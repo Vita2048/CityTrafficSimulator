@@ -3,16 +3,38 @@
 <head>
   <title>Traffic Simulation</title>
   <style>
+    body {
+      background-color: #f0f0f0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      margin: 0;
+      padding: 20px;
+      font-family: sans-serif;
+    }
     canvas {
       border: 1px solid black;
       display: block;
       margin: 0 auto;
+      background-color: white;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
     button {
       display: block;
-      margin: 10px auto;
+      margin: 20px auto;
       padding: 10px 20px;
       font-size: 16px;
+      cursor: pointer;
+      border: none;
+      background-color: #4CAF50;
+      color: white;
+      border-radius: 5px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+      transition: background-color 0.3s;
+    }
+    button:hover {
+        background-color: #45a049;
     }
   </style>
 </head>
@@ -26,75 +48,80 @@
     const ROAD_WIDTH = 80; // Road width
     const CAR_SCALE = 0.1; // Scaling factor for car sprite
     const CAR_LENGTH = 518 * CAR_SCALE; // Car sprite width (518px) scaled
-    const SLOWDOWN_DISTANCE = 4 * CAR_LENGTH; // 4 car lengths (~207px)
 
-    // Car physics constants (in sprite coordinates, then scaled)
+    // Car physics constants
     const WHEELBASE = (409 - 94) * CAR_SCALE; // Distance between rear and front axles
-    const REAR_AXLE_OFFSET = (94 - 259) * CAR_SCALE; // Rear axle offset from sprite center
-    const FRONT_AXLE_OFFSET = (409 - 259) * CAR_SCALE; // Front axle offset from sprite center
-
-    // First car (right/outer lane, clockwise)
-    let car1 = {
-      angle: 0,
-      a: 420, // Right lane: 440 - ROAD_WIDTH/4
-      b: 220, // Right lane: 240 - ROAD_WIDTH/4
-      speed: -0.005, // Clockwise
-      x: 0,
-      y: 0
-    };
-
-    // Second car (left/inner lane, counterclockwise)
-    let car2 = {
-      angle: Math.PI, // Start opposite car1
-      a: 380, // Left lane: 360 + ROAD_WIDTH/4
-      b: 180, // Left lane: 160 + ROAD_WIDTH/4
-      speed: 0.001, // Counterclockwise, normal speed
-      x: 0,
-      y: 0,
-      onVerticalRoad: false, // Track if on vertical road
-      turning: false, // Track if in turning phase
-      turnProgress: 0, // Progress of bottom turn (0 to 1)
-      // Car physics state
-      rearX: 0, // Rear axle position
-      rearY: 0,
-      frontX: 0, // Front axle position
-      frontY: 0,
-      heading: 0, // Car's heading angle
-      steerAngle: 0, // Current steering angle
-      targetSteerAngle: 0 // Target steering angle for smooth steering
-    };
 
     // Center of the canvas
     const centerX = 600;
     const centerY = 400;
 
-    // Load car sprite
+    // --- Unified steering and path-following constants ---
+    const STEERING_GAIN = 0.8; // Proportional gain for steering correction.
+    const LOOK_AHEAD_DISTANCE = 90; // Look-ahead distance for calculating the target point.
+    const SYMMETRIC_MAX_TURN_STEER_ANGLE = Math.PI / 6; // Approx 30 degrees
+const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;   // Right lane for traffic going up
+const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4; // Left lane for traffic going down
+
+    // --- DEBUG LOGGING: Thresholds to prevent log clutter ---
+    const LOG_HEADING_THRESHOLD_DEG = 5; // Log if heading changes by this many degrees.
+    const LOG_DISTANCE_THRESHOLD_PX = 25; // Log if car travels this many pixels.
+
+    // First car (right/outer lane, clockwise)
+    let car1 = {
+      angle: 0,
+      a: 400 + ROAD_WIDTH / 4, 
+      b: 200 + ROAD_WIDTH / 4, 
+      speed: -0.005, // Clockwise
+      x: 0,
+      y: 0,
+      heading: 0, 
+      steerAngle: 0,
+      targetSteerAngle: 0
+    };
+
+// Initialize car2 with path state and decision flags
+let car2 = {
+  angle: Math.PI, // Start opposite car1
+  a: 400 - ROAD_WIDTH / 4, 
+  b: 200 - ROAD_WIDTH / 4, 
+  speed: 0.035,
+  x: 0, y: 0,
+  rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+  heading: -Math.PI / 2, 
+  steerAngle: 0, targetSteerAngle: 0,
+  lastLoggedHeading: -Math.PI / 2,
+  lastLoggedX: 0, lastLoggedY: 0,
+  path: "ellipse", // Track path: "ellipse" or "vertical"
+  canDecideAtTop: true, // Allow decision at top crossroad
+  canDecideAtBottom: true, // Allow decision at bottom crossroad
+  verticalDirection: null // Track direction: "up" or "down" when on vertical path
+};
     const spriteSheet = new Image();
     spriteSheet.src = 'https://vita2048.github.io/CityTrafficSimulator/CarSpritesheetLights.png';
 
     function drawBackground() {
-      ctx.fillStyle = 'rgb(0, 255, 0)'; // Green grass
+      ctx.fillStyle = 'rgb(20, 140, 20)';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     }
 
     function drawRoad() {
-      ctx.strokeStyle = 'gray';
+      ctx.strokeStyle = '#666';
+      ctx.fillStyle = '#666';
       ctx.lineWidth = ROAD_WIDTH;
-      // Main elliptical road
       ctx.beginPath();
       ctx.ellipse(centerX, centerY, 400, 200, 0, 0, Math.PI * 2);
       ctx.stroke();
-      // Vertical T-shaped road
       ctx.beginPath();
-      ctx.moveTo(600, 200);
-      ctx.lineTo(600, 600);
+      ctx.moveTo(centerX, 200);
+      ctx.lineTo(centerX, 600);
       ctx.stroke();
     }
 
     function drawDashedEllipse(x, y, a, b) {
       ctx.strokeStyle = 'white';
       ctx.lineWidth = 2;
-      ctx.setLineDash([10, 10]);
+      ctx.setLineDash([15, 15]);
       ctx.beginPath();
       ctx.ellipse(x, y, a, b, 0, 0, Math.PI * 2);
       ctx.stroke();
@@ -104,7 +131,7 @@
     function drawDashedLine(x1, y1, x2, y2) {
       ctx.strokeStyle = 'white';
       ctx.lineWidth = 2;
-      ctx.setLineDash([10, 10]);
+      ctx.setLineDash([15, 15]);
       ctx.beginPath();
       ctx.moveTo(x1, y1);
       ctx.lineTo(x2, y2);
@@ -113,272 +140,270 @@
     }
 
     function updateCarPhysics(car, speed) {
-      // Smooth steering angle transition
-      car.steerAngle += (car.targetSteerAngle - car.steerAngle) * 0.15;
+      car.steerAngle += (car.targetSteerAngle - car.steerAngle) * 0.1; 
       
-      // Update heading based on steering angle
+      const MAX_STEER_CLAMP = Math.PI / 3; 
+      car.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, car.steerAngle));
+
       if (Math.abs(car.steerAngle) > 0.001) {
         const deltaHeading = Math.tan(car.steerAngle) * speed / WHEELBASE;
         car.heading += deltaHeading;
-        // Normalize heading
         while (car.heading > Math.PI) car.heading -= 2 * Math.PI;
         while (car.heading < -Math.PI) car.heading += 2 * Math.PI;
       }
       
-      // Update rear axle position based on current heading and speed
       car.rearX += Math.cos(car.heading) * speed;
       car.rearY += Math.sin(car.heading) * speed;
       
-      // Calculate front axle position
       car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
       car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
       
-      // Set car center position (between axles)
       car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
       car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
-    }
 
-function drawCar(car) {
-    let tangentAngle;
+      if (car === car2) {
+          const headingDeg = car.heading * 180 / Math.PI;
+          const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
+          const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
 
-    if (car === car2 && car.onVerticalRoad) {
-        if (car.turning) {
-            // Smooth natural turn with continuous movement
-            const speed = Math.abs(car.speed) * 40;
-
-            // Progressive steering for full 90-degree turn
-            // FIX 1: Use a POSITIVE angle for a LEFT turn, reduced to 40 degrees for stability.
-            const maxSteerAngle = Math.PI / 4.5; // +40 degrees for a stable left turn
-            if (car.turnProgress < 0.3) {
-                // Ramp up steering quickly in first 30%
-                car.targetSteerAngle = maxSteerAngle * (car.turnProgress / 0.3);
-            } else if (car.turnProgress < 0.7) {
-                // Maintain maximum steering in middle 40%
-                car.targetSteerAngle = maxSteerAngle;
-            } else {
-                // Gradually reduce steering in final 30%
-                car.targetSteerAngle = maxSteerAngle * (1 - (car.turnProgress - 0.7) / 0.3);
-            }
-
-            // Use physics-based movement
-            updateCarPhysics(car, speed);
-
-            car.turnProgress += 0.008; // Slower progression for full 90-degree turn
-            tangentAngle = car.heading;
-
-            // FIX 2: Update completion logic for a LEFT turn.
-            // The car turns from 90 degrees (down) to 180 degrees (left).
-            if (car.heading >= Math.PI - 0.1 && car.y > 500) {
-                // Complete the turn - transition back to ellipse
-                car.onVerticalRoad = false;
-                car.turning = false;
-
-                // Snap heading and steering for stability
-                car.heading = Math.PI;
-                car.steerAngle = 0;
-                car.targetSteerAngle = 0;
-
-                // Calculate the appropriate ellipse angle based on current position
-                const ellipseX = (car.x - centerX) / car.a;
-                const ellipseY = (car.y - centerY) / car.b;
-                car.angle = Math.atan2(ellipseY, ellipseX);
-
-                // Ensure angle is positive for counter-clockwise movement
-                if (car.angle < 0) car.angle += 2 * Math.PI;
-
-                car.speed = 0.02; // Restore normal speed
-                console.log("Car2 completed LEFT turn to ellipse at angle=", car.angle, "heading=", car.heading);
-            }
-        } else {
-            // On vertical road, move downward
-            car.x = centerX;
-            car.y = car.verticalY;
-            car.heading = Math.PI / 2; // Face downward
-            tangentAngle = Math.PI / 2;
-
-            // Update rear/front axle positions for smooth transition
-            car.rearX = car.x + Math.cos(car.heading + Math.PI) * WHEELBASE * 0.5;
-            car.rearY = car.y + Math.sin(car.heading + Math.PI) * WHEELBASE * 0.5;
-            car.frontX = car.x + Math.cos(car.heading) * WHEELBASE * 0.5;
-            car.frontY = car.y + Math.sin(car.heading) * WHEELBASE * 0.5;
-        }
-    } else {
-        // Calculate car position on ellipse
-        car.x = centerX + car.a * Math.cos(car.angle);
-        car.y = centerY + car.b * Math.sin(car.angle);
-
-        // Calculate tangent angle for rotation
-        const dx = -car.a * Math.sin(car.angle);
-        const dy = car.b * Math.cos(car.angle);
-        tangentAngle = Math.atan2(dy, dx) + Math.PI; // Base orientation (front-first for clockwise)
-
-        // Adjust orientation for car2 (counterclockwise, flip 180 degrees)
-        if (car === car2) {
-            tangentAngle += Math.PI;
-            car.heading = tangentAngle; // Keep heading in sync with ellipse movement
-        }
-    }
-
-    // Draw car sprite
-    ctx.save();
-    ctx.translate(car.x, car.y);
-    ctx.rotate(tangentAngle);
-    ctx.scale(CAR_SCALE, CAR_SCALE);
-
-    // Sprite frame dimensions
-    const frameWidth = 518;
-    const frameHeight = 465;
-    if (spriteSheet.complete && spriteSheet.naturalWidth > 0) {
-        ctx.drawImage(spriteSheet, 0, 0, frameWidth, frameHeight, -259, -91.5, frameWidth, frameHeight);
-    } else {
-        // Fallback red rectangle (same dimensions as car in frame)
-        ctx.fillStyle = 'red';
-        ctx.fillRect(-130, -91.5, 260, 260); // Approximate car dimensions
-    }
-    ctx.restore();
-
-    // Debug: Draw axle positions and heading for car2 when turning
-    if (car === car2 && car.onVerticalRoad) {
-        ctx.save();
-        ctx.strokeStyle = 'blue';
-        ctx.lineWidth = 3;
-        ctx.fillStyle = 'blue';
-        // Draw rear axle
-        ctx.beginPath();
-        ctx.arc(car.rearX, car.rearY, 4, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Draw front axle
-        ctx.fillStyle = 'red';
-        ctx.beginPath();
-        ctx.arc(car.frontX, car.frontY, 4, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Draw heading line
-        ctx.strokeStyle = 'green';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(car.x, car.y);
-        ctx.lineTo(car.x + Math.cos(car.heading) * 40, car.y + Math.sin(car.heading) * 40);
-        ctx.stroke();
-
-        // Draw steering angle indicator
-        if (car.turning) {
-            ctx.strokeStyle = 'orange';
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(car.frontX, car.frontY);
-            const steerDirection = car.heading + car.steerAngle;
-            ctx.lineTo(car.frontX + Math.cos(steerDirection) * 30,
-                car.frontY + Math.sin(steerDirection) * 30);
-            ctx.stroke();
-
-            // Draw turn progress indicator
-            ctx.fillStyle = 'purple';
-            ctx.font = '12px Arial';
-            ctx.fillText(`Progress: ${Math.round(car.turnProgress * 100)}%`, car.x - 30, car.y - 40);
-            ctx.fillText(`Heading: ${Math.round(car.heading * 180 / Math.PI)}°`, car.x - 30, car.y - 55);
-        }
-        ctx.restore();
-    }
-}
-
-    function update() {
-      // Update car1 (always on ellipse)
-      car1.angle += car1.speed;
-      if (car1.angle < -Math.PI * 2) car1.angle += Math.PI * 2;
-
-      // Update car2
-      if (car2.onVerticalRoad) {
-        if (car2.turning) {
-          // Physics-based turning is handled in drawCar function
-        } else {
-          // Move downward on vertical road, slow down near bottom
-          car2.speed = car2.verticalY > 520 ? 0.008 : 0.02; // Slow down earlier at y=520
-          car2.verticalY += Math.abs(car2.speed) * 50; // Adjust speed for linear motion
-          
-          // Start turn earlier and more gradually
-          if (car2.verticalY > 520 && !car2.turning) {
-            // Start smooth turn
-            car2.turning = true;
-            car2.turnProgress = 0;
-            car2.steerAngle = 0;
-            car2.targetSteerAngle = 0;
-            console.log("Car2 starting turn at y:", car2.verticalY);
+          if (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX) {
+              console.log(`Car2 | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}°`);
+              car.lastLoggedHeading = car.heading;
+              car.lastLoggedX = car.x;
+              car.lastLoggedY = car.y;
           }
-        }
-      } else {
-        // Move on ellipse, slow down near T-intersection
-        const x = centerX + car2.a * Math.cos(car2.angle);
-        const y = centerY + car2.b * Math.sin(car2.angle);
-        const distanceToIntersection = Math.sqrt((x - 600) ** 2 + (y - 220) ** 2);
-        // Gradual slowdown over 4 car lengths (~207px)
-        car2.speed = distanceToIntersection < SLOWDOWN_DISTANCE ? 
-                     0.002 + 0.002 * (distanceToIntersection / SLOWDOWN_DISTANCE) : 0.004;
-        car2.angle += car2.speed;
-        if (car2.angle > Math.PI * 2) car2.angle -= Math.PI * 2;
-
-        // Check if near T-intersection (x ≈ 600, y ≈ 220)
-        if (Math.abs(x - 600) < 25 && Math.abs(y - 220) < 25) {
-          // 50% chance to turn onto vertical road
-          if (Math.random() < 0.5) {
-            car2.onVerticalRoad = true;
-            car2.verticalY = 200; // Start at top of vertical road
-            car2.speed = 0.01; // Keep slowed speed for turn
-            car2.heading = Math.PI / 2; // Face downward initially
-            console.log("Car2 turning onto vertical road at x:", x, "y:", y, "angle:", car2.angle);
-          }
-        }
       }
     }
 
-    function resetSimulation() {
-      car1.angle = 0;
-      car1.x = centerX + car1.a;
-      car1.y = centerY;
-      car2.angle = Math.PI;
-      car2.x = centerX + car2.a * Math.cos(car2.angle);
-      car2.y = centerY + car2.b * Math.sin(car2.angle);
-      car2.onVerticalRoad = false;
-      car2.turning = false;
-      car2.turnProgress = 0;
-      car2.speed = 0.02;
-      car2.verticalY = 0;
-      car2.steerAngle = 0;
-      car2.targetSteerAngle = 0;
-      car2.heading = 0;
-      car2.rearX = 0;
-      car2.rearY = 0;
-      car2.frontX = 0;
-      car2.frontY = 0;
+    function drawCar(car) {
+      ctx.save();
+      ctx.translate(car.x, car.y);
+
+      // FIX: Rotate car1's sprite by 180 degrees (PI radians) to face forward
+      let rotation = car.heading;
+      if (car === car1) {
+        rotation += Math.PI;
+      }
+      ctx.rotate(rotation); 
+      
+      ctx.scale(CAR_SCALE, CAR_SCALE);
+
+      const frameWidth = 518;
+      const frameHeight = 465;
+      if (spriteSheet.complete && spriteSheet.naturalWidth > 0) {
+        ctx.drawImage(spriteSheet, 0, 0, frameWidth, frameHeight, -259, -91.5, frameWidth, frameHeight);
+      } else {
+        ctx.fillStyle = 'red';
+        ctx.fillRect(-259, -91.5, frameWidth, frameHeight); 
+      }
+      ctx.restore();
     }
 
+// Updated update function
+function update() {
+  // Update car1 (unchanged)
+  car1.angle += car1.speed;
+  car1.x = centerX + car1.a * Math.cos(car1.angle);
+  car1.y = centerY + car1.b * Math.sin(car1.angle);
+  const dx1 = -car1.a * Math.sin(car1.angle);
+  const dy1 = car1.b * Math.cos(car1.angle);
+  car1.heading = Math.atan2(dy1, dx1);
+
+  // Update car2
+  let currentSpeed = car2.speed * 50;
+  let targetX, targetY;
+
+  // Define crossroad conditions
+  const isApproachingTopCrossroad = car2.y < centerY - car2.b + ROAD_WIDTH && car2.x > centerX - ROAD_WIDTH && car2.heading > -Math.PI / 2 && car2.path === "ellipse" && car2.canDecideAtTop;
+  const isApproachingBottomCrossroad = car2.y > centerY + car2.b - ROAD_WIDTH / 8 && car2.path === "ellipse" && car2.canDecideAtBottom && car2.heading > 3 * Math.PI / 4;
+  const isOnVerticalSegment = car2.path === "vertical";
+
+  if (isApproachingTopCrossroad) {
+    // Make decision at top crossroad
+    car2.canDecideAtTop = false;
+    if (Math.random() < 0.5) {
+      // Turn onto vertical road (downward)
+      car2.path = "vertical";
+      car2.verticalDirection = "down";
+      targetX = DOWNWARD_LANE_X;
+      targetY = car2.y + LOOK_AHEAD_DISTANCE;
+      car2.speed = 0.035;
+      console.log("Car2 at top crossroad: decided to take the vertical road (downward)");
+    } else {
+      // Continue on ellipse
+      car2.path = "ellipse";
+      const currentEllipseX_norm = (car2.x - centerX) / car2.a;
+      const currentEllipseY_norm = (car2.y - centerY) / car2.b;
+      car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+      const lookAheadAngle = car2.angle + car2.speed * 5;
+      targetX = centerX + car2.a * Math.cos(lookAheadAngle);
+      targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+      car2.speed = 0.035;
+      console.log("Car2 at top crossroad: decided to continue on the ellipse");
+    }
+  } else if (isApproachingBottomCrossroad) {
+    // Make decision at bottom crossroad (only from ellipse)
+    car2.canDecideAtBottom = false;
+    if (Math.random() < 0.5) {
+      // Turn onto vertical road (upward)
+      car2.path = "vertical";
+      car2.verticalDirection = "up";
+      targetX = UPWARD_LANE_X;
+      targetY = car2.y - LOOK_AHEAD_DISTANCE;
+      car2.speed = 0.035;
+      console.log("Car2 at bottom crossroad: decided to take the vertical road (upward)");
+    } else {
+      // Continue on ellipse
+      car2.path = "ellipse";
+      const currentEllipseX_norm = (car2.x - centerX) / car2.a;
+      const currentEllipseY_norm = (car2.y - centerY) / car2.b;
+      car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+      const lookAheadAngle = car2.angle + car2.speed * 5;
+      targetX = centerX + car2.a * Math.cos(lookAheadAngle);
+      targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+      car2.speed = 0.035;
+      console.log("Car2 at bottom crossroad: decided to continue on the ellipse");
+    }
+    car2.canDecideAtTop = true;
+  } else if (isOnVerticalSegment) {
+    // Follow vertical road by selecting the correct lane center
+    let laneCenter = car2.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+    targetX = laneCenter + Math.max(-ROAD_WIDTH / 4, Math.min(ROAD_WIDTH / 4, (laneCenter - car2.x) * 0.7));
+    targetY = car2.y + (car2.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
+    car2.speed = 0.035;
+
+    // Check if car is approaching the end of the vertical segment for rejoin
+    if (car2.verticalDirection === "down" && car2.y > centerY + car2.b - ROAD_WIDTH / 2) {
+        // Start rejoining ellipse with right turn (counterclockwise)
+        car2.path = "ellipse";
+        car2.verticalDirection = null;
+        car2.canDecideAtTop = true;
+        car2.canDecideAtBottom = false;
+        const targetAngle = Math.PI + car2.speed * 5;
+        targetX = centerX + car2.a * Math.cos(targetAngle);
+        targetY = centerY + car2.b * Math.sin(targetAngle);
+        car2.angle = targetAngle;
+        console.log("Car2 rejoined the ellipse from vertical road (downward, right turn)");
+    } else if (car2.verticalDirection === "up" && car2.y < centerY - car2.b + ROAD_WIDTH / 2) {
+        // Start rejoining ellipse with right turn (clockwise)
+        car2.path = "ellipse";
+        car2.verticalDirection = null;
+        car2.canDecideAtTop = false;
+        car2.canDecideAtBottom = true;
+        const targetAngle = 0 - car2.speed * 5;
+        targetX = centerX + car2.a * Math.cos(targetAngle);
+        targetY = centerY + car2.b * Math.sin(targetAngle);
+        car2.angle = targetAngle;
+        console.log("Car2 rejoined the ellipse from vertical road (upward, right turn)");
+    }
+} else {
+    // Follow ellipse
+    car2.path = "ellipse";
+    const currentEllipseX_norm = (car2.x - centerX) / car2.a;
+    const currentEllipseY_norm = (car2.y - centerY) / car2.b;
+    car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+    const lookAheadAngle = car2.angle + car2.speed * 5;
+    targetX = centerX + car2.a * Math.cos(lookAheadAngle);
+    targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+    car2.speed = 0.035;
+    // Reset decision flags when away from crossroads
+    if (car2.y > centerY - car2.b + 2 * ROAD_WIDTH && car2.y < centerY + car2.b - 2 * ROAD_WIDTH) {
+      car2.canDecideAtTop = true;
+      car2.canDecideAtBottom = true;
+    }
+  }
+
+// Unified steering controller
+  const dx = targetX - car2.x;
+  const dy = targetY - car2.y;
+  let targetHeading;
+  if (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) {
+    targetHeading = car2.heading; // Maintain current heading if too close
+  } else {
+    // ALWAYS calculate the heading towards the target point.
+    // This allows for a natural, smooth approach to the vertical lane.
+    targetHeading = Math.atan2(dy, dx);
+  }
+
+  let headingError = targetHeading - car2.heading;
+  while (headingError > Math.PI) headingError -= 2 * Math.PI;
+  while (headingError < -Math.PI) headingError += 2 * Math.PI;
+
+  // Debug NaN in steering
+  if (isNaN(headingError) || isNaN(targetHeading) || isNaN(car2.heading)) {
+    console.log("NaN detected: targetHeading=", targetHeading, "dx=", dx, "dy=", dy, "car2.heading=", car2.heading, "path=", car2.path);
+  }
+
+  // Calculate steering with gain
+  const isRejoining = (car2.path === "ellipse" && 
+                      ((car2.y > centerY + car2.b - ROAD_WIDTH && car2.y < centerY + car2.b + ROAD_WIDTH) ||
+                       (car2.y < centerY - car2.b + ROAD_WIDTH && car2.y > centerY - car2.b - ROAD_WIDTH)));
+  const laneCenterForTransition = car2.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+const isTransitioningToVertical = (car2.path === "vertical" && car2.y > centerY + car2.b - ROAD_WIDTH && Math.abs(car2.x - laneCenterForTransition) > 2);
+  car2.targetSteerAngle = headingError * STEERING_GAIN * ((car2.path === "vertical" && car2.verticalDirection === "up") || isTransitioningToVertical ? 2.5 : isRejoining || car2.path === "vertical" ? 2.0 : 1);
+  car2.targetSteerAngle = isNaN(car2.targetSteerAngle) ? 0 : Math.max(-SYMMETRIC_MAX_TURN_STEER_ANGLE, Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, car2.targetSteerAngle));
+
+  // Update physics and clamp position to canvas
+  updateCarPhysics(car2, currentSpeed);
+  car2.x = Math.max(0, Math.min(canvas.width, car2.x));
+  car2.y = Math.max(0, Math.min(canvas.height, car2.y));
+
+  // Debug steering values
+  if (car2.path === "vertical" && car2.verticalDirection === "up") {
+    console.log("Upward path: x=", car2.x, "targetX=", targetX, "dx=", dx, "heading=", car2.heading * 180 / Math.PI, "targetHeading=", targetHeading * 180 / Math.PI, "steer=", car2.targetSteerAngle * 180 / Math.PI);
+  }
+}
+
+// resetSimulation function (unchanged, included for reference)
+function resetSimulation() {
+  car1.angle = 0;
+  
+  car2.angle = Math.PI;
+  car2.speed = 0.035;
+  car2.steerAngle = 0;
+  car2.targetSteerAngle = 0;
+  car2.heading = -Math.PI / 2;
+  car2.path = "ellipse";
+  car2.verticalDirection = null;
+  car2.canDecideAtTop = true;
+  car2.canDecideAtBottom = true;
+
+  car2.x = centerX + car2.a * Math.cos(car2.angle);
+  car2.y = centerY + car2.b * Math.sin(car2.angle);
+  
+  car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
+  car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
+  car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
+  car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
+  
+  car2.lastLoggedHeading = car2.heading;
+  car2.lastLoggedX = car2.x;
+  car2.lastLoggedY = car2.y;
+
+  console.clear();
+  console.log("--- Simulation Reset ---");
+}
     function draw() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       drawBackground();
       drawRoad();
-      drawDashedEllipse(600, 400, 400, 200);
-      drawDashedLine(600, 200, 600, 600);
+      drawDashedEllipse(centerX, centerY, 400, 200);
+      drawDashedLine(centerX, 200, centerX, 600);
       drawCar(car1);
       drawCar(car2);
       update();
       requestAnimationFrame(draw);
     }
 
-    // Start animation
     spriteSheet.onload = () => {
+      resetSimulation(); 
       draw();
     };
     spriteSheet.onerror = () => {
-      console.log('Sprite failed to load, using fallback');
+      console.error('Sprite failed to load, using fallback rectangles.');
+      resetSimulation(); 
       draw();
     };
-    setTimeout(() => {
-      if (!spriteSheet.complete) {
-        console.log('Sprite load timeout, using fallback');
-        draw();
-      }
-    }, 2000);
   </script>
 </body>
 </html>
