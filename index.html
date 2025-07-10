@@ -60,8 +60,8 @@
     const STEERING_GAIN = 0.8; // Proportional gain for steering correction.
     const LOOK_AHEAD_DISTANCE = 90; // Look-ahead distance for calculating the target point.
     const SYMMETRIC_MAX_TURN_STEER_ANGLE = Math.PI / 6; // Approx 30 degrees
-const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;   // Right lane for traffic going up
-const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4; // Left lane for traffic going down
+    const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;   // Right lane for traffic going up
+    const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4; // Left lane for traffic going down
 
     // --- DEBUG LOGGING: Thresholds to prevent log clutter ---
     const LOG_HEADING_THRESHOLD_DEG = 5; // Log if heading changes by this many degrees.
@@ -72,12 +72,18 @@ const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4; // Left lane for traffic going
       angle: 0,
       a: 400 + ROAD_WIDTH / 4, 
       b: 200 + ROAD_WIDTH / 4, 
-      speed: -0.005, // Clockwise
-      x: 0,
-      y: 0,
-      heading: 0, 
+      speed: 0.035, // Clockwise, changed to positive for physics update
+      x: 0, y: 0,
+      rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+      heading: 0, // Will be initialized in resetSimulation
       steerAngle: 0,
-      targetSteerAngle: 0
+      targetSteerAngle: 0,
+      lastLoggedHeading: 0,
+      lastLoggedX: 0, lastLoggedY: 0,
+      path: "ellipse",
+      canDecideAtTop: true,
+      canDecideAtBottom: true,
+      verticalDirection: null
     };
 
 // Initialize car2 with path state and decision flags
@@ -161,17 +167,17 @@ let car2 = {
       car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
       car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
 
-      if (car === car2) {
-          const headingDeg = car.heading * 180 / Math.PI;
-          const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
-          const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
+      // Debug logging for car1 and car2
+      const carName = car === car1 ? "Car1" : "Car2";
+      const headingDeg = car.heading * 180 / Math.PI;
+      const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
+      const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
 
-          if (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX) {
-              console.log(`Car2 | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}°`);
-              car.lastLoggedHeading = car.heading;
-              car.lastLoggedX = car.x;
-              car.lastLoggedY = car.y;
-          }
+      if (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX) {
+          console.log(`${carName} | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}° | Path:${car.path} | VertDir:${car.verticalDirection}`);
+          car.lastLoggedHeading = car.heading;
+          car.lastLoggedX = car.x;
+          car.lastLoggedY = car.y;
       }
     }
 
@@ -179,11 +185,10 @@ let car2 = {
       ctx.save();
       ctx.translate(car.x, car.y);
 
-      // FIX: Rotate car1's sprite by 180 degrees (PI radians) to face forward
       let rotation = car.heading;
-      if (car === car1) {
-        rotation += Math.PI;
-      }
+      // Car sprite faces right by default, add PI for counter-clockwise
+      // car1 moves clockwise, so its heading should match the visual direction more directly
+      // car2 moves counter-clockwise, it needs the PI offset
       ctx.rotate(rotation); 
       
       ctx.scale(CAR_SCALE, CAR_SCALE);
@@ -201,32 +206,145 @@ let car2 = {
 
 // Updated update function
 function update() {
-  // Update car1 (unchanged)
-  car1.angle += car1.speed;
-  car1.x = centerX + car1.a * Math.cos(car1.angle);
-  car1.y = centerY + car1.b * Math.sin(car1.angle);
-  const dx1 = -car1.a * Math.sin(car1.angle);
-  const dy1 = car1.b * Math.cos(car1.angle);
-  car1.heading = Math.atan2(dy1, dx1);
+  // --- Update Car1 ---
+  let currentSpeed1 = car1.speed * 50;
+  let targetX1, targetY1;
 
-  // Update car2
-  let currentSpeed = car2.speed * 50;
-  let targetX, targetY;
+  const isApproachingTopCrossroad1 = car1.y < centerY - car1.b + ROAD_WIDTH && car1.x > centerX - ROAD_WIDTH && car1.heading < Math.PI / 2 && car1.heading > -Math.PI/2 && car1.path === "ellipse" && car1.canDecideAtTop;
+  const isApproachingBottomCrossroad1 = car1.y > centerY + car1.b - ROAD_WIDTH / 8 && car1.path === "ellipse" && car1.canDecideAtBottom && car1.heading < Math.PI / 4 && car1.heading > -Math.PI / 4;
+  const isOnVerticalSegment1 = car1.path === "vertical";
+
+  if (isApproachingTopCrossroad1) {
+    car1.canDecideAtTop = false;
+    if (Math.random() < 0.5) {
+      car1.path = "vertical";
+      car1.verticalDirection = "down"; // Clockwise from top to bottom
+      targetX1 = UPWARD_LANE_X; // Right lane for car1's direction
+      targetY1 = car1.y + LOOK_AHEAD_DISTANCE;
+      console.log("Car1 at top crossroad: decided to take the vertical road (downward)");
+    } else {
+      const currentEllipseX_norm = (car1.x - centerX) / car1.a;
+      const currentEllipseY_norm = (car1.y - centerY) / car1.b;
+      car1.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+      const lookAheadAngle = car1.angle - car1.speed * 5; // Clockwise
+      targetX1 = centerX + car1.a * Math.cos(lookAheadAngle);
+      targetY1 = centerY + car1.b * Math.sin(lookAheadAngle);
+      console.log("Car1 at top crossroad: decided to continue on the ellipse");
+    }
+  } else if (isApproachingBottomCrossroad1) {
+    car1.canDecideAtBottom = false;
+    if (Math.random() < 0.5) {
+      car1.path = "vertical";
+      car1.verticalDirection = "up"; // Clockwise from bottom to top
+      targetX1 = DOWNWARD_LANE_X; // Left lane for car1's direction
+      targetY1 = car1.y - LOOK_AHEAD_DISTANCE;
+      console.log("Car1 at bottom crossroad: decided to take the vertical road (upward)");
+    } else {
+      const currentEllipseX_norm = (car1.x - centerX) / car1.a;
+      const currentEllipseY_norm = (car1.y - centerY) / car1.b;
+      car1.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+      const lookAheadAngle = car1.angle - car1.speed * 5; // Clockwise
+      targetX1 = centerX + car1.a * Math.cos(lookAheadAngle);
+      targetY1 = centerY + car1.b * Math.sin(lookAheadAngle);
+      console.log("Car1 at bottom crossroad: decided to continue on the ellipse");
+    }
+    car1.canDecideAtTop = true; // Reset for next cycle
+  } else if (isOnVerticalSegment1) {
+    let laneCenter = car1.verticalDirection === "down" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+    targetX1 = laneCenter + Math.max(-ROAD_WIDTH / 4, Math.min(ROAD_WIDTH / 4, (laneCenter - car1.x) * 0.7));
+    targetY1 = car1.y + (car1.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
+
+    // Always rejoin ellipse from vertical
+    if (car1.verticalDirection === "down" && car1.y > centerY + car1.b - ROAD_WIDTH / 2) {
+        car1.path = "ellipse";
+        car1.verticalDirection = null;
+        car1.canDecideAtTop = true; // Allow decision on next ellipse cycle
+        car1.canDecideAtBottom = false; // Prevent immediate re-decision
+        const currentEllipseX_norm = (car1.x - centerX) / car1.a;
+        const currentEllipseY_norm = (car1.y - centerY) / car1.b;
+        car1.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+        const lookAheadAngle = car1.angle - car1.speed * 5; // Clockwise
+        targetX1 = centerX + car1.a * Math.cos(lookAheadAngle);
+        targetY1 = centerY + car1.b * Math.sin(lookAheadAngle);
+        console.log("Car1 rejoined the ellipse from vertical road (downward)");
+    } else if (car1.verticalDirection === "up" && car1.y < centerY - car1.b + ROAD_WIDTH / 2) {
+        car1.path = "ellipse";
+        car1.verticalDirection = null;
+        car1.canDecideAtTop = false; // Prevent immediate re-decision
+        car1.canDecideAtBottom = true; // Allow decision on next ellipse cycle
+        const currentEllipseX_norm = (car1.x - centerX) / car1.a;
+        const currentEllipseY_norm = (car1.y - centerY) / car1.b;
+        car1.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+        const lookAheadAngle = car1.angle - car1.speed * 5; // Clockwise
+        targetX1 = centerX + car1.a * Math.cos(lookAheadAngle);
+        targetY1 = centerY + car1.b * Math.sin(lookAheadAngle);
+        console.log("Car1 rejoined the ellipse from vertical road (upward)");
+    }
+  } else {
+    car1.path = "ellipse";
+    const currentEllipseX_norm = (car1.x - centerX) / car1.a;
+    const currentEllipseY_norm = (car1.y - centerY) / car1.b;
+    car1.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
+    const lookAheadAngle = car1.angle - car1.speed * 5; // Clockwise
+    targetX1 = centerX + car1.a * Math.cos(lookAheadAngle);
+    targetY1 = centerY + car1.b * Math.sin(lookAheadAngle);
+    // Reset decision flags when away from crossroads
+    if (car1.y > centerY - car1.b + 2 * ROAD_WIDTH && car1.y < centerY + car1.b - 2 * ROAD_WIDTH) {
+      car1.canDecideAtTop = true;
+      car1.canDecideAtBottom = true;
+    }
+  }
+
+  // Unified steering controller for car1
+  const dx1 = targetX1 - car1.x;
+  const dy1 = targetY1 - car1.y;
+  let targetHeading1;
+  if (Math.abs(dx1) < 0.1 && Math.abs(dy1) < 0.1) {
+    targetHeading1 = car1.heading; 
+  } else {
+    targetHeading1 = Math.atan2(dy1, dx1);
+  }
+
+  let headingError1 = targetHeading1 - car1.heading;
+  while (headingError1 > Math.PI) headingError1 -= 2 * Math.PI;
+  while (headingError1 < -Math.PI) headingError1 += 2 * Math.PI;
+
+  if (isNaN(headingError1) || isNaN(targetHeading1) || isNaN(car1.heading)) {
+    console.log("Car1 NaN detected: targetHeading=", targetHeading1, "dx=", dx1, "dy=", dy1, "car1.heading=", car1.heading, "path=", car1.path);
+  }
+  
+  const isRejoining1 = (car1.path === "ellipse" && 
+                      ((car1.y > centerY + car1.b - ROAD_WIDTH && car1.y < centerY + car1.b + ROAD_WIDTH) ||
+                       (car1.y < centerY - car1.b + ROAD_WIDTH && car1.y > centerY - car1.b - ROAD_WIDTH)));
+  const laneCenterForTransition1 = car1.verticalDirection === "down" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+  const isTransitioningToVertical1 = (car1.path === "vertical" && ((car1.verticalDirection === "down" && car1.y < centerY - car1.b + ROAD_WIDTH) || (car1.verticalDirection === "up" && car1.y > centerY + car1.b - ROAD_WIDTH)) && Math.abs(car1.x - laneCenterForTransition1) > 2);
+
+  car1.targetSteerAngle = headingError1 * STEERING_GAIN * ((car1.path === "vertical" && (car1.verticalDirection === "up" || car1.verticalDirection === "down")) || isTransitioningToVertical1 ? 2.5 : isRejoining1 ? 2.0 : 1);
+  car1.targetSteerAngle = isNaN(car1.targetSteerAngle) ? 0 : Math.max(-SYMMETRIC_MAX_TURN_STEER_ANGLE, Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, car1.targetSteerAngle));
+
+  updateCarPhysics(car1, currentSpeed1);
+  car1.x = Math.max(0, Math.min(canvas.width, car1.x));
+  car1.y = Math.max(0, Math.min(canvas.height, car1.y));
+
+
+  // --- Update Car2 (unchanged from original logic) ---
+  let currentSpeed2 = car2.speed * 50;
+  let targetX2, targetY2;
 
   // Define crossroad conditions
-  const isApproachingTopCrossroad = car2.y < centerY - car2.b + ROAD_WIDTH && car2.x > centerX - ROAD_WIDTH && car2.heading > -Math.PI / 2 && car2.path === "ellipse" && car2.canDecideAtTop;
-  const isApproachingBottomCrossroad = car2.y > centerY + car2.b - ROAD_WIDTH / 8 && car2.path === "ellipse" && car2.canDecideAtBottom && car2.heading > 3 * Math.PI / 4;
-  const isOnVerticalSegment = car2.path === "vertical";
+  const isApproachingTopCrossroad2 = car2.y < centerY - car2.b + ROAD_WIDTH && car2.x > centerX - ROAD_WIDTH && car2.heading > -Math.PI / 2 && car2.path === "ellipse" && car2.canDecideAtTop;
+  const isApproachingBottomCrossroad2 = car2.y > centerY + car2.b - ROAD_WIDTH / 8 && car2.path === "ellipse" && car2.canDecideAtBottom && car2.heading > 3 * Math.PI / 4;
+  const isOnVerticalSegment2 = car2.path === "vertical";
 
-  if (isApproachingTopCrossroad) {
+  if (isApproachingTopCrossroad2) {
     // Make decision at top crossroad
     car2.canDecideAtTop = false;
     if (Math.random() < 0.5) {
       // Turn onto vertical road (downward)
       car2.path = "vertical";
       car2.verticalDirection = "down";
-      targetX = DOWNWARD_LANE_X;
-      targetY = car2.y + LOOK_AHEAD_DISTANCE;
+      targetX2 = DOWNWARD_LANE_X;
+      targetY2 = car2.y + LOOK_AHEAD_DISTANCE;
       car2.speed = 0.035;
       console.log("Car2 at top crossroad: decided to take the vertical road (downward)");
     } else {
@@ -236,20 +354,20 @@ function update() {
       const currentEllipseY_norm = (car2.y - centerY) / car2.b;
       car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
       const lookAheadAngle = car2.angle + car2.speed * 5;
-      targetX = centerX + car2.a * Math.cos(lookAheadAngle);
-      targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+      targetX2 = centerX + car2.a * Math.cos(lookAheadAngle);
+      targetY2 = centerY + car2.b * Math.sin(lookAheadAngle);
       car2.speed = 0.035;
       console.log("Car2 at top crossroad: decided to continue on the ellipse");
     }
-  } else if (isApproachingBottomCrossroad) {
+  } else if (isApproachingBottomCrossroad2) {
     // Make decision at bottom crossroad (only from ellipse)
     car2.canDecideAtBottom = false;
     if (Math.random() < 0.5) {
       // Turn onto vertical road (upward)
       car2.path = "vertical";
       car2.verticalDirection = "up";
-      targetX = UPWARD_LANE_X;
-      targetY = car2.y - LOOK_AHEAD_DISTANCE;
+      targetX2 = UPWARD_LANE_X;
+      targetY2 = car2.y - LOOK_AHEAD_DISTANCE;
       car2.speed = 0.035;
       console.log("Car2 at bottom crossroad: decided to take the vertical road (upward)");
     } else {
@@ -259,17 +377,17 @@ function update() {
       const currentEllipseY_norm = (car2.y - centerY) / car2.b;
       car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
       const lookAheadAngle = car2.angle + car2.speed * 5;
-      targetX = centerX + car2.a * Math.cos(lookAheadAngle);
-      targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+      targetX2 = centerX + car2.a * Math.cos(lookAheadAngle);
+      targetY2 = centerY + car2.b * Math.sin(lookAheadAngle);
       car2.speed = 0.035;
       console.log("Car2 at bottom crossroad: decided to continue on the ellipse");
     }
     car2.canDecideAtTop = true;
-  } else if (isOnVerticalSegment) {
+  } else if (isOnVerticalSegment2) {
     // Follow vertical road by selecting the correct lane center
     let laneCenter = car2.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-    targetX = laneCenter + Math.max(-ROAD_WIDTH / 4, Math.min(ROAD_WIDTH / 4, (laneCenter - car2.x) * 0.7));
-    targetY = car2.y + (car2.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
+    targetX2 = laneCenter + Math.max(-ROAD_WIDTH / 4, Math.min(ROAD_WIDTH / 4, (laneCenter - car2.x) * 0.7));
+    targetY2 = car2.y + (car2.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
     car2.speed = 0.035;
 
     // Check if car is approaching the end of the vertical segment for rejoin
@@ -280,8 +398,8 @@ function update() {
         car2.canDecideAtTop = true;
         car2.canDecideAtBottom = false;
         const targetAngle = Math.PI + car2.speed * 5;
-        targetX = centerX + car2.a * Math.cos(targetAngle);
-        targetY = centerY + car2.b * Math.sin(targetAngle);
+        targetX2 = centerX + car2.a * Math.cos(targetAngle);
+        targetY2 = centerY + car2.b * Math.sin(targetAngle);
         car2.angle = targetAngle;
         console.log("Car2 rejoined the ellipse from vertical road (downward, right turn)");
     } else if (car2.verticalDirection === "up" && car2.y < centerY - car2.b + ROAD_WIDTH / 2) {
@@ -291,8 +409,8 @@ function update() {
         car2.canDecideAtTop = false;
         car2.canDecideAtBottom = true;
         const targetAngle = 0 - car2.speed * 5;
-        targetX = centerX + car2.a * Math.cos(targetAngle);
-        targetY = centerY + car2.b * Math.sin(targetAngle);
+        targetX2 = centerX + car2.a * Math.cos(targetAngle);
+        targetY2 = centerY + car2.b * Math.sin(targetAngle);
         car2.angle = targetAngle;
         console.log("Car2 rejoined the ellipse from vertical road (upward, right turn)");
     }
@@ -303,8 +421,8 @@ function update() {
     const currentEllipseY_norm = (car2.y - centerY) / car2.b;
     car2.angle = Math.atan2(currentEllipseY_norm, currentEllipseX_norm);
     const lookAheadAngle = car2.angle + car2.speed * 5;
-    targetX = centerX + car2.a * Math.cos(lookAheadAngle);
-    targetY = centerY + car2.b * Math.sin(lookAheadAngle);
+    targetX2 = centerX + car2.a * Math.cos(lookAheadAngle);
+    targetY2 = centerY + car2.b * Math.sin(lookAheadAngle);
     car2.speed = 0.035;
     // Reset decision flags when away from crossroads
     if (car2.y > centerY - car2.b + 2 * ROAD_WIDTH && car2.y < centerY + car2.b - 2 * ROAD_WIDTH) {
@@ -313,51 +431,68 @@ function update() {
     }
   }
 
-// Unified steering controller
-  const dx = targetX - car2.x;
-  const dy = targetY - car2.y;
-  let targetHeading;
-  if (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) {
-    targetHeading = car2.heading; // Maintain current heading if too close
+// Unified steering controller for car2
+  const dx2 = targetX2 - car2.x;
+  const dy2 = targetY2 - car2.y;
+  let targetHeading2;
+  if (Math.abs(dx2) < 0.1 && Math.abs(dy2) < 0.1) {
+    targetHeading2 = car2.heading; // Maintain current heading if too close
   } else {
-    // ALWAYS calculate the heading towards the target point.
-    // This allows for a natural, smooth approach to the vertical lane.
-    targetHeading = Math.atan2(dy, dx);
+    targetHeading2 = Math.atan2(dy2, dx2);
   }
 
-  let headingError = targetHeading - car2.heading;
-  while (headingError > Math.PI) headingError -= 2 * Math.PI;
-  while (headingError < -Math.PI) headingError += 2 * Math.PI;
+  let headingError2 = targetHeading2 - car2.heading;
+  while (headingError2 > Math.PI) headingError2 -= 2 * Math.PI;
+  while (headingError2 < -Math.PI) headingError2 += 2 * Math.PI;
 
   // Debug NaN in steering
-  if (isNaN(headingError) || isNaN(targetHeading) || isNaN(car2.heading)) {
-    console.log("NaN detected: targetHeading=", targetHeading, "dx=", dx, "dy=", dy, "car2.heading=", car2.heading, "path=", car2.path);
+  if (isNaN(headingError2) || isNaN(targetHeading2) || isNaN(car2.heading)) {
+    console.log("Car2 NaN detected: targetHeading=", targetHeading2, "dx=", dx2, "dy=", dy2, "car2.heading=", car2.heading, "path=", car2.path);
   }
 
   // Calculate steering with gain
-  const isRejoining = (car2.path === "ellipse" && 
+  const isRejoining2 = (car2.path === "ellipse" && 
                       ((car2.y > centerY + car2.b - ROAD_WIDTH && car2.y < centerY + car2.b + ROAD_WIDTH) ||
                        (car2.y < centerY - car2.b + ROAD_WIDTH && car2.y > centerY - car2.b - ROAD_WIDTH)));
-  const laneCenterForTransition = car2.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-const isTransitioningToVertical = (car2.path === "vertical" && car2.y > centerY + car2.b - ROAD_WIDTH && Math.abs(car2.x - laneCenterForTransition) > 2);
-  car2.targetSteerAngle = headingError * STEERING_GAIN * ((car2.path === "vertical" && car2.verticalDirection === "up") || isTransitioningToVertical ? 2.5 : isRejoining || car2.path === "vertical" ? 2.0 : 1);
+  const laneCenterForTransition2 = car2.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+const isTransitioningToVertical2 = (car2.path === "vertical" && car2.y > centerY + car2.b - ROAD_WIDTH && Math.abs(car2.x - laneCenterForTransition2) > 2);
+  car2.targetSteerAngle = headingError2 * STEERING_GAIN * ((car2.path === "vertical" && car2.verticalDirection === "up") || isTransitioningToVertical2 ? 2.5 : isRejoining2 || car2.path === "vertical" ? 2.0 : 1);
   car2.targetSteerAngle = isNaN(car2.targetSteerAngle) ? 0 : Math.max(-SYMMETRIC_MAX_TURN_STEER_ANGLE, Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, car2.targetSteerAngle));
 
   // Update physics and clamp position to canvas
-  updateCarPhysics(car2, currentSpeed);
+  updateCarPhysics(car2, currentSpeed2);
   car2.x = Math.max(0, Math.min(canvas.width, car2.x));
   car2.y = Math.max(0, Math.min(canvas.height, car2.y));
-
-  // Debug steering values
-  if (car2.path === "vertical" && car2.verticalDirection === "up") {
-    console.log("Upward path: x=", car2.x, "targetX=", targetX, "dx=", dx, "heading=", car2.heading * 180 / Math.PI, "targetHeading=", targetHeading * 180 / Math.PI, "steer=", car2.targetSteerAngle * 180 / Math.PI);
-  }
 }
 
-// resetSimulation function (unchanged, included for reference)
+// resetSimulation function
 function resetSimulation() {
-  car1.angle = 0;
+  // Reset Car1
+  car1.angle = -Math.PI / 2; // Start car1 at the top of the ellipse for clockwise movement
+  car1.speed = 0.035; // Positive speed for physics update
+  car1.steerAngle = 0;
+  car1.targetSteerAngle = 0;
+  car1.heading = 0; // Initial heading right (clockwise movement at top)
+  car1.path = "ellipse";
+  car1.verticalDirection = null;
+  car1.canDecideAtTop = true;
+  car1.canDecideAtBottom = true;
+
+  // Calculate initial x, y based on angle for car1
+  car1.x = centerX + car1.a * Math.cos(car1.angle);
+  car1.y = centerY + car1.b * Math.sin(car1.angle);
   
+  // Set initial rear and front axles based on initial x,y and heading for car1
+  car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
+  car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
+  car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
+  car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
+
+  car1.lastLoggedHeading = car1.heading;
+  car1.lastLoggedX = car1.x;
+  car1.lastLoggedY = car1.y;
+
+  // Reset Car2
   car2.angle = Math.PI;
   car2.speed = 0.035;
   car2.steerAngle = 0;
