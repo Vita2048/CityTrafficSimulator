@@ -36,123 +36,143 @@
     button:hover {
         background-color: #45a049;
     }
-    .controls {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-    }
-    label {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      font-weight: bold;
-    }
   </style>
 </head>
 <body>
-  <div class="controls">
-  </div>
   <canvas id="trafficCanvas" width="1300" height="900"></canvas>
   <button onclick="resetSimulation()">Reset Simulation</button>
 
 <script>
   const canvas = document.getElementById('trafficCanvas');
   const ctx = canvas.getContext('2d');
-  const ROAD_WIDTH = 80*1.3;
-  const CAR_SCALE = 0.1*1.3;
+  const ROAD_WIDTH = 80 * 1.5;
+  const CAR_SCALE = 0.1 * 1.5;
   const CAR_LENGTH = 518 * CAR_SCALE;
   const WHEELBASE = (409 - 94) * CAR_SCALE;
-  const centerX = 650; // canvas.width / 2
-  const centerY = 450; // canvas.height / 2
-  const STEERING_GAIN = 0.5; // Further reduced for smoother steering
+  const centerX = 650;
+  const centerY = 450;
+  const STEERING_GAIN = 0.5;
   const LOOK_AHEAD_DISTANCE = 90;
   const SYMMETRIC_MAX_TURN_STEER_ANGLE = Math.PI / 5;
   const LOG_HEADING_THRESHOLD_DEG = 5;
   const LOG_DISTANCE_THRESHOLD_PX = 25;
-  const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4; // 620
-  const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4; // 580
-  const MAX_CENTRIFUGAL_FORCE = 0.01; // Updated per user
-  const MAX_ACCELERATION = 0.08; // Updated per user
-  const SPEED_SMOOTHING_FACTOR = 0.1; // Updated per user
-  const STEERING_SMOOTHING_FACTOR = 0.1; // New: Smooth steering changes
-  const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH; // New: Buffer zone to lock ellipse path post-rejoin
-  const DEBUG_LOG = false; // Boolean flag for debug logging
-  const USE_INTUITIVE_TURN_SIGNAL = true; // Use intuitive signals: L for left, R for right
-  // Constants for blinker timing
-const BLINKER_CYCLE_MS = 750; // 0.75s per full cycle (on + off)
-const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2; // 375ms on
+  const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;
+  const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4;
+  const MAX_CENTRIFUGAL_FORCE = 0.01;
+  const MAX_ACCELERATION = 0.08;
+  const SPEED_SMOOTHING_FACTOR = 0.1;
+  const STEERING_SMOOTHING_FACTOR = 0.1;
+  const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
+  const DEBUG_LOG = false; // Enabled for debugging
+  const USE_INTUITIVE_TURN_SIGNAL = true;
+  const BLINKER_CYCLE_MS = 500;
+  const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
+  const LOOK_AHEAD_CAR_LENGTHS = 2.0; // Increased to 2.0 for smoother behavior
+  const YIELD_TIMEOUT = 5000; // 5 seconds timeout for yielding
 
   // Car objects
-let car1 = {
-  angle: 0,
-  a: 560 + ROAD_WIDTH / 4,
-  b: 360 + ROAD_WIDTH / 4,
-  maximumSpeed: 0.05,
-  speed: 0.05,
-  currentSpeedFactor: 1.0,
-  x: 0, y: 0,
-  rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-  heading: 0,
-  steerAngle: 0,
-  targetSteerAngle: 0,
-  lastLoggedHeading: 0,
-  lastLoggedX: 0, lastLoggedY: 0,
-  path: "ellipse",
-  verticalDirection: null,
-  direction: -1, // Clockwise
-  nextTurnIsLeft: false,
-  rejoinBuffer: 0,
-  turnState: null, // null, 'approaching', 'turning', or 'rejoining'
-  willTurn: false,
-  canDecide: true // Replaces canDecideAtTop and canDecideAtBottom
-};
+  let car1 = {
+    angle: 0,
+    a: 560 + ROAD_WIDTH / 4,
+    b: 360 + ROAD_WIDTH / 4,
+    maximumSpeed: 0.05,
+    speed: 0.05,
+    currentSpeedFactor: 1.0,
+    x: 0, y: 0,
+    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+    heading: 0,
+    steerAngle: 0,
+    targetSteerAngle: 0,
+    lastLoggedHeading: 0,
+    lastLoggedX: 0, lastLoggedY: 0,
+    path: "ellipse",
+    verticalDirection: null,
+    direction: -1, // Clockwise
+    nextTurnIsLeft: false,
+    rejoinBuffer: 0,
+    turnState: null,
+    willTurn: false,
+    canDecide: true,
+    isYielding: false,
+    yieldStartTime: 0 // Track when yielding started
+  };
 
-let car2 = {
-  angle: Math.PI,
-  a: 560 - ROAD_WIDTH / 4,
-  b: 360 - ROAD_WIDTH / 4,
-  maximumSpeed: 0.05,
-  speed: 0.05,
-  currentSpeedFactor: 1.0,
-  x: 0, y: 0,
-  rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-  heading: -Math.PI / 2,
-  steerAngle: 0, targetSteerAngle: 0,
-  lastLoggedHeading: -Math.PI / 2,
-  lastLoggedX: 0, lastLoggedY: 0,
-  path: "ellipse",
-  verticalDirection: null,
-  direction: 1, // Counter-clockwise
-  nextTurnIsLeft: false,
-  rejoinBuffer: 0,
-  turnState: null,
-  willTurn: false,
-  canDecide: true
-};
+  let car2 = {
+    angle: Math.PI,
+    a: 560 - ROAD_WIDTH / 4,
+    b: 360 - ROAD_WIDTH / 4,
+    maximumSpeed: 0.05,
+    speed: 0.05,
+    currentSpeedFactor: 1.0,
+    x: 0, y: 0,
+    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+    heading: -Math.PI / 2,
+    steerAngle: 0, targetSteerAngle: 0,
+    lastLoggedHeading: -Math.PI / 2,
+    lastLoggedX: 0, lastLoggedY: 0,
+    path: "ellipse",
+    verticalDirection: null,
+    direction: 1, // Counter-clockwise
+    nextTurnIsLeft: false,
+    rejoinBuffer: 0,
+    turnState: null,
+    willTurn: false,
+    canDecide: true,
+    isYielding: false,
+    yieldStartTime: 0
+  };
 
-let car3 = {
-  angle: Math.PI / 2,
-  a: 560 + ROAD_WIDTH / 4,
-  b: 360 + ROAD_WIDTH / 4,
-  maximumSpeed: 0.05,
-  speed: 0.05,
-  currentSpeedFactor: 1.0,
-  x: 0, y: 0,
-  rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-  heading: Math.PI,
-  steerAngle: 0,
-  targetSteerAngle: 0,
-  lastLoggedHeading: Math.PI,
-  lastLoggedX: 0, lastLoggedY: 0,
-  path: "ellipse",
-  verticalDirection: null,
-  direction: -1, // Clockwise
-  nextTurnIsLeft: false,
-  rejoinBuffer: 0,
-  turnState: null,
-  willTurn: false,
-  canDecide: true
-};
+  let car3 = {
+    angle: Math.PI / 2,
+    a: 560 + ROAD_WIDTH / 4,
+    b: 360 + ROAD_WIDTH / 4,
+    maximumSpeed: 0.05,
+    speed: 0.05,
+    currentSpeedFactor: 1.0,
+    x: 0, y: 0,
+    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+    heading: Math.PI,
+    steerAngle: 0,
+    targetSteerAngle: 0,
+    lastLoggedHeading: Math.PI,
+    lastLoggedX: 0, lastLoggedY: 0,
+    path: "ellipse",
+    verticalDirection: null,
+    direction: -1, // Clockwise
+    nextTurnIsLeft: false,
+    rejoinBuffer: 0,
+    turnState: null,
+    willTurn: false,
+    canDecide: true,
+    isYielding: false,
+    yieldStartTime: 0
+  };
+  
+  
+      let car4 = {
+    angle: Math.PI / 2,
+    a: 560 - ROAD_WIDTH / 4,
+    b: 360 - ROAD_WIDTH / 4,
+    maximumSpeed: 0.05,
+    speed: 0.05,
+    currentSpeedFactor: 1.0,
+    x: 0, y: 0,
+    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
+    heading: Math.PI,
+    steerAngle: 0,
+    targetSteerAngle: 0,
+    lastLoggedHeading: Math.PI,
+    lastLoggedX: 0, lastLoggedY: 0,
+    path: "ellipse",
+    verticalDirection: null,
+    direction: 1, // Counter-clockwise
+    nextTurnIsLeft: false,
+    rejoinBuffer: 0,
+    turnState: null,
+    willTurn: false,
+    canDecide: true,
+    isYielding: false
+  };
 
   const spriteSheet = new Image();
   spriteSheet.src = 'https://vita2048.github.io/CityTrafficSimulator/CarSpritesheetLights.png';
@@ -196,12 +216,88 @@ let car3 = {
     ctx.setLineDash([]);
   }
 
+  function getDistance(carA, carB) {
+    return Math.hypot(carA.x - carB.x, carA.y - carB.y);
+  }
+
+function checkCollisionRisk(car, otherCar) {
+  const safeDistance = CAR_LENGTH * LOOK_AHEAD_CAR_LENGTHS;
+  const distance = getDistance(car, otherCar);
+  let isAhead = false;
+
+  if (car.path === "ellipse" && otherCar.path === "ellipse") {
+    const sameLane = Math.abs(car.a - otherCar.a) < ROAD_WIDTH / 2;
+    const sameDirection = car.direction === otherCar.direction;
+    if (sameLane && sameDirection) {
+      if (car.direction === 1) {
+        isAhead = otherCar.angle > car.angle && otherCar.angle - car.angle < Math.PI;
+      } else {
+        isAhead = otherCar.angle < car.angle && car.angle - otherCar.angle < Math.PI;
+      }
+    }
+  } else if (car.path === "vertical" && otherCar.path === "vertical") {
+    const sameDirection = car.verticalDirection === otherCar.verticalDirection;
+    if (sameDirection) {
+      // Original logic for same-lane traffic, preventing rear-ending.
+      isAhead = (
+        (car.verticalDirection === "up" && otherCar.y < car.y) ||
+        (car.verticalDirection === "down" && otherCar.y > car.y)
+      );
+    } else {
+      // **FIX START**: New logic for opposing traffic at intersection conflict zones.
+      const carIsApproachingTop = car.verticalDirection === "up" && car.y < centerY + ROAD_WIDTH;
+      const otherCarIsAtTop = otherCar.verticalDirection === "down" && otherCar.y < centerY + ROAD_WIDTH;
+
+      const carIsApproachingBottom = car.verticalDirection === "down" && car.y > centerY - ROAD_WIDTH;
+      const otherCarIsAtBottom = otherCar.verticalDirection === "up" && otherCar.y > centerY - ROAD_WIDTH;
+
+      // A car is considered "ahead" if it's an opposing car at the same intersection conflict zone.
+      // This forces the car approaching the rejoin point to yield to the car entering the vertical segment.
+      if ((carIsApproachingTop && otherCarIsAtTop) || (carIsApproachingBottom && otherCarIsAtBottom)) {
+        isAhead = true;
+      }
+      // **FIX END**
+    }
+  } else if (car.path === "vertical" && otherCar.path === "ellipse") {
+    // Only yield if the vertical car is very close to the ellipse intersection
+    const isRejoiningTop = car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 0.5; // Tightened threshold
+    const isRejoiningBottom = car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 0.5;
+    if (isRejoiningTop || isRejoiningBottom) {
+      const intersectionY = isRejoiningTop ? centerY - car.b : centerY + car.b;
+      const timeToIntersection = Math.abs((car.y - intersectionY) / (car.maximumSpeed * 50 * car.currentSpeedFactor));
+      const otherCarAngle = otherCar.angle + otherCar.direction * otherCar.maximumSpeed * 50 * otherCar.currentSpeedFactor * timeToIntersection;
+      const otherCarX = centerX + otherCar.a * Math.cos(otherCarAngle);
+      const otherCarY = centerY + otherCar.b * Math.sin(otherCarAngle);
+      const distanceToIntersection = Math.hypot(otherCarX - centerX, otherCarY - intersectionY);
+      isAhead = distanceToIntersection < ROAD_WIDTH && distance < safeDistance * 0.75; // Reduced threshold
+    }
+  } else if (car.path === "ellipse" && otherCar.path === "vertical") {
+    // Ellipse car only yields if vertical car is very close to the intersection
+    const isOtherRejoiningTop = otherCar.verticalDirection === "up" && otherCar.y < centerY - otherCar.b + ROAD_WIDTH * 0.5;
+    const isOtherRejoiningBottom = otherCar.verticalDirection === "down" && otherCar.y > centerY + otherCar.b - ROAD_WIDTH * 0.5;
+    if (isOtherRejoiningTop || isOtherRejoiningBottom) {
+      const intersectionY = isOtherRejoiningTop ? centerY - otherCar.b : centerY + otherCar.b;
+      const angleToIntersection = Math.atan2(intersectionY - centerY, 0);
+      const angleDiff = Math.abs(car.angle - angleToIntersection);
+      isAhead = angleDiff < Math.PI / 8 && distance < safeDistance * 0.75; // Tighter angle and distance
+    }
+  }
+
+  const relativeVelocity = (car.maximumSpeed * 50 * car.currentSpeedFactor) - (otherCar.maximumSpeed * 50 * otherCar.currentSpeedFactor);
+
+  return {
+    distance,
+    isTooClose: distance < safeDistance,
+    isAhead,
+    relativeVelocity
+  };
+}
+
   function updateCarPhysics(car, speed) {
-    car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR; // Smooth steering
+    car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR;
     const MAX_STEER_CLAMP = Math.PI / 3;
     car.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, car.steerAngle));
 
-    // Enforce centrifugal force during turn
     if (Math.abs(car.steerAngle) > 0.001) {
       const turnRadius = WHEELBASE / Math.tan(Math.abs(car.steerAngle));
       const currentVelocity = car.maximumSpeed * 50 * car.currentSpeedFactor;
@@ -228,104 +324,94 @@ let car3 = {
     car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
     car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
 
-    // Update rejoin buffer distance
     if (car.path === "ellipse" && car.verticalDirection === null) {
       car.rejoinBuffer += speed;
     }
 
-    //const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : "Car3";
-	const carName = "Car1";
+    const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : "Car4";
     const headingDeg = car.heading * 180 / Math.PI;
     const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
     const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
 
     if (DEBUG_LOG && (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX)) {
       const turnRadius = Math.abs(car.steerAngle) > 0.001 ? WHEELBASE / Math.tan(Math.abs(car.steerAngle)) : Number.MAX_VALUE;
-      console.log(`${carName} | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}° | Path:${car.path} | VertDir:${car.verticalDirection} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)} | TurnRadius:${turnRadius.toFixed(1)} | CentrifugalForce:${((car.maximumSpeed * 50 * car.currentSpeedFactor) ** 2 / (turnRadius || car.b)).toFixed(6)}`);
+      console.log(`${carName} | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}° | Path:${car.path} | VertDir:${car.verticalDirection || 'none'} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)} | TurnRadius:${turnRadius.toFixed(1)} | CentrifugalForce:${((car.maximumSpeed * 50 * car.currentSpeedFactor) ** 2 / (turnRadius || car.b)).toFixed(6)} | Yielding:${car.isYielding}`);
       car.lastLoggedHeading = car.heading;
       car.lastLoggedX = car.x;
       car.lastLoggedY = car.y;
     }
   }
 
-function drawCar(car) {
-  const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : "Car3";
-  ctx.save();
-  ctx.translate(car.x, car.y);
-  ctx.rotate(car.heading);
-  ctx.scale(CAR_SCALE, CAR_SCALE);
-  const frameWidth = 518;
-  const frameHeight = 465;
+  function drawCar(car) {
+    const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : "Car4";
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    ctx.rotate(car.heading);
+    ctx.scale(CAR_SCALE, CAR_SCALE);
+    const frameWidth = 518;
+    const frameHeight = 465;
 
-  // Draw base car image (Frame 1 at (0, 0) in 3x2 sprite sheet)
-  if (spriteSheet.complete && spriteSheet.naturalWidth > 0) {
-    ctx.drawImage(spriteSheet, 0, 0, frameWidth, frameHeight, -259, -91.5, frameWidth, frameHeight);
-  } else {
-    ctx.fillStyle = car === car3 ? 'blue' : 'red';
-    ctx.fillRect(-259, -91.5, frameWidth, frameHeight);
-  }
-
-  // Draw blinker mask if in turning or rejoining state
-  let blinkerFrame = null;
-  if (car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining') {
-    // Determine which blinker to show based on turn direction
-    if (car.nextTurnIsLeft) {
-      blinkerFrame = { sx: 1 * frameWidth, sy: 1 * frameHeight }; // Frame 5: Left blinker at (1, 1)
+    if (spriteSheet.complete && spriteSheet.naturalWidth > 0) {
+      ctx.drawImage(spriteSheet, 0, 0, frameWidth, frameHeight, -259, -91.5, frameWidth, frameHeight);
     } else {
-      blinkerFrame = { sx: 2 * frameWidth, sy: 1 * frameHeight }; // Frame 6: Right blinker at (2, 1)
+      ctx.fillStyle = car === car3 ? 'blue' : 'red';
+      ctx.fillRect(-259, -91.5, frameWidth, frameHeight);
     }
 
-    // Toggle blinker based on time (0.75s cycle: 375ms on, 375ms off)
-    const currentTime = performance.now();
-    const cycleTime = currentTime % BLINKER_CYCLE_MS;
-    const isBlinkerOn = cycleTime < BLINKER_ON_MS;
+    let blinkerFrame = null;
+    if (car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining') {
+      if (car.nextTurnIsLeft) {
+        blinkerFrame = { sx: 1 * frameWidth, sy: 1 * frameHeight };
+      } else {
+        blinkerFrame = { sx: 2 * frameWidth, sy: 1 * frameHeight };
+      }
 
-    // Draw blinker mask if "on"
-    if (blinkerFrame && isBlinkerOn && spriteSheet.complete && spriteSheet.naturalWidth > 0) {
+      const currentTime = performance.now();
+      const cycleTime = currentTime % BLINKER_CYCLE_MS;
+      const isBlinkerOn = cycleTime < BLINKER_ON_MS;
+
+      if (blinkerFrame && isBlinkerOn && spriteSheet.complete && spriteSheet.naturalWidth > 0) {
+        ctx.drawImage(
+          spriteSheet,
+          blinkerFrame.sx, blinkerFrame.sy, frameWidth, frameHeight,
+          -259, -91.5, frameWidth, frameHeight
+        );
+      }
+
+      if (DEBUG_LOG && blinkerFrame && (car.turnState === 'approaching' || car.turnState === 'turning' ||
+          (car.turnState === 'rejoining' && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)))) {
+        console.log(`${carName} displaying ${car.nextTurnIsLeft ? 'left' : 'right'} blinker: ${isBlinkerOn ? 'ON' : 'OFF'} at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), TurnState:${car.turnState}, NextTurnIsLeft:${car.nextTurnIsLeft}`);
+        car.lastLoggedX = car.x;
+        car.lastLoggedY = car.y;
+      }
+    }
+
+    if (typeof car.lastSpeedFactor === 'undefined') {
+      car.lastSpeedFactor = car.currentSpeedFactor;
+    }
+
+    const isDecelerating = car.currentSpeedFactor < car.lastSpeedFactor || car.isYielding;
+    if (isDecelerating && spriteSheet.complete && spriteSheet.naturalWidth > 0) {
+      const brakeFrame = { sx: 0, sy: 1 * frameHeight };
       ctx.drawImage(
         spriteSheet,
-        blinkerFrame.sx, blinkerFrame.sy, frameWidth, frameHeight,
+        brakeFrame.sx, brakeFrame.sy, frameWidth, frameHeight,
         -259, -91.5, frameWidth, frameHeight
       );
-    }
 
-    // Log blinker state for debugging
-    if (DEBUG_LOG && blinkerFrame && (car.turnState === 'approaching' || car.turnState === 'turning' ||
-        (car.turnState === 'rejoining' && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)))) {
-      console.log(`${carName} displaying ${car.nextTurnIsLeft ? 'left' : 'right'} blinker: ${isBlinkerOn ? 'ON' : 'OFF'} at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), TurnState:${car.turnState}, NextTurnIsLeft:${car.nextTurnIsLeft}`);
-      car.lastLoggedX = car.x;
-      car.lastLoggedY = car.y;
+      if (DEBUG_LOG && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)) {
+        console.log(`${carName} displaying brake lights at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), SpeedFactor:${car.currentSpeedFactor.toFixed(3)}, LastSpeedFactor:${car.lastSpeedFactor.toFixed(3)}, Yielding:${car.isYielding}`);
+      }
     }
-  }
-    // Initialize lastSpeedFactor if not set (first frame)
-  if (typeof car.lastSpeedFactor === 'undefined') {
     car.lastSpeedFactor = car.currentSpeedFactor;
+    ctx.restore();
   }
-
-  const isDecelerating = car.currentSpeedFactor < car.lastSpeedFactor;
-  // Draw brake lights if decelerating
-  if (isDecelerating && spriteSheet.complete && spriteSheet.naturalWidth > 0) {
-    const brakeFrame = { sx: 0, sy: 1 * frameHeight }; // Brake lights at (0, 1)
-    ctx.drawImage(
-      spriteSheet,
-      brakeFrame.sx, brakeFrame.sy, frameWidth, frameHeight,
-      -259, -91.5, frameWidth, frameHeight
-    );
-
-    // Log brake light state for debugging
-    if (DEBUG_LOG && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)) {
-      console.log(`${carName} displaying brake lights at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), SpeedFactor:${car.currentSpeedFactor.toFixed(3)}, LastSpeedFactor:${car.lastSpeedFactor.toFixed(3)}, Offset:(${offsetX * CAR_SCALE}, ${offsetY * CAR_SCALE}), CAR_SCALE:${CAR_SCALE}`);
-    }
-  }
-    // Update lastSpeedFactor for the next frame
-  car.lastSpeedFactor = car.currentSpeedFactor;
-  ctx.restore();
-}
 
 function updateCar(car) {
-  const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : "Car3";
+  const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : "Car4";
   let currentSpeed = car.maximumSpeed * 50 * car.currentSpeedFactor;
   let targetX, targetY;
+  car.isYielding = false;
 
   const isAtIntersection = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9;
   const isApproachingTopCrossroad = car.y < centerY - car.b + ROAD_WIDTH * 3 && isAtIntersection && car.path === "ellipse" && car.canDecide;
@@ -333,184 +419,250 @@ function updateCar(car) {
   const isOnVerticalSegment = car.path === "vertical";
   let isRejoining = car.path === "ellipse" && car.verticalDirection !== null;
 
-  // Calculate distance to intersections
   const distToTop = Math.abs(car.y - (centerY - car.b));
   const distToBottom = Math.abs(car.y - (centerY + car.b));
 
-  // Determine if the car will turn at the upcoming intersection
-  if (isApproachingTopCrossroad && car.turnState === null) {
-    car.willTurn = Math.random() < 0.5;
-    if (car.willTurn) {
-      // For counterclockwise (direction: 1), left turn to vertical downward
-      // For clockwise (direction: -1), right turn to vertical downward
-      car.nextTurnIsLeft = car.direction === -1 ? true : false;
-      car.turnState = 'approaching';
-      if (DEBUG_LOG) console.log(`${carName} at top crossroad: will turn ${car.nextTurnIsLeft ? 'left' : 'right'}, turnState: approaching, NextTurnIsLeft:${car.nextTurnIsLeft}`);
+  // Collision and priority checks
+  const cars = [car1, car2, car3, car4].filter(c => c !== car);
+  let minDistanceToOtherCar = Infinity;
+  let closestCarAhead = null;
+  let shouldYield = false;
+
+  for (const otherCar of cars) {
+    const { distance, isTooClose, isAhead, relativeVelocity } = checkCollisionRisk(car, otherCar);
+    if (distance < minDistanceToOtherCar) {
+      minDistanceToOtherCar = distance;
     }
-    car.canDecide = false;
-  } else if (isApproachingBottomCrossroad && car.turnState === null) {
-    car.willTurn = Math.random() < 0.5;
-    if (car.willTurn) {
-      // For counterclockwise (direction: 1), right turn to vertical upward
-      // For clockwise (direction: -1), left turn to vertical upward
-      car.nextTurnIsLeft = car.direction === 1 ? false : true;
-      car.turnState = 'approaching';
-      if (DEBUG_LOG) console.log(`${carName} at bottom crossroad: will turn ${car.nextTurnIsLeft ? 'left' : 'right'}, turnState: approaching, NextTurnIsLeft:${car.nextTurnIsLeft}`);
+    if (isAhead && distance < CAR_LENGTH * LOOK_AHEAD_CAR_LENGTHS) {
+      closestCarAhead = otherCar;
     }
-    car.canDecide = false;
+    if (isOnVerticalSegment && (
+        (car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 0.5) ||
+        (car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 0.5)
+      ) && otherCar.path === "ellipse" && isAhead) {
+      shouldYield = true;
+      car.isYielding = true;
+      car.yieldStartTime = car.yieldStartTime || performance.now();
+    }
   }
 
-  // Anticipation logic for speed adjustment
-  let targetSpeedFactor = car.currentSpeedFactor;
-  let predictedTurnRadius = car.b;
+  // Check for yield timeout to prevent deadlocks
+  if (car.isYielding && performance.now() - car.yieldStartTime > YIELD_TIMEOUT) {
+    car.isYielding = false;
+    car.yieldStartTime = 0;
+    car.currentSpeedFactor = Math.min(car.currentSpeedFactor + MAX_ACCELERATION * 0.5 / (car.maximumSpeed * 50), 1.0);
+    if (DEBUG_LOG) console.log(`${carName} yield timeout, resuming at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), SpeedFactor:${car.currentSpeedFactor.toFixed(3)}`);
+  }
 
-  if (isApproachingTopCrossroad && car.willTurn) {
-    predictedTurnRadius = ROAD_WIDTH / 2;
-  } else if (isApproachingBottomCrossroad && car.willTurn) {
-    predictedTurnRadius = ROAD_WIDTH / 2;
-  } else if (isOnVerticalSegment) {
-    if (car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 1.5) {
-      car.nextTurnIsLeft = car.direction === 1 ? false : true; // Right for CCW, left for CW
-      predictedTurnRadius = car.nextTurnIsLeft ? ROAD_WIDTH / 2 : car.b;
-      if (car.turnState !== 'rejoining') {
-        car.turnState = 'rejoining';
-        if (DEBUG_LOG) console.log(`${carName} approaching rejoin from vertical downward, turnState: rejoining, turn: ${car.nextTurnIsLeft ? 'left' : 'right'}, NextTurnIsLeft:${car.nextTurnIsLeft}`);
+  // Adjust speed for cars ahead on the same road
+  if (closestCarAhead && !car.isYielding) {
+    const safeDistance = CAR_LENGTH * LOOK_AHEAD_CAR_LENGTHS;
+    const distanceToAhead = getDistance(car, closestCarAhead);
+    if (distanceToAhead < safeDistance) {
+      if (car.path === "ellipse" && closestCarAhead.path === "vertical") {
+        // Only slow down if vertical car is very close to the intersection
+        const isOtherRejoiningTop = closestCarAhead.verticalDirection === "up" && closestCarAhead.y < centerY - closestCarAhead.b + ROAD_WIDTH * 0.5;
+        const isOtherRejoiningBottom = closestCarAhead.verticalDirection === "down" && closestCarAhead.y > centerY + closestCarAhead.b - ROAD_WIDTH * 0.5;
+        if (isOtherRejoiningTop || isOtherRejoiningBottom) {
+          const relativeVelocity = (car.maximumSpeed * 50 * car.currentSpeedFactor) - (closestCarAhead.maximumSpeed * 50 * closestCarAhead.currentSpeedFactor);
+          if (relativeVelocity > 0) {
+            const targetSpeedFactor = Math.max(0, closestCarAhead.currentSpeedFactor - (safeDistance - distanceToAhead) / safeDistance * 0.5);
+            car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+            if (DEBUG_LOG) {
+              console.log(`${carName} slowing down for ${closestCarAhead === car1 ? "Car1" : closestCarAhead === car2 ? "Car2" : closestCarAhead === car3 ? "Car3" : "Car4"} | Distance:${distanceToAhead.toFixed(1)} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)}`);
+            }
+          }
+        }
+      } else {
+        const relativeVelocity = (car.maximumSpeed * 50 * car.currentSpeedFactor) - (closestCarAhead.maximumSpeed * 50 * closestCarAhead.currentSpeedFactor);
+        if (relativeVelocity > 0) {
+          const targetSpeedFactor = Math.max(0, closestCarAhead.currentSpeedFactor - (safeDistance - distanceToAhead) / safeDistance * 0.5);
+          car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+          if (DEBUG_LOG) {
+            console.log(`${carName} slowing down for ${closestCarAhead === car1 ? "Car1" : closestCarAhead === car2 ? "Car2" : closestCarAhead === car3 ? "Car3" : "Car4"} | Distance:${distanceToAhead.toFixed(1)} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)}`);
+          }
+        }
       }
-    } else if (car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 1.5) {
-      car.nextTurnIsLeft = car.direction === -1 ? true : false; // Left for CCW, right for CW
-      predictedTurnRadius = car.nextTurnIsLeft ? ROAD_WIDTH / 2 : car.b;
-      if (car.turnState !== 'rejoining') {
-        car.turnState = 'rejoining';
-        if (DEBUG_LOG) console.log(`${carName} approaching rejoin from vertical upward, turnState: rejoining, turn: ${car.nextTurnIsLeft ? 'left' : 'right'}, NextTurnIsLeft:${car.nextTurnIsLeft}`);
-      }
-    } else {
-      predictedTurnRadius = Number.MAX_VALUE;
     }
-  } else if (isRejoining && Math.abs(car.steerAngle * 180 / Math.PI) > 10) {
-    predictedTurnRadius = Math.abs(car.steerAngle) > 0.001 ? WHEELBASE / Math.tan(Math.abs(car.steerAngle)) : car.b;
+  }
+
+  // Yielding logic for rejoining
+  if (shouldYield) {
+    car.currentSpeedFactor = 0;
+    currentSpeed = 0;
+    if (DEBUG_LOG) {
+      console.log(`${carName} yielding to ellipse traffic at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), SpeedFactor:${car.currentSpeedFactor.toFixed(3)}`);
+    }
+    targetX = car.x;
+    targetY = car.y;
   } else {
-    const expectedAngle = Math.atan2(car.y - centerY, car.x - centerX);
-    let headingError = Math.abs(car.heading - expectedAngle);
-    while (headingError > Math.PI) headingError -= 2 * Math.PI;
-    while (headingError < -Math.PI) headingError += 2 * Math.PI;
-    const radialDistance = Math.hypot(car.x - centerX, (car.y - centerY) * car.a / car.b);
-    const isOnEllipse = Math.abs(radialDistance - car.a) < ROAD_WIDTH;
-    if (isRejoining) {
-      car.rejoinBuffer += currentSpeed;
-      if ((Math.abs(headingError * 180 / Math.PI) < 20 && isOnEllipse) || car.rejoinBuffer > 100) {
-        car.verticalDirection = null;
-        car.rejoinBuffer = 0;
+    // Normal turn decision logic
+    if (isApproachingTopCrossroad && car.turnState === null) {
+      car.willTurn = Math.random() < 0.5;
+      if (car.willTurn) {
+        car.nextTurnIsLeft = car.direction === -1 ? true : false;
+        car.turnState = 'approaching';
+        if (DEBUG_LOG) console.log(`${carName} at top crossroad: will turn ${car.nextTurnIsLeft ? 'left' : 'right'}, turnState: approaching`);
+      }
+      car.canDecide = false;
+    } else if (isApproachingBottomCrossroad && car.turnState === null) {
+      car.willTurn = Math.random() < 0.5;
+      if (car.willTurn) {
+        car.nextTurnIsLeft = car.direction === 1 ? false : true;
+        car.turnState = 'approaching';
+        if (DEBUG_LOG) console.log(`${carName} at bottom crossroad: will turn ${car.nextTurnIsLeft ? 'left' : 'right'}, turnState: approaching`);
+      }
+      car.canDecide = false;
+    }
+
+    // Anticipation logic for speed adjustment
+    let targetSpeedFactor = car.currentSpeedFactor;
+    let predictedTurnRadius = car.b;
+
+    if (isApproachingTopCrossroad && car.willTurn) {
+      predictedTurnRadius = ROAD_WIDTH / 2;
+    } else if (isApproachingBottomCrossroad && car.willTurn) {
+      predictedTurnRadius = ROAD_WIDTH / 2;
+    } else if (isOnVerticalSegment) {
+      if (car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 1.5) {
+        car.nextTurnIsLeft = car.direction === 1 ? false : true;
+        predictedTurnRadius = car.nextTurnIsLeft ? ROAD_WIDTH / 2 : car.b;
+        if (car.turnState !== 'rejoining') {
+          car.turnState = 'rejoining';
+          if (DEBUG_LOG) console.log(`${carName} approaching rejoin from vertical downward, turnState: rejoining, turn: ${car.nextTurnIsLeft ? 'left' : 'right'}`);
+        }
+      } else if (car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 1.5) {
+        car.nextTurnIsLeft = car.direction === -1 ? true : false;
+        predictedTurnRadius = car.nextTurnIsLeft ? ROAD_WIDTH / 2 : car.b;
+        if (car.turnState !== 'rejoining') {
+          car.turnState = 'rejoining';
+          if (DEBUG_LOG) console.log(`${carName} approaching rejoin from vertical upward, turnState: rejoining, turn: ${car.nextTurnIsLeft ? 'left' : 'right'}`);
+        }
+      } else {
+        predictedTurnRadius = Number.MAX_VALUE;
+      }
+    } else if (isRejoining && Math.abs(car.steerAngle * 180 / Math.PI) > 10) {
+      predictedTurnRadius = Math.abs(car.steerAngle) > 0.001 ? WHEELBASE / Math.tan(Math.abs(car.steerAngle)) : car.b;
+    } else {
+      const expectedAngle = Math.atan2(car.y - centerY, car.x - centerX);
+      let headingError = Math.abs(car.heading - expectedAngle);
+      while (headingError > Math.PI) headingError -= 2 * Math.PI;
+      while (headingError < -Math.PI) headingError += 2 * Math.PI;
+      const radialDistance = Math.hypot(car.x - centerX, (car.y - centerY) * car.a / car.b);
+      const isOnEllipse = Math.abs(radialDistance - car.a) < ROAD_WIDTH * 1.5;
+      if (isRejoining) {
+        car.rejoinBuffer += currentSpeed;
+        if ((Math.abs(headingError * 180 / Math.PI) < 30 && isOnEllipse) || car.rejoinBuffer > REJOIN_BUFFER_DISTANCE * 0.5) {
+          car.verticalDirection = null;
+          car.rejoinBuffer = 0;
+          car.turnState = null;
+          isRejoining = false;
+          predictedTurnRadius = car.b;
+          if (DEBUG_LOG) console.log(`${carName} rejoin complete, reset verticalDirection and turnState at Pos:(${Math.round(car.x)}, ${Math.round(car.y)})`);
+        }
+      }
+    }
+
+    const currentVelocity = car.maximumSpeed * 50 * car.currentSpeedFactor;
+    const targetVelocity = Math.sqrt(predictedTurnRadius * MAX_CENTRIFUGAL_FORCE);
+    const decelerationDistance = Math.abs(currentVelocity - targetVelocity) / MAX_ACCELERATION * 4;
+
+    if ((isApproachingTopCrossroad && car.willTurn && distToTop <= decelerationDistance) ||
+        (isApproachingBottomCrossroad && car.willTurn && distToBottom <= decelerationDistance) ||
+        (isOnVerticalSegment && (car.y > centerY + car.b - ROAD_WIDTH * 1.5 || car.y < centerY - car.b + ROAD_WIDTH * 1.5)) ||
+        (isRejoining && Math.abs(car.steerAngle * 180 / Math.PI) > 10)) {
+      targetSpeedFactor = Math.min(1.0, targetVelocity / (car.maximumSpeed * 50));
+      car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+    } else if (car.currentSpeedFactor < 1.0 && Math.abs(car.steerAngle * 180 / Math.PI) < 10 && !isApproachingTopCrossroad && !isApproachingBottomCrossroad && !closestCarAhead) {
+      targetSpeedFactor = Math.min(1.0, car.currentSpeedFactor + MAX_ACCELERATION * 0.5 / (car.maximumSpeed * 50));
+      car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+    }
+
+    // Path and steering logic
+    if (isApproachingTopCrossroad) {
+      if (car.willTurn) {
+        car.path = "vertical";
+        car.verticalDirection = "down";
+        car.turnState = 'turning';
+        targetX = DOWNWARD_LANE_X;
+        targetY = car.y + LOOK_AHEAD_DISTANCE;
+        if (DEBUG_LOG) console.log(`${carName} at top crossroad: turning to vertical road (downward)`);
+      } else {
+        const lookAheadAngle = car.angle + car.direction * car.speed * 5;
+        targetX = centerX + car.a * Math.cos(lookAheadAngle);
+        targetY = centerY + car.b * Math.sin(lookAheadAngle);
         car.turnState = null;
-        isRejoining = false;
-        predictedTurnRadius = car.b;
-        if (DEBUG_LOG) console.log(`${carName} rejoin complete, reset verticalDirection and turnState at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), HeadingError:${(headingError * 180 / Math.PI).toFixed(1)}°, RadialDistance:${radialDistance.toFixed(1)}`);
-      } else if (DEBUG_LOG && Math.abs(car.steerAngle * 180 / Math.PI) > 10) {
-        console.log(`${carName} rejoin in progress, Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), HeadingError:${(headingError * 180 / Math.PI).toFixed(1)}°, RadialDistance:${radialDistance.toFixed(1)}, ExpectedRadius:${car.a.toFixed(1)}`);
       }
-    }
-  }
-
-  const currentVelocity = car.maximumSpeed * 50 * car.currentSpeedFactor;
-  const targetVelocity = Math.sqrt(predictedTurnRadius * MAX_CENTRIFUGAL_FORCE);
-  const decelerationDistance = Math.abs(currentVelocity - targetVelocity) / MAX_ACCELERATION * 4;
-
-  if ((isApproachingTopCrossroad && car.willTurn && distToTop <= decelerationDistance) ||
-      (isApproachingBottomCrossroad && car.willTurn && distToBottom <= decelerationDistance) ||
-      (isOnVerticalSegment && (car.y > centerY + car.b - ROAD_WIDTH * 1.5 || car.y < centerY - car.b + ROAD_WIDTH * 1.5)) ||
-      (isRejoining && Math.abs(car.steerAngle * 180 / Math.PI) > 10)) {
-    targetSpeedFactor = Math.min(1.0, targetVelocity / (car.maximumSpeed * 50));
-    car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
-  } else if (car.currentSpeedFactor < 1.0 && Math.abs(car.steerAngle * 180 / Math.PI) < 10 && !isApproachingTopCrossroad && !isApproachingBottomCrossroad) {
-    targetSpeedFactor = Math.min(1.0, car.currentSpeedFactor + MAX_ACCELERATION * 0.5 / (car.maximumSpeed * 50));
-    car.currentSpeedFactor += (targetSpeedFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
-  }
-
-  // Apply turn decision and update turnState
-  if (isApproachingTopCrossroad) {
-    if (car.willTurn) {
-      car.path = "vertical";
-      car.verticalDirection = "down";
-      car.turnState = 'turning';
-      targetX = DOWNWARD_LANE_X;
-      targetY = car.y + LOOK_AHEAD_DISTANCE;
-      if (DEBUG_LOG) console.log(`${carName} at top crossroad: turning to vertical road (downward), NextTurnIsLeft:${car.nextTurnIsLeft}`);
-    } else {
-      const lookAheadAngle = car.angle + car.direction * car.speed * 5;
-      targetX = centerX + car.a * Math.cos(lookAheadAngle);
-      targetY = centerY + car.b * Math.sin(lookAheadAngle);
-      car.turnState = null;
-    }
-  } else if (isApproachingBottomCrossroad) {
-    if (car.willTurn) {
-      car.path = "vertical";
-      car.verticalDirection = "up";
-      car.turnState = 'turning';
-      targetX = UPWARD_LANE_X;
-      targetY = car.y - LOOK_AHEAD_DISTANCE;
-      if (DEBUG_LOG) console.log(`${carName} at bottom crossroad: turning to vertical road (upward), NextTurnIsLeft:${car.nextTurnIsLeft}`);
-    } else {
-      const lookAheadAngle = car.angle + car.direction * car.speed * 5;
-      targetX = centerX + car.a * Math.cos(lookAheadAngle);
-      targetY = centerY + car.b * Math.sin(lookAheadAngle);
-      car.turnState = null;
-    }
-  } else if (isOnVerticalSegment) {
-    let laneCenter = car.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-    targetX = laneCenter;
-    targetY = car.y + (car.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
-
-    // Clear turnState when aligned with vertical road
-    const headingError = Math.abs(car.heading - (car.verticalDirection === "up" ? -Math.PI / 2 : Math.PI / 2));
-    if (headingError < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
-      car.turnState = null;
-      car.willTurn = false;
-      if (DEBUG_LOG) console.log(`${carName} turn complete, aligned with vertical road at Pos:(${Math.round(car.x)}, ${Math.round(car.y)})`);
-    }
-
-    if (car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH / 2) {
-      car.path = "ellipse";
-      car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-      if (car.nextTurnIsLeft) {
-        let targetAngleForLeftTurn = (car.direction === -1) ? Math.PI * 0.25 : Math.PI * 1.25;
-        targetX = centerX + car.a * Math.cos(targetAngleForLeftTurn);
-        targetY = centerY + car.b * Math.sin(targetAngleForLeftTurn);
-        if (DEBUG_LOG) console.log(`${carName} rejoined from vertical downward: left turn, Target:(${Math.round(targetX)}, ${Math.round(targetY)}), NextTurnIsLeft:${car.nextTurnIsLeft}`);
+    } else if (isApproachingBottomCrossroad) {
+      if (car.willTurn) {
+        car.path = "vertical";
+        car.verticalDirection = "up";
+        car.turnState = 'turning';
+        targetX = UPWARD_LANE_X;
+        targetY = car.y - LOOK_AHEAD_DISTANCE;
+        if (DEBUG_LOG) console.log(`${carName} at bottom crossroad: turning to vertical road (upward)`);
       } else {
         const lookAheadAngle = car.angle + car.direction * car.speed * 5;
         targetX = centerX + car.a * Math.cos(lookAheadAngle);
         targetY = centerY + car.b * Math.sin(lookAheadAngle);
-        if (DEBUG_LOG) console.log(`${carName} rejoined from vertical downward: right turn, Target:(${Math.round(targetX)}, ${Math.round(targetY)}), NextTurnIsLeft:${car.nextTurnIsLeft}`);
+        car.turnState = null;
       }
-    } else if (car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH / 2) {
+    } else if (isOnVerticalSegment) {
+      let laneCenter = car.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+      targetX = laneCenter;
+      targetY = car.y + (car.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
+
+      const headingError = Math.abs(car.heading - (car.verticalDirection === "up" ? -Math.PI / 2 : Math.PI / 2));
+      if (headingError < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
+        car.turnState = null;
+        car.willTurn = false;
+        if (DEBUG_LOG) console.log(`${carName} turn complete, aligned with vertical road at Pos:(${Math.round(car.x)}, ${Math.round(car.y)})`);
+      }
+
+      if (car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH / 2 && !shouldYield) {
+        car.path = "ellipse";
+        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+        if (car.nextTurnIsLeft) {
+          let targetAngleForLeftTurn = (car.direction === -1) ? Math.PI * 0.25 : Math.PI * 1.25;
+          targetX = centerX + car.a * Math.cos(targetAngleForLeftTurn);
+          targetY = centerY + car.b * Math.sin(targetAngleForLeftTurn);
+          if (DEBUG_LOG) console.log(`${carName} rejoined from vertical downward: left turn`);
+        } else {
+          const lookAheadAngle = car.angle + car.direction * car.speed * 5;
+          targetX = centerX + car.a * Math.cos(lookAheadAngle);
+          targetY = centerY + car.b * Math.sin(lookAheadAngle);
+          if (DEBUG_LOG) console.log(`${carName} rejoined from vertical downward: right turn`);
+        }
+      } else if (car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH / 2 && !shouldYield) {
+        car.path = "ellipse";
+        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+        if (car.nextTurnIsLeft) {
+          let targetAngleForLeftTurn = (car.direction === -1) ? Math.PI * 1.75 : Math.PI * 0.75;
+          targetX = centerX + car.a * Math.cos(targetAngleForLeftTurn);
+          targetY = centerY + car.b * Math.sin(targetAngleForLeftTurn);
+          if (DEBUG_LOG) console.log(`${carName} rejoined from vertical upward: left turn`);
+        } else {
+          const lookAheadAngle = car.angle + car.direction * car.speed * 5;
+          targetX = centerX + car.a * Math.cos(lookAheadAngle);
+          targetY = centerY + car.b * Math.sin(lookAheadAngle);
+          if (DEBUG_LOG) console.log(`${carName} rejoined from vertical upward: right turn`);
+        }
+      }
+    } else {
       car.path = "ellipse";
       car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-      if (car.nextTurnIsLeft) {
-        let targetAngleForLeftTurn = (car.direction === -1) ? Math.PI * 1.75 : Math.PI * 0.75;
-        targetX = centerX + car.a * Math.cos(targetAngleForLeftTurn);
-        targetY = centerY + car.b * Math.sin(targetAngleForLeftTurn);
-        if (DEBUG_LOG) console.log(`${carName} rejoined from vertical upward: left turn, Target:(${Math.round(targetX)}, ${Math.round(targetY)}), NextTurnIsLeft:${car.nextTurnIsLeft}`);
-      } else {
-        const lookAheadAngle = car.angle + car.direction * car.speed * 5;
-        targetX = centerX + car.a * Math.cos(lookAheadAngle);
-        targetY = centerY + car.b * Math.sin(lookAheadAngle);
-        if (DEBUG_LOG) console.log(`${carName} rejoined from vertical upward: right turn, Target:(${Math.round(targetX)}, ${Math.round(targetY)}), NextTurnIsLeft:${car.nextTurnIsLeft}`);
-      }
-    }
-  } else {
-    car.path = "ellipse";
-    car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-    const lookAheadAngle = car.angle + car.direction * car.speed * 5;
-    targetX = centerX + car.a * Math.cos(lookAheadAngle);
-    targetY = centerY + car.b * Math.sin(lookAheadAngle);
-
-    if (car.rejoinBuffer < REJOIN_BUFFER_DISTANCE) {
+      const lookAheadAngle = car.angle + car.direction * car.speed * 5;
       targetX = centerX + car.a * Math.cos(lookAheadAngle);
       targetY = centerY + car.b * Math.sin(lookAheadAngle);
-    }
 
-    // Reset canDecide when away from intersections
-    if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
-      car.canDecide = true;
+      if (car.rejoinBuffer < REJOIN_BUFFER_DISTANCE) {
+        targetX = centerX + car.a * Math.cos(lookAheadAngle);
+        targetY = centerY + car.b * Math.sin(lookAheadAngle);
+      }
+
+      if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
+        car.canDecide = true;
+      }
     }
   }
 
@@ -534,95 +686,121 @@ function updateCar(car) {
   updateCarPhysics(car, currentSpeed);
   car.x = Math.max(0, Math.min(canvas.width, car.x));
   car.y = Math.max(0, Math.min(canvas.height, car.y));
-
-  // Log car state periodically for context
-  if (DEBUG_LOG && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25 || Math.abs(car.heading - car.lastLoggedHeading) > Math.PI / 18)) {
-    console.log(`${carName} | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${(car.heading * 180 / Math.PI).toFixed(0)}° | Steer:${(car.steerAngle * 180 / Math.PI).toFixed(0)}° | Path:${car.path} | VertDir:${car.verticalDirection || 'none'} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)} | TurnRadius:${predictedTurnRadius.toFixed(1)} | CentrifugalForce:${((car.maximumSpeed * 50 * car.currentSpeedFactor) ** 2 / predictedTurnRadius).toFixed(6)} | TurnState:${car.turnState || 'none'}`);
-    car.lastLoggedX = car.x;
-    car.lastLoggedY = car.y;
-    car.lastLoggedHeading = car.heading;
-  }
-}function resetSimulation() {
-  car1.angle = -Math.PI / 2;
-  car1.maximumSpeed = 0.05;
-  car1.speed = 0.05;
-  car1.currentSpeedFactor = 1.0;
-  car1.steerAngle = 0;
-  car1.targetSteerAngle = 0;
-  car1.heading = 0;
-  car1.path = "ellipse";
-  car1.verticalDirection = null;
-  car1.direction = -1;
-  car1.nextTurnIsLeft = false;
-  car1.rejoinBuffer = 0;
-  car1.turnState = null;
-  car1.willTurn = false;
-  car1.canDecide = true;
-  car1.x = centerX + car1.a * Math.cos(car1.angle);
-  car1.y = centerY + car1.b * Math.sin(car1.angle);
-  car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
-  car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
-  car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
-  car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
-  car1.lastLoggedHeading = car1.heading;
-  car1.lastLoggedX = car1.x;
-  car1.lastLoggedY = car1.y;
-
-  car2.angle = Math.PI;
-  car2.maximumSpeed = 0.05;
-  car2.speed = 0.05;
-  car2.currentSpeedFactor = 1.0;
-  car2.steerAngle = 0;
-  car2.targetSteerAngle = 0;
-  car2.heading = -Math.PI / 2;
-  car2.path = "ellipse";
-  car2.verticalDirection = null;
-  car2.direction = 1;
-  car2.nextTurnIsLeft = false;
-  car2.rejoinBuffer = 0;
-  car2.turnState = null;
-  car2.willTurn = false;
-  car2.canDecide = true;
-  car2.x = centerX + car2.a * Math.cos(car2.angle);
-  car2.y = centerY + car2.b * Math.sin(car2.angle);
-  car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
-  car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
-  car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
-  car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
-  car2.lastLoggedHeading = car2.heading;
-  car2.lastLoggedX = car2.x;
-  car2.lastLoggedY = car2.y;
-
-  car3.angle = Math.PI / 2;
-  car3.maximumSpeed = 0.05;
-  car3.speed = 0.05;
-  car3.currentSpeedFactor = 1.0;
-  car3.steerAngle = 0;
-  car3.targetSteerAngle = 0;
-  car3.heading = Math.PI;
-  car3.path = "ellipse";
-  car3.verticalDirection = null;
-  car3.direction = -1;
-  car3.nextTurnIsLeft = false;
-  car3.rejoinBuffer = 0;
-  car3.turnState = null;
-  car3.willTurn = false;
-  car3.canDecide = true;
-  car3.x = centerX + car3.a * Math.cos(car3.angle);
-  car3.y = centerY + car3.b * Math.sin(car3.angle);
-  car3.rearX = car3.x - Math.cos(car3.heading) * WHEELBASE * 0.5;
-  car3.rearY = car3.y - Math.sin(car3.heading) * WHEELBASE * 0.5;
-  car3.frontX = car3.rearX + Math.cos(car3.heading) * WHEELBASE;
-  car3.frontY = car3.rearY + Math.sin(car3.heading) * WHEELBASE;
-  car3.lastLoggedHeading = car3.heading;
-  car3.lastLoggedX = car3.x;
-  car3.lastLoggedY = car3.y;
-
-  if (DEBUG_LOG) {
-    console.clear();
-    console.log("--- Simulation Reset ---");
-  }
 }
+  function resetSimulation() {
+    car1.angle = -Math.PI / 2;
+    car1.maximumSpeed = 0.05;
+    car1.speed = 0.05;
+    car1.currentSpeedFactor = 1.0;
+    car1.steerAngle = 0;
+    car1.targetSteerAngle = 0;
+    car1.heading = 0;
+    car1.path = "ellipse";
+    car1.verticalDirection = null;
+    car1.direction = -1;
+    car1.nextTurnIsLeft = false;
+    car1.rejoinBuffer = 0;
+    car1.turnState = null;
+    car1.willTurn = false;
+    car1.canDecide = true;
+    car1.isYielding = false;
+    car1.yieldStartTime = 0;
+    car1.x = centerX + car1.a * Math.cos(car1.angle);
+    car1.y = centerY + car1.b * Math.sin(car1.angle);
+    car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
+    car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
+    car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
+    car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
+    car1.lastLoggedHeading = car1.heading;
+    car1.lastLoggedX = car1.x;
+    car1.lastLoggedY = car1.y;
+
+    car2.angle = Math.PI;
+    car2.maximumSpeed = 0.05;
+    car2.speed = 0.05;
+    car2.currentSpeedFactor = 1.0;
+    car2.steerAngle = 0;
+    car2.targetSteerAngle = 0;
+    car2.heading = -Math.PI / 2;
+    car2.path = "ellipse";
+    car2.verticalDirection = null;
+    car2.direction = 1;
+    car2.nextTurnIsLeft = false;
+    car2.rejoinBuffer = 0;
+    car2.turnState = null;
+    car2.willTurn = false;
+    car2.canDecide = true;
+    car2.isYielding = false;
+    car2.yieldStartTime = 0;
+    car2.x = centerX + car2.a * Math.cos(car2.angle);
+    car2.y = centerY + car2.b * Math.sin(car2.angle);
+    car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
+    car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
+    car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
+    car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
+    car2.lastLoggedHeading = car2.heading;
+    car2.lastLoggedX = car2.x;
+    car2.lastLoggedY = car2.y;
+
+    car3.angle = Math.PI / 2;
+    car3.maximumSpeed = 0.05;
+    car3.speed = 0.05;
+    car3.currentSpeedFactor = 1.0;
+    car3.steerAngle = 0;
+    car3.targetSteerAngle = 0;
+    car3.heading = Math.PI;
+    car3.path = "ellipse";
+    car3.verticalDirection = null;
+    car3.direction = -1;
+    car3.nextTurnIsLeft = false;
+    car3.rejoinBuffer = 0;
+    car3.turnState = null;
+    car3.willTurn = false;
+    car3.canDecide = true;
+    car3.isYielding = false;
+    car3.yieldStartTime = 0;
+    car3.x = centerX + car3.a * Math.cos(car3.angle);
+    car3.y = centerY + car3.b * Math.sin(car3.angle);
+    car3.rearX = car3.x - Math.cos(car3.heading) * WHEELBASE * 0.5;
+    car3.rearY = car3.y - Math.sin(car3.heading) * WHEELBASE * 0.5;
+    car3.frontX = car3.rearX + Math.cos(car3.heading) * WHEELBASE;
+    car3.frontY = car3.rearY + Math.sin(car3.heading) * WHEELBASE;
+    car3.lastLoggedHeading = car3.heading;
+    car3.lastLoggedX = car3.x;
+    car3.lastLoggedY = car3.y;
+	
+	
+		car4.angle = Math.PI / 2;
+    car4.maximumSpeed = 0.05;
+    car4.speed = 0.05;
+    car4.currentSpeedFactor = 1.0;
+    car4.steerAngle = 0;
+    car4.targetSteerAngle = 0;
+    car4.heading = Math.PI;
+    car4.path = "ellipse";
+    car4.verticalDirection = null;
+    car4.direction = 1;
+    car4.nextTurnIsLeft = false;
+    car4.rejoinBuffer = 0;
+    car4.turnState = null;
+    car4.willTurn = false;
+    car4.canDecide = true;
+    car4.isYielding = false;
+    car4.x = centerX + car4.a * Math.cos(car4.angle);
+    car4.y = centerY + car4.b * Math.sin(car4.angle);
+    car4.rearX = car4.x - Math.cos(car4.heading) * WHEELBASE * 0.5;
+    car4.rearY = car4.y - Math.sin(car4.heading) * WHEELBASE * 0.5;
+    car4.frontX = car4.rearX + Math.cos(car4.heading) * WHEELBASE;
+    car4.frontY = car4.rearY + Math.sin(car4.heading) * WHEELBASE;
+    car4.lastLoggedHeading = car4.heading;
+    car4.lastLoggedX = car4.x;
+    car4.lastLoggedY = car4.y;
+
+    if (DEBUG_LOG) {
+      console.clear();
+      console.log("--- Simulation Reset ---");
+    }
+  }
 
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -633,6 +811,7 @@ function updateCar(car) {
     drawCar(car1);
     drawCar(car2);
     drawCar(car3);
+	drawCar(car4);
     update();
     requestAnimationFrame(draw);
   }
@@ -641,6 +820,7 @@ function updateCar(car) {
     updateCar(car1);
     updateCar(car2);
     updateCar(car3);
+	updateCar(car4);
   }
 
   spriteSheet.onload = () => {
