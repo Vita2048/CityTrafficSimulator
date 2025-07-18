@@ -78,8 +78,8 @@
   // Car objects
   let car1 = {
     angle: 0,
-    a: 560 + ROAD_WIDTH / 4,
-    b: 360 + ROAD_WIDTH / 4,
+    a: 560 - ROAD_WIDTH / 4,
+    b: 360 - ROAD_WIDTH / 4,
     maximumSpeed: 0.05,
     speed: 0.05,
     currentSpeedFactor: 1.0,
@@ -92,7 +92,7 @@
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: -1, // Clockwise
+    direction: 1, 
     isMakingTurn: false, // Renamed willTurn
     turnDirection: null, // New: 'left', 'right', 'straight'
     rejoinBuffer: 0,
@@ -104,8 +104,8 @@
 
   let car2 = {
     angle: Math.PI,
-    a: 560 - ROAD_WIDTH / 4,
-    b: 360 - ROAD_WIDTH / 4,
+    a: 560 + ROAD_WIDTH / 4,
+    b: 360 + ROAD_WIDTH / 4,
     maximumSpeed: 0.05,
     speed: 0.05,
     currentSpeedFactor: 1.0,
@@ -117,7 +117,7 @@
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: 1, // Counter-clockwise
+    direction: -1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
@@ -128,7 +128,7 @@
   };
 
   let car3 = {
-    angle: Math.PI / 2,
+    angle: Math.PI ,
     a: 560 + ROAD_WIDTH / 4,
     b: 360 + ROAD_WIDTH / 4,
     maximumSpeed: 0.05,
@@ -136,14 +136,14 @@
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
     rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: Math.PI,
+    heading: -Math.PI / 2,
     steerAngle: 0,
     targetSteerAngle: 0,
-    lastLoggedHeading: Math.PI,
+    lastLoggedHeading: -Math.PI / 2,
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: -1, // Clockwise
+    direction: -1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
@@ -155,7 +155,7 @@
 
 
       let car4 = {
-    angle: Math.PI / 2,
+    angle: Math.PI ,
     a: 560 - ROAD_WIDTH / 4,
     b: 360 - ROAD_WIDTH / 4,
     maximumSpeed: 0.05,
@@ -163,20 +163,21 @@
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
     rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: Math.PI,
+    heading: Math.PI/2,
     steerAngle: 0,
     targetSteerAngle: 0,
-    lastLoggedHeading: Math.PI,
+    lastLoggedHeading: Math.PI/2,
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: 1, // Counter-clockwise
+    direction: 1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
     turnState: null,
     canDecide: true,
-    isYielding: false
+    isYielding: false,
+	    yieldStartTime: 0
   };
 
   // Add car5
@@ -196,7 +197,7 @@
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: -1, // Clockwise (same as car1 and car3)
+    direction: -1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
@@ -208,8 +209,8 @@
 
 let car6 = {
     angle: 0, // Start at the bottom of the ellipse
-    a: 560 + ROAD_WIDTH / 4, // Right side of the elliptical road
-    b: 360 + ROAD_WIDTH / 4,
+    a: 560 - ROAD_WIDTH / 4, // Right side of the elliptical road
+    b: 360 - ROAD_WIDTH / 4,
     maximumSpeed: 0.05,
     speed: 0.05,
     currentSpeedFactor: 1.0,
@@ -221,7 +222,7 @@ let car6 = {
     lastLoggedX: 0, lastLoggedY: 0,
     path: "ellipse",
     verticalDirection: null,
-    direction: -1, // Clockwise
+    direction: 1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
@@ -230,6 +231,192 @@ let car6 = {
     isYielding: false,
     yieldStartTime: 0
 };
+
+function resetSimulation() {
+    // Reset car1 (CW)
+    car1.angle = 0; // Right side
+    car1.heading = Math.PI / 2; // Pointing up
+    car1.maximumSpeed = 0.05;
+    car1.speed = 0.05;
+    car1.currentSpeedFactor = 1.0;
+    car1.steerAngle = 0;
+    car1.targetSteerAngle = 0;
+    car1.path = "ellipse";
+    car1.verticalDirection = null;
+    car1.direction = 1;
+    car1.isMakingTurn = false;
+    car1.turnDirection = null;
+    car1.rejoinBuffer = 0;
+    car1.turnState = null;
+    car1.canDecide = true;
+    car1.isYielding = false;
+    car1.yieldStartTime = 0;
+    car1.x = centerX + car1.a * Math.cos(car1.angle);
+    car1.y = centerY + car1.b * Math.sin(car1.angle);
+    car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
+    car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
+    car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
+    car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
+    car1.lastLoggedHeading = car1.heading;
+    car1.lastLoggedX = car1.x;
+    car1.lastLoggedY = car1.y;
+
+    
+    car2.angle = Math.PI * 5 / 4; 
+    car2.heading = car2.angle - Math.PI / 2; 
+    car2.maximumSpeed = 0.05;
+    car2.speed = 0.05;
+    car2.currentSpeedFactor = 1.0;
+    car2.steerAngle = 0;
+    car2.targetSteerAngle = 0;
+    car2.path = "ellipse";
+    car2.verticalDirection = null;
+    car2.direction = -1;
+    car2.isMakingTurn = false;
+    car2.turnDirection = null;
+    car2.rejoinBuffer = 0;
+    car2.turnState = null;
+    car2.canDecide = true;
+    car2.isYielding = false;
+    car2.yieldStartTime = 0;
+    car2.x = centerX + car2.a * Math.cos(car2.angle);
+    car2.y = centerY + car2.b * Math.sin(car2.angle);
+    car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
+    car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
+    car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
+    car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
+    car2.lastLoggedHeading = car2.heading;
+    car2.lastLoggedX = car2.x;
+    car2.lastLoggedY = car2.y;
+
+    
+    car3.angle = Math.PI ; 
+    car3.heading = car3.angle - Math.PI / 2;
+    car3.maximumSpeed = 0.05;
+    car3.speed = 0.05;
+    car3.currentSpeedFactor = 1.0;
+    car3.steerAngle = 0;
+    car3.targetSteerAngle = 0;
+    car3.path = "ellipse";
+    car3.verticalDirection = null;
+    car3.direction = -1;
+    car3.isMakingTurn = false;
+    car3.turnDirection = null;
+    car3.rejoinBuffer = 0;
+    car3.turnState = null;
+    car3.canDecide = true;
+    car3.isYielding = false;
+    car3.yieldStartTime = 0;
+    car3.x = centerX + car3.a * Math.cos(car3.angle);
+    car3.y = centerY + car3.b * Math.sin(car3.angle);
+    car3.rearX = car3.x - Math.cos(car3.heading) * WHEELBASE * 0.5;
+    car3.rearY = car3.y - Math.sin(car3.heading) * WHEELBASE * 0.5;
+    car3.frontX = car3.rearX + Math.cos(car3.heading) * WHEELBASE;
+    car3.frontY = car3.rearY + Math.sin(car3.heading) * WHEELBASE;
+    car3.lastLoggedHeading = car3.heading;
+    car3.lastLoggedX = car3.x;
+    car3.lastLoggedY = car3.y;
+
+    
+    car4.angle = Math.PI / 3; 
+    car4.heading = Math.PI / 1.3;
+    car4.maximumSpeed = 0.05;
+    car4.speed = 0.05;
+    car4.currentSpeedFactor = 1.0;
+    car4.steerAngle = 0;
+    car4.targetSteerAngle = 0;
+    car4.path = "ellipse";
+    car4.verticalDirection = null;
+    car4.direction = 1;
+    car4.isMakingTurn = false;
+    car4.turnDirection = null;
+    car4.rejoinBuffer = 0;
+    car4.turnState = null;
+    car4.canDecide = true;
+    car4.isYielding = false;
+    car4.x = centerX + car4.a * Math.cos(car4.angle);
+    car4.y = centerY + car4.b * Math.sin(car4.angle);
+    car4.rearX = car4.x - Math.cos(car4.heading) * WHEELBASE * 0.5;
+    car4.rearY = car4.y - Math.sin(car4.heading) * WHEELBASE * 0.5;
+    car4.frontX = car4.rearX + Math.cos(car4.heading) * WHEELBASE;
+    car4.frontY = car4.rearY + Math.sin(car4.heading) * WHEELBASE;
+    car4.lastLoggedHeading = car4.heading;
+    car4.lastLoggedX = car4.x;
+    car4.lastLoggedY = car4.y;
+
+    // Reset car5 (CW)
+    car5.angle = -Math.PI / 2; // Top
+    car5.heading = Math.PI; // Pointing right
+    car5.maximumSpeed = 0.05;
+    car5.speed = 0.05;
+    car5.currentSpeedFactor = 1.0;
+    car5.steerAngle = 0;
+    car5.targetSteerAngle = 0;
+    car5.path = "ellipse";
+    car5.verticalDirection = null;
+    car5.direction = -1;
+    car5.isMakingTurn = false;
+    car5.turnDirection = null;
+    car5.rejoinBuffer = 0;
+    car5.turnState = null;
+    car5.canDecide = true;
+    car5.isYielding = false;
+    car5.yieldStartTime = 0;
+    car5.x = centerX + car5.a * Math.cos(car5.angle);
+    car5.y = centerY + car5.b * Math.sin(car5.angle);
+    car5.rearX = car5.x - Math.cos(car5.heading) * WHEELBASE * 0.5;
+    car5.rearY = car5.y - Math.sin(car5.heading) * WHEELBASE * 0.5;
+    car5.frontX = car5.rearX + Math.cos(car5.heading) * WHEELBASE;
+    car5.frontY = car5.rearY + Math.sin(car5.heading) * WHEELBASE;
+    car5.lastLoggedHeading = car5.heading;
+    car5.lastLoggedX = car5.x;
+    car5.lastLoggedY = car5.y;
+
+  // Reset car6 (CW)
+  car6.angle = Math.PI / 2; // Bottom
+  car6.heading = Math.PI; // Pointing left
+  car6.maximumSpeed = 0.05;
+  car6.speed = 0.05;
+  car6.currentSpeedFactor = 1.0;
+  car6.steerAngle = 0;
+  car6.targetSteerAngle = 0;
+  car6.path = "ellipse";
+  car6.verticalDirection = null;
+  car6.direction = 1;
+  car6.isMakingTurn = false;
+  car6.turnDirection = null;
+  car6.rejoinBuffer = 0;
+  car6.turnState = null;
+  car6.canDecide = true;
+  car6.isYielding = false;
+  car6.yieldStartTime = 0;
+  car6.x = centerX + car6.a * Math.cos(car6.angle);
+  car6.y = centerY + car6.b * Math.sin(car6.angle);
+  car6.rearX = car6.x - Math.cos(car6.heading) * WHEELBASE * 0.5;
+  car6.rearY = car6.y - Math.sin(car6.heading) * WHEELBASE * 0.5;
+  car6.frontX = car6.rearX + Math.cos(car6.heading) * WHEELBASE;
+  car6.frontY = car6.rearY + Math.sin(car6.heading) * WHEELBASE;
+  car6.lastLoggedHeading = car6.heading;
+  car6.lastLoggedX = car6.x;
+  car6.lastLoggedY = car6.y;
+
+    if (DEBUG_LOG) {
+      console.clear();
+      console.log("--- Simulation Reset ---");
+    }
+
+    if (!isSimulationRunning) {
+      isSimulationRunning = true;
+      const button = document.getElementById('toggleSimulationButton');
+      if (button) button.textContent = 'Stop Simulation';
+    }
+    
+    if (animationFrameId) {
+      cancelAnimationFrame(animationFrameId);
+    }
+    gameLoop();
+  }
+
 
   const spriteSheet = new Image();
   spriteSheet.src = 'https://vita2048.github.io/CityTrafficSimulator/CarSpritesheetLights.png';
@@ -730,7 +917,8 @@ function predictTrajectory(car) {
     const isAtTopCrossroadEntrance = car.path === 'vertical' && car.verticalDirection === 'down' && Math.abs(car.frontY - (centerY - car.b)) < 10;
     const isAtBottomCrossroadEntrance = car.path === 'vertical' && car.verticalDirection === 'up' && Math.abs(car.frontY - (centerY + car.b)) < 10;
 
-    if (!isChangingDirection || !trajectoryHitsCrossroad) {
+if (!isChangingDirection || !trajectoryHitsCrossroad) {
+        // Logic for cars NOT changing direction or NOT hitting crossroad (e.g., following lane, simple collisions)
         for (const otherCar of allCars) {
             if (car === otherCar) continue;
             let isAheadInLane = false;
@@ -754,48 +942,87 @@ function predictTrajectory(car) {
                 }
             }
         }
-    } else {
-        if (car.path === 'vertical') {
-            const isJoiningCCW = car.direction === 1;
-            const isJoiningCW = car.direction === -1;
-            if (isJoiningCW && (isAtTopCrossroadEntrance || isAtBottomCrossroadEntrance)) {
+    } else { // This is the block for cars that ARE changing direction OR whose trajectory HITS a crossroad
+			if (car.path === 'vertical') {
+				const isJoiningCCW = car.direction === 1;
+				const isJoiningCW = car.direction === -1;
+
+				if (isJoiningCW) {
+					for (const otherCar of allCars) {
+						if (car === otherCar) continue;
+						if (otherCar.path === 'ellipse') {
+							if (checkTrajectoryIntersection(trajectory, otherCar)) {
+								shouldStop = true;
+								break;
+							}
+						}
+					}
+				} else if (isJoiningCCW) {
+					for (const otherCar of allCars) {
+						if (car === otherCar) continue;
+
+						if (otherCar.path === 'ellipse') {
+							if (checkTrajectoryIntersection(trajectory, otherCar)) {
+								shouldStop = true;
+								break;
+							}
+						}
+						else if (otherCar.path === 'vertical' && otherCar.turnState === 'turning') {
+							const carDistanceToCrossroad = car.verticalDirection === 'up' ? Math.abs(car.frontY - (centerY + car.b)) : Math.abs(car.frontY - (centerY - car.b));
+							const otherCarDistanceToCrossroad = (otherCar.verticalDirection === 'up' ? Math.abs(otherCar.frontY - (centerY + car.b)) : Math.abs(otherCar.frontY - (centerY - car.b)));
+							if (checkTrajectoryIntersection(trajectory, otherCar) && carDistanceToCrossroad >= otherCarDistanceToCrossroad) {
+								shouldStop = true;
+								break;
+							}
+						}
+					}
+				}
+            } else if (car.path === 'ellipse' && car.turnState === 'rejoining') { // NEW BLOCK FOR REJOINING ONTO ELLIPSE
                 for (const otherCar of allCars) {
                     if (car === otherCar) continue;
-                    if (otherCar.path === 'ellipse') {
+                    // A rejoining car should yield to all cars already on the elliptical path whose trajectory intersects
+                    if (otherCar.path === 'ellipse') { // Only yield to cars on the elliptical path for now
                         if (checkTrajectoryIntersection(trajectory, otherCar)) {
                             shouldStop = true;
+                            if (DEBUG_LOG) console.log(`${carName} yielding to ${otherCar === car1 ? "Car1" : otherCar === car2 ? "Car2" : otherCar === car3 ? "Car3" : otherCar === car4 ? "Car4" : otherCar === car5 ? "Car5" : otherCar === car6 ? "Car6" : "UnknownCar"} (rejoining onto ellipse).`);
                             break;
                         }
                     }
                 }
-            } else if (isJoiningCCW && (isAtTopCrossroadEntrance || isAtBottomCrossroadEntrance)) {
-                for (const otherCar of allCars) {
-                    if (car === otherCar) continue;
-                    if (otherCar.path === 'ellipse' || (otherCar.path === 'vertical' && otherCar.turnState === 'turning' && (otherCar.turnDirection === 'left' || otherCar.turnDirection === 'right'))) {
-                        const carDistanceToCrossroad = car.verticalDirection === 'up' ? Math.abs(car.frontY - (centerY + car.b)) : Math.abs(car.frontY - (centerY - car.b));
-                        const otherCarDistanceToCrossroad = otherCar.path === 'ellipse' ? 0 : (otherCar.verticalDirection === 'up' ? Math.abs(otherCar.frontY - (centerY + car.b)) : Math.abs(otherCar.frontY - (centerY - car.b)));
-                        if (checkTrajectoryIntersection(trajectory, otherCar) && carDistanceToCrossroad >= otherCarDistanceToCrossroad) {
-                            shouldStop = true;
-                            break;
+            } else if (car.path === 'ellipse' && car.isMakingTurn && (car.turnDirection === 'left' || car.turnDirection === 'right')) { // Modified condition for turning from ellipse to vertical
+                const isAtCrossroad = isNearTopCrossroad || isNearBottomCrossroad;
+                if (isAtCrossroad) {
+                    for (const otherCar of allCars) {
+                        if (car === otherCar) continue;
+                        // Simplified yielding condition for cars turning from ellipse.
+                        // If trajectories intersect, and the other car is straight on ellipse, or turning into the path
+                        // the current car is entering, it should yield.
+                        if (checkTrajectoryIntersection(trajectory, otherCar)) {
+                            let yieldConditionMet = false;
+                            if (otherCar.path === 'ellipse') {
+                                // Yield to any car on the ellipse whose path intersects if it's not also yielding to us.
+                                // A simpler rule: if other car is on ellipse and not turning, or turning in a way that conflicts.
+                                if (!otherCar.isMakingTurn || otherCar.turnDirection === 'straight' ||
+                                    (otherCar.turnState === 'approaching' && otherCar.turnDirection !== car.turnDirection && otherCar.direction !== car.direction)
+                                ) {
+                                    yieldConditionMet = true;
+                                }
+                            } else if (otherCar.path === 'vertical') {
+                                // If turning from ellipse to vertical, yield to vertical traffic, especially those committed to a turn or going straight
+                                if (otherCar.turnState === 'turning' || otherCar.turnDirection === 'straight') {
+                                    yieldConditionMet = true;
+                                }
+                            }
+
+                            if (yieldConditionMet) {
+                                shouldStop = true;
+                                if (DEBUG_LOG) console.log(`${carName} yielding to ${otherCar === car1 ? "Car1" : otherCar === car2 ? "Car2" : otherCar === car3 ? "Car3" : otherCar === car4 ? "Car4" : otherCar === car5 ? "Car5" : otherCar === car6 ? "Car6" : "UnknownCar"} (ellipse to vertical turn).`);
+                                break;
+                            }
                         }
                     }
                 }
             }
-        } else if (car.path === 'ellipse' && car.turnDirection === 'left') {
-            const isAtCrossroad = isNearTopCrossroad || isNearBottomCrossroad;
-            if (isAtCrossroad) {
-                for (const otherCar of allCars) {
-                    if (car === otherCar) continue;
-                    if ((otherCar.path === 'ellipse' && otherCar.direction !== car.direction) || (otherCar.path === 'vertical' && otherCar.turnState === 'turning' && ((car.direction === 1 && otherCar.turnDirection === 'right') || (car.direction === -1 && otherCar.turnDirection === 'left') || (otherCar.turnDirection === 'left' && otherCar.verticalDirection === (car.direction === 1 ? 'up' : 'down'))))) {
-                        const shouldYield = car.direction === 1 || (otherCar.path === 'ellipse' && otherCar.direction === -1) || (otherCar.path === 'vertical' && otherCar.turnState === 'turning' && otherCar.turnDirection === 'right');
-                        if (checkTrajectoryIntersection(trajectory, otherCar) && shouldYield) {
-                            shouldStop = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     car.isYielding = shouldStop;
@@ -968,191 +1195,7 @@ function predictTrajectory(car) {
   car.x = Math.max(0, Math.min(canvas.width, car.x));
   car.y = Math.max(0, Math.min(canvas.height, car.y));
 }
-  function resetSimulation() {
-    // Reset car1 (CW)
-    car1.angle = 0; // Right side
-    car1.heading = Math.PI / 2; // Pointing up
-    car1.maximumSpeed = 0.05;
-    car1.speed = 0.05;
-    car1.currentSpeedFactor = 1.0;
-    car1.steerAngle = 0;
-    car1.targetSteerAngle = 0;
-    car1.path = "ellipse";
-    car1.verticalDirection = null;
-    car1.direction = -1;
-    car1.isMakingTurn = false;
-    car1.turnDirection = null;
-    car1.rejoinBuffer = 0;
-    car1.turnState = null;
-    car1.canDecide = true;
-    car1.isYielding = false;
-    car1.yieldStartTime = 0;
-    car1.x = centerX + car1.a * Math.cos(car1.angle);
-    car1.y = centerY + car1.b * Math.sin(car1.angle);
-    car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
-    car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
-    car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
-    car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
-    car1.lastLoggedHeading = car1.heading;
-    car1.lastLoggedX = car1.x;
-    car1.lastLoggedY = car1.y;
-
-    // Reset car2 (CCW)
-    car2.angle = Math.PI * 5 / 4; // Top-left quadrant
-    car2.heading = car2.angle - Math.PI / 2; // Pointing down-left
-    car2.maximumSpeed = 0.05;
-    car2.speed = 0.05;
-    car2.currentSpeedFactor = 1.0;
-    car2.steerAngle = 0;
-    car2.targetSteerAngle = 0;
-    car2.path = "ellipse";
-    car2.verticalDirection = null;
-    car2.direction = 1;
-    car2.isMakingTurn = false;
-    car2.turnDirection = null;
-    car2.rejoinBuffer = 0;
-    car2.turnState = null;
-    car2.canDecide = true;
-    car2.isYielding = false;
-    car2.yieldStartTime = 0;
-    car2.x = centerX + car2.a * Math.cos(car2.angle);
-    car2.y = centerY + car2.b * Math.sin(car2.angle);
-    car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
-    car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
-    car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
-    car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
-    car2.lastLoggedHeading = car2.heading;
-    car2.lastLoggedX = car2.x;
-    car2.lastLoggedY = car2.y;
-
-    // Reset car3 (CW)
-    car3.angle = Math.PI; // Left side
-    car3.heading = Math.PI * 3 / 2; // Pointing down
-    car3.maximumSpeed = 0.05;
-    car3.speed = 0.05;
-    car3.currentSpeedFactor = 1.0;
-    car3.steerAngle = 0;
-    car3.targetSteerAngle = 0;
-    car3.path = "ellipse";
-    car3.verticalDirection = null;
-    car3.direction = -1;
-    car3.isMakingTurn = false;
-    car3.turnDirection = null;
-    car3.rejoinBuffer = 0;
-    car3.turnState = null;
-    car3.canDecide = true;
-    car3.isYielding = false;
-    car3.yieldStartTime = 0;
-    car3.x = centerX + car3.a * Math.cos(car3.angle);
-    car3.y = centerY + car3.b * Math.sin(car3.angle);
-    car3.rearX = car3.x - Math.cos(car3.heading) * WHEELBASE * 0.5;
-    car3.rearY = car3.y - Math.sin(car3.heading) * WHEELBASE * 0.5;
-    car3.frontX = car3.rearX + Math.cos(car3.heading) * WHEELBASE;
-    car3.frontY = car3.rearY + Math.sin(car3.heading) * WHEELBASE;
-    car3.lastLoggedHeading = car3.heading;
-    car3.lastLoggedX = car3.x;
-    car3.lastLoggedY = car3.y;
-
-    // Reset car4 (CCW)
-    car4.angle = Math.PI / 4; // Bottom-right quadrant
-    car4.heading = car4.angle - Math.PI / 2; // Pointing up-right
-    car4.maximumSpeed = 0.05;
-    car4.speed = 0.05;
-    car4.currentSpeedFactor = 1.0;
-    car4.steerAngle = 0;
-    car4.targetSteerAngle = 0;
-    car4.path = "ellipse";
-    car4.verticalDirection = null;
-    car4.direction = 1;
-    car4.isMakingTurn = false;
-    car4.turnDirection = null;
-    car4.rejoinBuffer = 0;
-    car4.turnState = null;
-    car4.canDecide = true;
-    car4.isYielding = false;
-    car4.x = centerX + car4.a * Math.cos(car4.angle);
-    car4.y = centerY + car4.b * Math.sin(car4.angle);
-    car4.rearX = car4.x - Math.cos(car4.heading) * WHEELBASE * 0.5;
-    car4.rearY = car4.y - Math.sin(car4.heading) * WHEELBASE * 0.5;
-    car4.frontX = car4.rearX + Math.cos(car4.heading) * WHEELBASE;
-    car4.frontY = car4.rearY + Math.sin(car4.heading) * WHEELBASE;
-    car4.lastLoggedHeading = car4.heading;
-    car4.lastLoggedX = car4.x;
-    car4.lastLoggedY = car4.y;
-
-    // Reset car5 (CW)
-    car5.angle = -Math.PI / 2; // Top
-    car5.heading = 0; // Pointing right
-    car5.maximumSpeed = 0.05;
-    car5.speed = 0.05;
-    car5.currentSpeedFactor = 1.0;
-    car5.steerAngle = 0;
-    car5.targetSteerAngle = 0;
-    car5.path = "ellipse";
-    car5.verticalDirection = null;
-    car5.direction = -1;
-    car5.isMakingTurn = false;
-    car5.turnDirection = null;
-    car5.rejoinBuffer = 0;
-    car5.turnState = null;
-    car5.canDecide = true;
-    car5.isYielding = false;
-    car5.yieldStartTime = 0;
-    car5.x = centerX + car5.a * Math.cos(car5.angle);
-    car5.y = centerY + car5.b * Math.sin(car5.angle);
-    car5.rearX = car5.x - Math.cos(car5.heading) * WHEELBASE * 0.5;
-    car5.rearY = car5.y - Math.sin(car5.heading) * WHEELBASE * 0.5;
-    car5.frontX = car5.rearX + Math.cos(car5.heading) * WHEELBASE;
-    car5.frontY = car5.rearY + Math.sin(car5.heading) * WHEELBASE;
-    car5.lastLoggedHeading = car5.heading;
-    car5.lastLoggedX = car5.x;
-    car5.lastLoggedY = car5.y;
-
-  // Reset car6 (CW)
-  car6.angle = Math.PI / 2; // Bottom
-  car6.heading = Math.PI; // Pointing left
-  car6.maximumSpeed = 0.05;
-  car6.speed = 0.05;
-  car6.currentSpeedFactor = 1.0;
-  car6.steerAngle = 0;
-  car6.targetSteerAngle = 0;
-  car6.path = "ellipse";
-  car6.verticalDirection = null;
-  car6.direction = -1; // Clockwise
-  car6.isMakingTurn = false;
-  car6.turnDirection = null;
-  car6.rejoinBuffer = 0;
-  car6.turnState = null;
-  car6.canDecide = true;
-  car6.isYielding = false;
-  car6.yieldStartTime = 0;
-  car6.x = centerX + car6.a * Math.cos(car6.angle);
-  car6.y = centerY + car6.b * Math.sin(car6.angle);
-  car6.rearX = car6.x - Math.cos(car6.heading) * WHEELBASE * 0.5;
-  car6.rearY = car6.y - Math.sin(car6.heading) * WHEELBASE * 0.5;
-  car6.frontX = car6.rearX + Math.cos(car6.heading) * WHEELBASE;
-  car6.frontY = car6.rearY + Math.sin(car6.heading) * WHEELBASE;
-  car6.lastLoggedHeading = car6.heading;
-  car6.lastLoggedX = car6.x;
-  car6.lastLoggedY = car6.y;
-
-    if (DEBUG_LOG) {
-      console.clear();
-      console.log("--- Simulation Reset ---");
-    }
-
-    if (!isSimulationRunning) {
-      isSimulationRunning = true;
-      const button = document.getElementById('toggleSimulationButton');
-      if (button) button.textContent = 'Stop Simulation';
-    }
-    
-    if (animationFrameId) {
-      cancelAnimationFrame(animationFrameId);
-    }
-    gameLoop();
-  }
-
+  
     // Function to draw crossroad areas for debugging
   function drawCrossroadAreas() {
     ctx.save();
