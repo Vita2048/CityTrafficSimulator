@@ -74,12 +74,16 @@
   const TRAJECTORY_LENGTH = 4.0; // In car lengths
   const APPROACH_DISTANCE = TRAJECTORY_LENGTH * CAR_LENGTH;
 
+  // Declare car objects globally
+  let car1 = {};
+  let car2 = {};
+  let car3 = {};
+  let car4 = {};
+  let car5 = {};
+  let car6 = {};
 
-  // Car objects
-  let car1 = {
-    angle: 0,
-    a: 560 - ROAD_WIDTH / 4,
-    b: 360 - ROAD_WIDTH / 4,
+  // Default properties for a car
+  const CAR_DEFAULTS = {
     maximumSpeed: 0.05,
     speed: 0.05,
     currentSpeedFactor: 1.0,
@@ -93,31 +97,6 @@
     path: "ellipse",
     verticalDirection: null,
     direction: 1, 
-    isMakingTurn: false, // Renamed willTurn
-    turnDirection: null, // New: 'left', 'right', 'straight'
-    rejoinBuffer: 0,
-    turnState: null,
-    canDecide: true,
-    isYielding: false,
-    yieldStartTime: 0 // Track when yielding started
-  };
-
-  let car2 = {
-    angle: Math.PI,
-    a: 560 + ROAD_WIDTH / 4,
-    b: 360 + ROAD_WIDTH / 4,
-    maximumSpeed: 0.05,
-    speed: 0.05,
-    currentSpeedFactor: 1.0,
-    x: 0, y: 0,
-    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: -Math.PI / 2,
-    steerAngle: 0, targetSteerAngle: 0,
-    lastLoggedHeading: -Math.PI / 2,
-    lastLoggedX: 0, lastLoggedY: 0,
-    path: "ellipse",
-    verticalDirection: null,
-    direction: -1, 
     isMakingTurn: false,
     turnDirection: null,
     rejoinBuffer: 0,
@@ -127,278 +106,79 @@
     yieldStartTime: 0
   };
 
-  let car3 = {
-    angle: Math.PI ,
-    a: 560 + ROAD_WIDTH / 4,
-    b: 360 + ROAD_WIDTH / 4,
-    maximumSpeed: 0.05,
-    speed: 0.05,
-    currentSpeedFactor: 1.0,
-    x: 0, y: 0,
-    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: -Math.PI / 2,
-    steerAngle: 0,
-    targetSteerAngle: 0,
-    lastLoggedHeading: -Math.PI / 2,
-    lastLoggedX: 0, lastLoggedY: 0,
-    path: "ellipse",
-    verticalDirection: null,
-    direction: -1, 
-    isMakingTurn: false,
-    turnDirection: null,
-    rejoinBuffer: 0,
-    turnState: null,
-    canDecide: true,
-    isYielding: false,
-    yieldStartTime: 0
-  };
-
-
-      let car4 = {
-    angle: Math.PI ,
-    a: 560 - ROAD_WIDTH / 4,
-    b: 360 - ROAD_WIDTH / 4,
-    maximumSpeed: 0.05,
-    speed: 0.05,
-    currentSpeedFactor: 1.0,
-    x: 0, y: 0,
-    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: Math.PI/2,
-    steerAngle: 0,
-    targetSteerAngle: 0,
-    lastLoggedHeading: Math.PI/2,
-    lastLoggedX: 0, lastLoggedY: 0,
-    path: "ellipse",
-    verticalDirection: null,
-    direction: 1, 
-    isMakingTurn: false,
-    turnDirection: null,
-    rejoinBuffer: 0,
-    turnState: null,
-    canDecide: true,
-    isYielding: false,
-	    yieldStartTime: 0
-  };
-
-  // Add car5
-  let car5 = {
-    angle: Math.PI / 2, // Start at the bottom of the ellipse
-    a: 560 + ROAD_WIDTH / 4, // Same lane as car1 and car3
-    b: 360 + ROAD_WIDTH / 4,
-    maximumSpeed: 0.05,
-    speed: 0.05,
-    currentSpeedFactor: 1.0,
-    x: 0, y: 0,
-    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: 0, // Initial heading
-    steerAngle: 0,
-    targetSteerAngle: 0,
-    lastLoggedHeading: 0,
-    lastLoggedX: 0, lastLoggedY: 0,
-    path: "ellipse",
-    verticalDirection: null,
-    direction: -1, 
-    isMakingTurn: false,
-    turnDirection: null,
-    rejoinBuffer: 0,
-    turnState: null,
-    canDecide: true,
-    isYielding: false,
-    yieldStartTime: 0
-  };
-
-let car6 = {
-    angle: 0, // Start at the bottom of the ellipse
-    a: 560 - ROAD_WIDTH / 4, // Right side of the elliptical road
-    b: 360 - ROAD_WIDTH / 4,
-    maximumSpeed: 0.05,
-    speed: 0.05,
-    currentSpeedFactor: 1.0,
-    x: 0, y: 0,
-    rearX: 0, rearY: 0, frontX: 0, frontY: 0,
-    heading: 0, // Initial heading, will be adjusted by physics
-    steerAngle: 0, targetSteerAngle: 0,
-    lastLoggedHeading: 0,
-    lastLoggedX: 0, lastLoggedY: 0,
-    path: "ellipse",
-    verticalDirection: null,
-    direction: 1, 
-    isMakingTurn: false,
-    turnDirection: null,
-    rejoinBuffer: 0,
-    turnState: null,
-    canDecide: true,
-    isYielding: false,
-    yieldStartTime: 0
-};
+  // Helper to create a car object with default and specific properties
+  function createCar(overrides) {
+    return { ...CAR_DEFAULTS, ...overrides };
+  }
 
 function resetSimulation() {
     // Reset car1 (CW)
-    car1.angle = 0; // Right side
-    car1.heading = Math.PI / 2; // Pointing up
-    car1.maximumSpeed = 0.05;
-    car1.speed = 0.05;
-    car1.currentSpeedFactor = 1.0;
-    car1.steerAngle = 0;
-    car1.targetSteerAngle = 0;
-    car1.path = "ellipse";
-    car1.verticalDirection = null;
-    car1.direction = 1;
-    car1.isMakingTurn = false;
-    car1.turnDirection = null;
-    car1.rejoinBuffer = 0;
-    car1.turnState = null;
-    car1.canDecide = true;
-    car1.isYielding = false;
-    car1.yieldStartTime = 0;
-    car1.x = centerX + car1.a * Math.cos(car1.angle);
-    car1.y = centerY + car1.b * Math.sin(car1.angle);
-    car1.rearX = car1.x - Math.cos(car1.heading) * WHEELBASE * 0.5;
-    car1.rearY = car1.y - Math.sin(car1.heading) * WHEELBASE * 0.5;
-    car1.frontX = car1.rearX + Math.cos(car1.heading) * WHEELBASE;
-    car1.frontY = car1.rearY + Math.sin(car1.heading) * WHEELBASE;
-    car1.lastLoggedHeading = car1.heading;
-    car1.lastLoggedX = car1.x;
-    car1.lastLoggedY = car1.y;
+    Object.assign(car1, createCar({
+        angle: 0, // Right side
+        heading: Math.PI / 2, // Pointing up
+        a: 560 - ROAD_WIDTH / 4,
+        b: 360 - ROAD_WIDTH / 4,
+        direction: 1
+    }));
 
-    
-    car2.angle = Math.PI * 5 / 4; 
-    car2.heading = car2.angle - Math.PI / 2; 
-    car2.maximumSpeed = 0.05;
-    car2.speed = 0.05;
-    car2.currentSpeedFactor = 1.0;
-    car2.steerAngle = 0;
-    car2.targetSteerAngle = 0;
-    car2.path = "ellipse";
-    car2.verticalDirection = null;
-    car2.direction = -1;
-    car2.isMakingTurn = false;
-    car2.turnDirection = null;
-    car2.rejoinBuffer = 0;
-    car2.turnState = null;
-    car2.canDecide = true;
-    car2.isYielding = false;
-    car2.yieldStartTime = 0;
-    car2.x = centerX + car2.a * Math.cos(car2.angle);
-    car2.y = centerY + car2.b * Math.sin(car2.angle);
-    car2.rearX = car2.x - Math.cos(car2.heading) * WHEELBASE * 0.5;
-    car2.rearY = car2.y - Math.sin(car2.heading) * WHEELBASE * 0.5;
-    car2.frontX = car2.rearX + Math.cos(car2.heading) * WHEELBASE;
-    car2.frontY = car2.rearY + Math.sin(car2.heading) * WHEELBASE;
-    car2.lastLoggedHeading = car2.heading;
-    car2.lastLoggedX = car2.x;
-    car2.lastLoggedY = car2.y;
+    // Reset car2 (CCW)
+    Object.assign(car2, createCar({
+        angle: Math.PI * 5 / 4, 
+        heading: Math.PI * 5 / 4 - Math.PI / 2, // Calculated based on angle for ellipse
+        a: 560 + ROAD_WIDTH / 4,
+        b: 360 + ROAD_WIDTH / 4,
+        direction: -1
+    }));
 
-    
-    car3.angle = Math.PI ; 
-    car3.heading = car3.angle - Math.PI / 2;
-    car3.maximumSpeed = 0.05;
-    car3.speed = 0.05;
-    car3.currentSpeedFactor = 1.0;
-    car3.steerAngle = 0;
-    car3.targetSteerAngle = 0;
-    car3.path = "ellipse";
-    car3.verticalDirection = null;
-    car3.direction = -1;
-    car3.isMakingTurn = false;
-    car3.turnDirection = null;
-    car3.rejoinBuffer = 0;
-    car3.turnState = null;
-    car3.canDecide = true;
-    car3.isYielding = false;
-    car3.yieldStartTime = 0;
-    car3.x = centerX + car3.a * Math.cos(car3.angle);
-    car3.y = centerY + car3.b * Math.sin(car3.angle);
-    car3.rearX = car3.x - Math.cos(car3.heading) * WHEELBASE * 0.5;
-    car3.rearY = car3.y - Math.sin(car3.heading) * WHEELBASE * 0.5;
-    car3.frontX = car3.rearX + Math.cos(car3.heading) * WHEELBASE;
-    car3.frontY = car3.rearY + Math.sin(car3.heading) * WHEELBASE;
-    car3.lastLoggedHeading = car3.heading;
-    car3.lastLoggedX = car3.x;
-    car3.lastLoggedY = car3.y;
+    // Reset car3 (CCW)
+    Object.assign(car3, createCar({
+        angle: Math.PI, 
+        heading: Math.PI - Math.PI / 2, // Calculated based on angle for ellipse
+        a: 560 + ROAD_WIDTH / 4,
+        b: 360 + ROAD_WIDTH / 4,
+        direction: -1
+    }));
 
-    
-    car4.angle = Math.PI / 3; 
-    car4.heading = Math.PI / 1.3;
-    car4.maximumSpeed = 0.05;
-    car4.speed = 0.05;
-    car4.currentSpeedFactor = 1.0;
-    car4.steerAngle = 0;
-    car4.targetSteerAngle = 0;
-    car4.path = "ellipse";
-    car4.verticalDirection = null;
-    car4.direction = 1;
-    car4.isMakingTurn = false;
-    car4.turnDirection = null;
-    car4.rejoinBuffer = 0;
-    car4.turnState = null;
-    car4.canDecide = true;
-    car4.isYielding = false;
-    car4.x = centerX + car4.a * Math.cos(car4.angle);
-    car4.y = centerY + car4.b * Math.sin(car4.angle);
-    car4.rearX = car4.x - Math.cos(car4.heading) * WHEELBASE * 0.5;
-    car4.rearY = car4.y - Math.sin(car4.heading) * WHEELBASE * 0.5;
-    car4.frontX = car4.rearX + Math.cos(car4.heading) * WHEELBASE;
-    car4.frontY = car4.rearY + Math.sin(car4.heading) * WHEELBASE;
-    car4.lastLoggedHeading = car4.heading;
-    car4.lastLoggedX = car4.x;
-    car4.lastLoggedY = car4.y;
+    // Reset car4 (CW)
+    Object.assign(car4, createCar({
+        angle: Math.PI / 3, 
+        heading: Math.PI / 1.3, // Example fixed heading, consider dynamic calculation
+        a: 560 - ROAD_WIDTH / 4,
+        b: 360 - ROAD_WIDTH / 4,
+        direction: 1
+    }));
 
-    // Reset car5 (CW)
-    car5.angle = -Math.PI / 2; // Top
-    car5.heading = Math.PI; // Pointing right
-    car5.maximumSpeed = 0.05;
-    car5.speed = 0.05;
-    car5.currentSpeedFactor = 1.0;
-    car5.steerAngle = 0;
-    car5.targetSteerAngle = 0;
-    car5.path = "ellipse";
-    car5.verticalDirection = null;
-    car5.direction = -1;
-    car5.isMakingTurn = false;
-    car5.turnDirection = null;
-    car5.rejoinBuffer = 0;
-    car5.turnState = null;
-    car5.canDecide = true;
-    car5.isYielding = false;
-    car5.yieldStartTime = 0;
-    car5.x = centerX + car5.a * Math.cos(car5.angle);
-    car5.y = centerY + car5.b * Math.sin(car5.angle);
-    car5.rearX = car5.x - Math.cos(car5.heading) * WHEELBASE * 0.5;
-    car5.rearY = car5.y - Math.sin(car5.heading) * WHEELBASE * 0.5;
-    car5.frontX = car5.rearX + Math.cos(car5.heading) * WHEELBASE;
-    car5.frontY = car5.rearY + Math.sin(car5.heading) * WHEELBASE;
-    car5.lastLoggedHeading = car5.heading;
-    car5.lastLoggedX = car5.x;
-    car5.lastLoggedY = car5.y;
+    // Reset car5 (CCW)
+    Object.assign(car5, createCar({
+        angle: -Math.PI / 2, // Top
+        heading: Math.PI, // Pointing right
+        a: 560 + ROAD_WIDTH / 4,
+        b: 360 + ROAD_WIDTH / 4,
+        direction: -1
+    }));
 
-  // Reset car6 (CW)
-  car6.angle = Math.PI / 2; // Bottom
-  car6.heading = Math.PI; // Pointing left
-  car6.maximumSpeed = 0.05;
-  car6.speed = 0.05;
-  car6.currentSpeedFactor = 1.0;
-  car6.steerAngle = 0;
-  car6.targetSteerAngle = 0;
-  car6.path = "ellipse";
-  car6.verticalDirection = null;
-  car6.direction = 1;
-  car6.isMakingTurn = false;
-  car6.turnDirection = null;
-  car6.rejoinBuffer = 0;
-  car6.turnState = null;
-  car6.canDecide = true;
-  car6.isYielding = false;
-  car6.yieldStartTime = 0;
-  car6.x = centerX + car6.a * Math.cos(car6.angle);
-  car6.y = centerY + car6.b * Math.sin(car6.angle);
-  car6.rearX = car6.x - Math.cos(car6.heading) * WHEELBASE * 0.5;
-  car6.rearY = car6.y - Math.sin(car6.heading) * WHEELBASE * 0.5;
-  car6.frontX = car6.rearX + Math.cos(car6.heading) * WHEELBASE;
-  car6.frontY = car6.rearY + Math.sin(car6.heading) * WHEELBASE;
-  car6.lastLoggedHeading = car6.heading;
-  car6.lastLoggedX = car6.x;
-  car6.lastLoggedY = car6.y;
+    // Reset car6 (CW)
+    Object.assign(car6, createCar({
+        angle: Math.PI / 2, // Bottom
+        heading: Math.PI, // Pointing left
+        a: 560 - ROAD_WIDTH / 4,
+        b: 360 - ROAD_WIDTH / 4,
+        direction: 1
+    }));
+
+    // Initialize position and other calculated properties for all cars
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    allCars.forEach(car => {
+        car.x = centerX + car.a * Math.cos(car.angle);
+        car.y = centerY + car.b * Math.sin(car.angle);
+        car.rearX = car.x - Math.cos(car.heading) * WHEELBASE * 0.5;
+        car.rearY = car.y - Math.sin(car.heading) * WHEELBASE * 0.5;
+        car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
+        car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
+        car.lastLoggedHeading = car.heading;
+        car.lastLoggedX = car.x;
+        car.lastLoggedY = car.y;
+    });
 
     if (DEBUG_LOG) {
       console.clear();
@@ -538,50 +318,50 @@ function checkTrajectoryVsArea(trajectory, area) {
     return false;
 }
 
-// Function to get the lookahead point for steering, used for prediction
+// **** FIX STARTS HERE: Refactored function for consistent trajectory prediction ****
+// This function is now fully based on the car's state (path, isMakingTurn, turnState)
+// to ensure the predicted trajectory always matches the car's intended maneuver.
 function getLookaheadPointForPrediction(car) {
     let targetX, targetY;
     const isOnVerticalSegment = car.path === "vertical";
 
-    // Rejoining from vertical to ellipse
-    const approachingBottomRejoin = isOnVerticalSegment && car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 1.5;
-    const approachingTopRejoin = isOnVerticalSegment && car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 1.5;
+    // Condition: Car is on the ellipse and will turn onto the vertical road.
+    const willTurnToVertical = car.path === "ellipse" && car.isMakingTurn && (car.turnState === 'approaching' || car.turnState === 'turning');
+    
+    // Condition: Car is on the vertical road and will turn (rejoin) the ellipse.
+    // This now triggers as soon as the car's state is 'approaching', ensuring the
+    // prediction is consistent from the moment the decision is made.
+    const willRejoinEllipse = isOnVerticalSegment && car.isMakingTurn && (car.turnState === 'approaching' || car.turnState === 'rejoining');
 
-    // *** FIX: The prediction logic for a turn now depends only on the car's intent (`isMakingTurn`)
-    // and its general location (top/bottom half), not on being perfectly aligned with the intersection.
-    // This makes the predicted trajectory show the turn much earlier.
-    const willTurnAtTop = car.path === "ellipse" && car.isMakingTurn && car.y < centerY;
-    const willTurnAtBottom = car.path === "ellipse" && car.isMakingTurn && car.y > centerY;
-
-    if (willTurnAtTop) {
+    if (willTurnToVertical && car.y < centerY) {
         // Guide towards the vertical downward lane
         targetX = DOWNWARD_LANE_X;
         targetY = car.y + LOOK_AHEAD_DISTANCE;
-    } else if (willTurnAtBottom) {
+    } else if (willTurnToVertical && car.y > centerY) {
         // Guide towards the vertical upward lane
         targetX = UPWARD_LANE_X;
         targetY = car.y - LOOK_AHEAD_DISTANCE;
-    } else if (approachingBottomRejoin || approachingTopRejoin) {
-        // Guide towards the elliptical path
-        // Calculate the angle on the ellipse corresponding to the current (x,y)
+    } else if (willRejoinEllipse) {
+        // Guide towards the elliptical path. The car's future lane (a, b, direction) is already set.
+        // We calculate the point on the target ellipse that corresponds to our current position, then look ahead from there.
         const currentEllipseAngle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-        // Project a point LOOK_AHEAD_DISTANCE along the intended elliptical path
-        const lookAheadAngleOnEllipse = currentEllipseAngle + car.direction * (LOOK_AHEAD_DISTANCE / car.b); // Approximate angular step
+        const lookAheadAngleOnEllipse = currentEllipseAngle + car.direction * (LOOK_AHEAD_DISTANCE / car.b);
         targetX = centerX + car.a * Math.cos(lookAheadAngleOnEllipse);
         targetY = centerY + car.b * Math.sin(lookAheadAngleOnEllipse);
     } else if (isOnVerticalSegment) {
-        // Continue straight on vertical road
+        // If on vertical but not planning to turn yet, go straight.
         let laneCenter = car.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
         targetX = laneCenter;
         targetY = car.y + (car.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
     } else { // On ellipse, not turning or rejoining
-        // Continue along elliptical path
-        const lookAheadAngle = car.angle + car.direction * (LOOK_AHEAD_DISTANCE / car.b); // Use LOOK_AHEAD_DISTANCE for consistent lookahead
+        // Default: Continue along the current elliptical path.
+        const lookAheadAngle = car.angle + car.direction * (LOOK_AHEAD_DISTANCE / car.b);
         targetX = centerX + car.a * Math.cos(lookAheadAngle);
         targetY = centerY + car.b * Math.sin(lookAheadAngle);
     }
     return { targetX, targetY };
 }
+// **** FIX ENDS HERE ****
 
 
 // Function to predict a car's future trajectory
@@ -681,7 +461,10 @@ function predictTrajectory(car) {
       car.rejoinBuffer += speed;
     }
 
-    const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : car === car4 ? "Car4" : car === car5 ? "Car5" : car === car6 ? "Car6" : "UnknownCar";
+    const carNames = [null, "Car1", "Car2", "Car3", "Car4", "Car5", "Car6"];
+    const carNumber = [car1, car2, car3, car4, car5, car6].indexOf(car) + 1;
+    const carName = carNames[carNumber];
+
     const headingDeg = car.heading * 180 / Math.PI;
     const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
     const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
@@ -741,8 +524,10 @@ function predictTrajectory(car) {
 
 
   function drawCar(car) {
-    const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : car === car4 ? "Car4" : car === car5 ? "Car5" : car === car6 ? "Car6" : "UnknownCar";
-    const carNumber = carName.replace('Car','');
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    const carNumber = allCars.indexOf(car) + 1;
+    const carName = `Car${carNumber}`;
+
     ctx.save();
     ctx.translate(car.x, car.y);
     ctx.rotate(car.heading);
@@ -821,31 +606,56 @@ function predictTrajectory(car) {
       }
     }
     car.lastSpeedFactor = car.currentSpeedFactor;
-    ctx.restore();
+
 
     const predictedTrajectory = predictTrajectory(car);
     let turnType = 'straight';
 
-    const isOnVerticalSegment = car.path === "vertical";
-    const isRejoiningAtTop = isOnVerticalSegment && car.verticalDirection === "up" && car.y < centerY - car.b + ROAD_WIDTH * 1.5;
-    const isRejoiningAtBottom = isOnVerticalSegment && car.verticalDirection === "down" && car.y > centerY + car.b - ROAD_WIDTH * 1.5;
+    // **** FIX STARTS HERE: New trajectory coloring logic based on maneuver state ****
+    // This logic ensures the trajectory color is consistent throughout a multi-stage maneuver
+    // by correctly identifying the overall maneuver type based on the car's state.
 
-    if (car.isMakingTurn && car.path === 'ellipse' && car.turnDirection === 'left') {
-        turnType = 'ellipse-to-vertical-left';
-    } else if (isRejoiningAtTop || isRejoiningAtBottom || car.turnState === 'rejoining') {
+    // Case 1: Ellipse-to-Vertical Maneuver
+    // This is identified by the car being in the 'turning' state, or 'approaching' a turn from the ellipse.
+    if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
         if (car.turnDirection === 'left') {
-            turnType = 'vertical-to-ellipse-left';
+            turnType = 'ellipse-to-vertical-left'; // Blue
+        }
+        // If turning right from the ellipse, turnType remains 'straight' (green), as requested.
+    }
+    // Case 2: Vertical-to-Ellipse (Rejoin) Maneuver
+    // This is identified by the car being in the 'rejoining' state, or 'approaching' a turn from a vertical segment.
+    else if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical')) {
+        if (car.turnDirection === 'left') {
+            turnType = 'vertical-to-ellipse-left'; // Orange-Red ("Red Amber")
         } else if (car.turnDirection === 'right') {
-            turnType = 'vertical-to-ellipse-right';
+            turnType = 'vertical-to-ellipse-right'; // Dark Orange ("Blue Amber")
         }
     }
+    // **** FIX ENDS HERE ****
+	
+	ctx.font = 'bold 80px sans-serif'; // Smaller font for additional info
+	ctx.fillStyle = 'white'; // White for better visibility
+	ctx.fillText(`Dir: ${car.direction === 1 ? 'CW' : 'CCW'}`, 0, 100);
+	ctx.fillText(`VDir: ${car.verticalDirection || 'none'}`, 0, 180);
+	ctx.fillText(`TurnType: ${car.turnType || 'none'}`, 0, 260); // turnType not used in car object, but kept for consistency
+	ctx.fillText(`State: ${car.turnState || 'none'}`, 0, 340);
+	ctx.fillText(`TurnDir: ${car.turnDirection || 'none'}`, 0, 420);
+	ctx.fillText(`Path: ${car.path || 'none'}`, 0, 540);
+	ctx.fillText(`CanDecide: ${car.canDecide}`, 0, 600);
+	
+	
+	ctx.restore();
 
     drawTrajectory(car, predictedTrajectory, turnType);
   }
 
 
  function updateCar(car) {
-    const carName = car === car1 ? "Car1" : car === car2 ? "Car2" : car === car3 ? "Car3" : car === car4 ? "Car4" : car === car5 ? "Car5" : car === car6 ? "Car6" : "UnknownCar";
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    const carNumber = allCars.indexOf(car) + 1;
+    const carName = `Car${carNumber}`;
+
     let currentSpeed = car.maximumSpeed * 50 * car.currentSpeedFactor;
     let targetX, targetY;
 
@@ -854,9 +664,6 @@ function predictTrajectory(car) {
     const isOnVerticalSegment = car.path === "vertical";
     let isRejoining = car.path === "ellipse" && car.verticalDirection !== null;
 
-    // *** FIX: The conditions for approaching an intersection are now wider, using APPROACH_DISTANCE
-    // on the x-axis. This triggers the turn decision logic much earlier, before the car is
-    // directly aligned with the vertical road.
     const isNearTopCrossroad = car.path === "ellipse" && car.y < centerY && Math.abs(car.x - centerX) < APPROACH_DISTANCE;
     const isNearBottomCrossroad = car.path === "ellipse" && car.y > centerY && Math.abs(car.x - centerX) < APPROACH_DISTANCE;
 
@@ -891,23 +698,38 @@ function predictTrajectory(car) {
             }
             car.canDecide = false;
         } else if (isApproachingTopVerticalCrossroad || isApproachingBottomVerticalCrossroad) {
+            // *** FIX: This is the main change. The car now randomly decides its turn
+            // direction and updates its properties (lane parameters a, b and driving direction) accordingly.
             car.isMakingTurn = true; // Always turn to rejoin ellipse
             car.turnState = 'approaching';
-            if (car.verticalDirection === "down") {
-                // Rejoining at bottom (from top vertical). To join CW (outer) lane, turn left. To join CCW (inner) lane, turn right.
-                car.turnDirection = (car.direction === -1) ? 'left' : 'right';
-            } else { // verticalDirection === "up"
-                // Rejoining at top (from bottom vertical). To join CCW (inner) lane, turn left. To join CW (outer) lane, turn right.
-                car.turnDirection = (car.direction === 1) ? 'left' : 'right';
-            }
+            
+            const randomTurn = Math.random() < 0.5 ? 'left' : 'right';
+            car.turnDirection = randomTurn;
+
+            const outerLaneA = 560 - ROAD_WIDTH / 4;
+            const outerLaneB = 360 - ROAD_WIDTH / 4;
+            const innerLaneA = 560 + ROAD_WIDTH / 4;
+            const innerLaneB = 360 + ROAD_WIDTH / 4;
+
+			if (randomTurn === 'left') { // Turn left to join inner, CCW lane
+				car.direction = -1;
+				car.a = innerLaneA;
+				car.b = innerLaneB;
+			} else { // Turn right to join outer, CW lane
+				car.direction = 1;
+				car.a = outerLaneA;
+				car.b = outerLaneB;
+			}
+
+            
             car.canDecide = false;
-            if (DEBUG_LOG) console.log(`${carName} approaching vertical rejoin: will turn ${car.turnDirection}, turnState: approaching`);
+            if (DEBUG_LOG) console.log(`%c${carName} approaching vertical rejoin: RANDOMLY chose ${car.turnDirection}, new lane direction ${car.direction}`, 'color: magenta; font-weight: bold;');
         }
     }
 
 
     const trajectory = predictTrajectory(car);
-    const allCars = [car1, car2, car3, car4, car5, car6];
+    
     let shouldStop = false;
     let collisionSlowdownFactor = 1.0;
 
@@ -984,7 +806,7 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
                     if (otherCar.path === 'ellipse') { // Only yield to cars on the elliptical path for now
                         if (checkTrajectoryIntersection(trajectory, otherCar)) {
                             shouldStop = true;
-                            if (DEBUG_LOG) console.log(`${carName} yielding to ${otherCar === car1 ? "Car1" : otherCar === car2 ? "Car2" : otherCar === car3 ? "Car3" : otherCar === car4 ? "Car4" : otherCar === car5 ? "Car5" : otherCar === car6 ? "Car6" : "UnknownCar"} (rejoining onto ellipse).`);
+                            if (DEBUG_LOG) console.log(`${carName} yielding to Car${allCars.indexOf(otherCar) + 1} (rejoining onto ellipse).`);
                             break;
                         }
                     }
@@ -1016,7 +838,7 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
 
                             if (yieldConditionMet) {
                                 shouldStop = true;
-                                if (DEBUG_LOG) console.log(`${carName} yielding to ${otherCar === car1 ? "Car1" : otherCar === car2 ? "Car2" : otherCar === car3 ? "Car3" : otherCar === car4 ? "Car4" : otherCar === car5 ? "Car5" : otherCar === car6 ? "Car6" : "UnknownCar"} (ellipse to vertical turn).`);
+                                if (DEBUG_LOG) console.log(`${carName} yielding to Car${allCars.indexOf(otherCar) + 1} (ellipse to vertical turn).`);
                                 break;
                             }
                         }
@@ -1102,7 +924,12 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
     currentSpeed = car.maximumSpeed * 50 * car.currentSpeedFactor;
 
     // Path guidance logic
-    if (car.isMakingTurn && car.path === 'ellipse') {
+    // **** FIX STARTS HERE ****
+    // The condition now includes a check for car.turnState !== 'rejoining'.
+    // This prevents a car that is rejoining the ellipse from being immediately
+    // rerouted back onto the vertical path.
+    if (car.isMakingTurn && car.path === 'ellipse' && car.turnState !== 'rejoining') {
+    // **** FIX ENDS HERE ****
         const isAtTopIntersection = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y < centerY;
         const isAtBottomIntersection = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y > centerY;
 
@@ -1112,6 +939,7 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
             car.turnState = 'turning';
             targetX = DOWNWARD_LANE_X;
             targetY = car.y + LOOK_AHEAD_DISTANCE;
+
         } else if (isAtBottomIntersection) {
             car.path = "vertical";
             car.verticalDirection = "up";
@@ -1132,7 +960,8 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
         if (headingError < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
             car.turnState = null;
             car.isMakingTurn = false;
-            //car.turnDirection = null;
+			car.canDecide = true;
+			car.turnDirection = null;
         }
         
         // Transition back to ellipse
@@ -1145,6 +974,7 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
             targetY = centerY + car.b * Math.sin(lookAheadAngle);
             car.turnState = 'rejoining'; // Keep rejoin state until stable
         }
+        
     } else { // On elliptical path, not turning to vertical
         car.path = "ellipse";
         if (!isRejoining) { // Only update angle if not actively rejoining
@@ -1171,7 +1001,9 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
         if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
             car.canDecide = true;
         }
-    }
+    
+
+	}
 
 
   const dx = targetX - car.x;
@@ -1194,15 +1026,14 @@ if (!isChangingDirection || !trajectoryHitsCrossroad) {
   updateCarPhysics(car, currentSpeed);
   car.x = Math.max(0, Math.min(canvas.width, car.x));
   car.y = Math.max(0, Math.min(canvas.height, car.y));
-}
-  
+}  
     // Function to draw crossroad areas for debugging
   function drawCrossroadAreas() {
     ctx.save();
     ctx.globalAlpha = 0.2;
     ctx.fillStyle = 'purple';
     ctx.fillRect(topCrossroadArea.x, topCrossroadArea.y, topCrossroadArea.width, topCrossroadArea.height);
-    ctx.fillRect(bottomCrossroadArea.x, bottomCrossroadArea.y, bottomCrossroadArea.width, bottomCrossroadArea.height);
+    ctx.fillRect(bottomCrossroadArea.x, bottomCrossroadArea.y, bottomCrossroadArea.height, bottomCrossroadArea.height);
     ctx.restore();
   }
 
