@@ -59,7 +59,7 @@
   const LOG_DISTANCE_THRESHOLD_PX = 25;
   const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;
   const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4;
-  const MAX_CENTRIFUGAL_FORCE = 0.01;
+  const MAX_CENTRIFUGAL_FORCE = 0.02;
   const MAX_ACCELERATION = 0.08;
   const SPEED_SMOOTHING_FACTOR = 0.1;
   const STEERING_SMOOTHING_FACTOR = 0.1;
@@ -68,12 +68,12 @@
   const USE_INTUITIVE_TURN_SIGNAL = true;
   const BLINKER_CYCLE_MS = 500;
   const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
-  const YIELD_TIMEOUT = 5000; // 5 seconds timeout for yielding
+  const YIELD_TIMEOUT = 3000; // Reduced to 3 seconds to break deadlocks faster
   const TRAJECTORY_LOOKAHEAD_DISTANCE = 300; // Increased distance (in pixels) to check for future overlaps
   const AGGRESSIVE_DECELERATION_FACTOR = 2.0; // Factor to multiply MAX_ACCELERATION when aggressive stop is needed (e.g., 2.0 allows double the normal deceleration)
 
   // New tunable parameter for trajectory prediction
-  const TRAJECTORY_LENGTH = 4.0; // In car lengths
+  const TRAJECTORY_LENGTH = 4.0;
   const APPROACH_DISTANCE = TRAJECTORY_LENGTH * CAR_LENGTH;
 
   // Declare car objects globally
@@ -200,8 +200,6 @@ function resetSimulation() {
     }
     gameLoop();
   }
-
-
   const spriteSheet = new Image();
   spriteSheet.src = 'https://vita2048.github.io/CityTrafficSimulator/CarSpritesheetLights.png';
 
@@ -246,8 +244,6 @@ function resetSimulation() {
     ctx.stroke();
     ctx.setLineDash([]);
   }
-
-
   function getDistance(carA, carB) {
     return Math.hypot(carA.x - carB.x, carA.y - carB.y);
   }
@@ -325,8 +321,6 @@ function checkPolygonIntersection(polyA, polyB) {
     // If no separating axis was found, the polygons are intersecting
     return true;
 }
-
-
 function checkTrajectoryVsStaticBox(trajectory, staticCarBox) {
     if (!trajectory || trajectory.length === 0) return false;
     for (const state of trajectory) {
@@ -585,8 +579,6 @@ function predictTrajectory(car) {
         ctx.fill();
     }
   }
-
-
   function drawCar(car) {
     const allCars = [car1, car2, car3, car4, car5, car6];
     const carNumber = allCars.indexOf(car) + 1;
@@ -620,8 +612,6 @@ function predictTrajectory(car) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(carNumber, 0, 0);
-
-
     let blinkerFrame = null;
     const isTurningOrRejoining = car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining';
 
@@ -670,8 +660,6 @@ function predictTrajectory(car) {
       }
     }
     car.lastSpeedFactor = car.currentSpeedFactor;
-
-
     const predictedTrajectory = predictTrajectory(car);
     let turnType = 'straight';
 
@@ -697,14 +685,10 @@ function predictTrajectory(car) {
     ctx.fillText(`TurnDir: ${car.turnDirection || 'none'}`, 0, 420);
     ctx.fillText(`Path: ${car.path || 'none'}`, 0, 540);
     ctx.fillText(`CanDecide: ${car.canDecide}`, 0, 600);
-
-
     ctx.restore();
 
     drawTrajectory(car, predictedTrajectory, turnType);
   }
-
-
 function updateCar(car) {
   const allCars = [car1, car2, car3, car4, car5, car6];
   const carNumber = allCars.indexOf(car) + 1;
@@ -748,20 +732,20 @@ function updateCar(car) {
       }
       car.canDecide = false;
     } else if (isApproachingTopVerticalCrossroad || isApproachingBottomVerticalCrossroad) {
-      car.isMakingTurn = true;
-      car.turnState    = 'approaching';
-      car.turnDirection = Math.random() < 0.5 ? 'left' : 'right';
+        car.isMakingTurn = true;
+        car.turnState    = 'approaching';
+        car.turnDirection = Math.random() < 0.5 ? 'left' : 'right';
 
-      if (car.turnDirection === 'left') {
-        car.direction = -1;
-        car.a = 560 + ROAD_WIDTH / 4;
-        car.b = 360 + ROAD_WIDTH / 4;
-      } else {
-        car.direction = 1;
-        car.a = 560 - ROAD_WIDTH / 4;
-        car.b = 360 - ROAD_WIDTH / 4;
-      }
-      car.canDecide = false;
+        if (car.turnDirection === 'left') {
+          car.direction = -1;
+          car.a = 560 + ROAD_WIDTH / 4;
+          car.b = 360 + ROAD_WIDTH / 4;
+        } else {
+          car.direction = 1;
+          car.a = 560 - ROAD_WIDTH / 4;
+          car.b = 360 - ROAD_WIDTH / 4;
+        }
+        car.canDecide = false;
     }
   }
 
@@ -783,73 +767,39 @@ function updateCar(car) {
     let isAheadInLane = false;
     const distance = getDistance(car, otherCar);
 
-    if (otherCar.turnState === 'rejoining') {
-      isAheadInLane = false;
-    } else {
-      if (car.path === 'ellipse' && otherCar.path === 'ellipse' && car.direction === otherCar.direction) {
-        let carA  = (car.angle   + 2 * Math.PI) % (2 * Math.PI);
-        let othA  = (otherCar.angle + 2 * Math.PI) % (2 * Math.PI);
-        if (car.direction === 1) {
-          isAheadInLane = (othA > carA && othA - carA < Math.PI) || (carA - othA > Math.PI);
-        } else {
-          isAheadInLane = (othA < carA && carA - othA < Math.PI) || (othA - carA > Math.PI);
-        }
-      } else if (car.path === 'vertical' && otherCar.path === 'vertical' && car.verticalDirection === otherCar.verticalDirection) {
-        if (car.turnState !== 'turning' && otherCar.turnState !== 'turning') {
-          isAheadInLane = (car.verticalDirection === 'up' && otherCar.y < car.y) ||
-                          (car.verticalDirection === 'down' && otherCar.y > car.y);
-        }
-      }
-    }
-    
-    /* Rule: Handle conflicts between two cars turning from the same vertical lane. */
-    if (car.path === 'vertical' && otherCar.path === 'vertical' &&
-        car.verticalDirection === otherCar.verticalDirection &&
-        car.turnState === 'turning' && otherCar.turnState === 'turning') {
+    // Case A: Both rejoining (High Priority Transition Logic)
+    // Treats the transition from vertical to ellipse as one continuous lane for following
+    if (car.turnState === 'rejoining' && otherCar.turnState === 'rejoining' && 
+        car.verticalDirection === otherCar.verticalDirection && 
+        car.direction === otherCar.direction) {
         
-        // Case 1: One car turns left, the other turns right. The left-turning car must yield.
-        if (car.turnDirection === 'left' && otherCar.turnDirection === 'right') {
-            mustYield = true;
-            reason    = 'vertical-left-yields-to-right';
-            if (DEBUG_LOG) console.log(
-                `%c${carName} (L-turn) yielding to Car${allCars.indexOf(otherCar)+1} (R-turn)`,
-                'color: darkorange'
-            );
-        }
-        // Case 2: Both cars turn in the same direction. The car behind must yield to the car ahead.
-        else if (car.turnDirection === otherCar.turnDirection) {
-            const joinY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
-            const myDist = Math.abs(car.y - joinY);
-            const otherDist = Math.abs(otherCar.y - joinY);
-
-            // Yield to the car that is closer to the junction (ahead).
-            if (otherDist < myDist) {
-                mustYield = true;
-                reason    = 'same-direction-turn-following';
-                 if (DEBUG_LOG) console.log(
-                    `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} (ahead in same-direction turn)`,
-                    'color: crimson'
-                );
-            }
+        // Calculate "ahead" based on distance to the "finish line" of the rejoin
+        // For down/CCW rejoin, finish line is roughly center + b.
+        const destinationY = (car.verticalDirection === 'up') ? (centerY - car.b) : (centerY + car.b);
+        const distCar = Math.abs(car.y - destinationY);
+        const distOther = Math.abs(otherCar.y - destinationY);
+        
+        if (distOther < distCar) {
+             isAheadInLane = true;
         }
     }
-
-    /* Rule: A car turning left from the ellipse onto the vertical road must yield
-       to a car turning left from the vertical road onto the ellipse at the same intersection. */
-    if (car.path === 'vertical' && (car.turnState === 'turning' || car.turnState === 'approaching') && car.turnDirection === 'left' &&
-        otherCar.path === 'ellipse' && (otherCar.turnState === 'rejoining' || (otherCar.turnState === 'approaching' && otherCar.isMakingTurn)) && otherCar.turnDirection === 'left') {
-        
-        // Check they are at the same intersection (both top or both bottom)
-        const carAtBottom = car.y > centerY;
-        const otherCarAtBottom = otherCar.y > centerY;
-
-        if (carAtBottom === otherCarAtBottom) {
-            mustYield = true;
-            reason = 'vertical-turn-yields-to-rejoin';
-            if (DEBUG_LOG) console.log(
-                `%c${carName} (turning off ellipse) yielding to Car${allCars.indexOf(otherCar)+1} (joining ellipse)`,
-                'color: #20B2AA' // LightSeaGreen
-            );
+    // Case B: Both Vertical (Standard vertical road following)
+    else if (car.path === 'vertical' && otherCar.path === 'vertical' && car.verticalDirection === otherCar.verticalDirection) {
+         isAheadInLane = (car.verticalDirection === 'up' && otherCar.y < car.y) ||
+                         (car.verticalDirection === 'down' && otherCar.y > car.y);
+    }
+    // Case C: Both Ellipse (Standard ellipse road following)
+    else if (car.path === 'ellipse' && otherCar.path === 'ellipse' && car.direction === otherCar.direction) {
+        // If the other car is rejoining, we generally ignore it for "lane following" until it's fully on the ellipse
+        // to prevent main-road traffic from braking prematurely for merging traffic (which should yield).
+        if (otherCar.turnState !== 'rejoining') {
+             let carA  = (car.angle   + 2 * Math.PI) % (2 * Math.PI);
+             let othA  = (otherCar.angle + 2 * Math.PI) % (2 * Math.PI);
+             if (car.direction === 1) {
+               isAheadInLane = (othA > carA && othA - carA < Math.PI) || (carA - othA > Math.PI);
+             } else {
+               isAheadInLane = (othA < carA && carA - othA < Math.PI) || (othA - carA > Math.PI);
+             }
         }
     }
 
@@ -870,19 +820,12 @@ function updateCar(car) {
            Re-joining → ellipse (vertical → ellipse)
            ---------------------------------------------------------- */
         if (car.turnState === 'rejoining' && car.verticalDirection !== null) {
-          const carAngle   = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-          const otherAngle = Math.atan2((otherCar.y - centerY) / otherCar.b, (otherCar.x - centerX) / otherCar.a);
-
-          let diff = otherAngle - carAngle;
-          diff = (diff + 2 * Math.PI) % (2 * Math.PI);
-
-          const isOtherAhead = (car.direction === 1) ? diff < Math.PI : diff > Math.PI;
-
-          // Only yield to cars driving in the opposite direction on ellipse
-          if (otherCar.path === 'ellipse' && !otherCar.isMakingTurn && isOtherAhead && otherCar.direction !== car.direction) {
-            mustYield = true;
-            reason    = 'rejoin-conflict';
-            if (DEBUG_LOG) console.log(`%c${carName} (rejoin) yielding to ${allCars.indexOf(otherCar)+1}`, 'color: #FF69B4');
+          // Yield to ANY car on the ellipse if there is a trajectory overlap
+          // Exception: Do not yield to cars that are also rejoining (handled by Rule 1 above)
+          if (otherCar.path === 'ellipse' && otherCar.turnState !== 'rejoining') {
+             mustYield = true;
+             reason = 'rejoin-yield-to-main-road';
+             if (DEBUG_LOG) console.log(`%c${carName} (rejoin) yielding to ${allCars.indexOf(otherCar)+1}`, 'color: #FF69B4');
           }
         }
         /* 2.1.1  vertical → ellipse right */
@@ -901,57 +844,28 @@ function updateCar(car) {
             );
           }
         }
-
-
         /* 2.1.2  vertical → ellipse left  */
         else if (car.turnDirection === 'left' && car.turnState !== 'turning' && !car.isCommittedToTurn) {
-          let isOtherAhead = false;
-
           if (otherCar.path === 'ellipse') {
-            const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
-            const carDist   = Math.abs(car.y - carIsectY);
-            const othDist   = Math.abs(otherCar.y - carIsectY);
-            isOtherAhead    = othDist < carDist;
-          }
-
-          if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
-            const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
-            const carDist   = Math.abs(car.y - carIsectY);
-            const othDist   = Math.abs(otherCar.y - carIsectY);
-            isOtherAhead    = othDist < carDist;
-          }
-
-          if (isOtherAhead) {
             mustYield = true;
             reason    = 'intersection-vertical-left';
             if (DEBUG_LOG) console.log(
               `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical→ellipse left`,
               'color: red'
             );
-          }
-        }
-
-        /* Extra rule: rejoining → ellipse, yield to rejoining car ahead in same lane */
-        if (car.turnState === 'rejoining' && otherCar.turnState === 'rejoining' &&
-            car.verticalDirection === otherCar.verticalDirection &&
-            car.direction === otherCar.direction) {
-
-            // Ahead = other car is closer to the ellipse join point
-            const joinY = car.verticalDirection === 'up'
-                ? centerY - car.b
-                : centerY + car.b;
-
-            const myDist    = Math.abs(car.y    - joinY);
-            const otherDist = Math.abs(otherCar.y - joinY);
-
-            if (otherDist < myDist) {
-                mustYield = true;
-                reason    = 'rejoin-same-lane';
-                if (DEBUG_LOG) console.log(
-                    `%c${carName} (rejoin) yielding to ${allCars.indexOf(otherCar)+1} (ahead in same lane)`,
-                    'color: gold'
-                );
+          } else if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
+            const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
+            const carDist   = Math.abs(car.y - carIsectY);
+            const othDist   = Math.abs(otherCar.y - carIsectY);
+            if (othDist < carDist) {
+              mustYield = true;
+              reason    = 'intersection-vertical-left';
+              if (DEBUG_LOG) console.log(
+                `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical→ellipse left`,
+                'color: red'
+              );
             }
+          }
         }
 
         /* Opposite-direction vertical turning conflict */
@@ -967,9 +881,9 @@ function updateCar(car) {
                 : centerY + car.b; // bottom junction
 
             const myDist    = Math.abs(car.y - crossroadY);
-            const otherDist = Math.abs(otherCar.y - crossroadY);
+            const othDist   = Math.abs(otherCar.y - crossroadY);
 
-            if (otherDist < myDist) {
+            if (othDist < myDist) {
                 mustYield = true;
                 reason    = 'vertical-turn-opposite';
                 if (DEBUG_LOG) console.log(
@@ -980,15 +894,30 @@ function updateCar(car) {
         }	  
 
         /* 2.2.1 ellipse → vertical left yields to opposite on ellipse */
-        if (car.path === 'ellipse' && car.turnDirection === 'left' &&
-            otherCar.path === 'ellipse' && otherCar.direction !== car.direction &&
-            !car.isCommittedToTurn) {
-          mustYield = true;
-          reason = 'ellipse-left-yield-to-opposite';
-          if (DEBUG_LOG) console.log(
-            `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} (ellipse→vertical left vs opposite on ellipse)`,
-            'color: purple'
-          );
+        // Explicitly check for LEFT turn direction.
+        // Check if car is on ellipse OR has just switched to vertical path while turning from ellipse.
+        const isEllipseToVerticalLeft = car.turnDirection === 'left' && 
+                                        car.isMakingTurn &&
+                                        (car.path === 'ellipse' || (car.path === 'vertical' && car.turnState === 'turning'));
+
+        if (isEllipseToVerticalLeft && !car.isCommittedToTurn) {
+            
+            // Check if otherCar is in the opposing stream
+            const isOppositeDirection = (car.direction === 1 && otherCar.direction === -1) ||
+                                        (car.direction === -1 && otherCar.direction === 1);
+            
+            // The other car should be on the ellipse or entering the intersection
+            const isOtherOnEllipse = otherCar.path === 'ellipse' || 
+                                     (otherCar.path === 'vertical' && otherCar.turnState === 'turning');
+
+            if (isOppositeDirection && isOtherOnEllipse) {
+                mustYield = true;
+                reason = 'ellipse-left-yield-to-opposite';
+                if (DEBUG_LOG) console.log(
+                    `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} (ellipse→vertical left vs opposite on ellipse)`,
+                    'color: purple'
+                );
+            }
         }
       }
     }
@@ -1025,7 +954,7 @@ function updateCar(car) {
   let isAtYieldLine = false;
 
   if (!car.isCommittedToTurn) {
-    if (car.path === 'ellipse' && car.isMakingTurn && car.turnDirection === 'left') {
+    if (car.path === 'ellipse' && car.isMakingTurn) {
       isAtYieldLine = car.x > centerX
         ? frontBumperX <= VERTICAL_ROAD_RIGHT
         : frontBumperX >= VERTICAL_ROAD_LEFT;
@@ -1054,7 +983,7 @@ function updateCar(car) {
   /* commit once past the stopping line */
   if (!car.isCommittedToTurn) {
     let past = false;
-    if (car.path === 'ellipse' && car.isMakingTurn && car.turnDirection === 'left') {
+    if (car.path === 'ellipse' && car.isMakingTurn) {
       past = car.x > centerX
         ? frontBumperX < VERTICAL_ROAD_RIGHT
         : frontBumperX > VERTICAL_ROAD_LEFT;
@@ -1093,15 +1022,45 @@ function updateCar(car) {
     }
   }
 
-  const curVel   = car.maximumSpeed * 50 * car.currentSpeedFactor;
-  const maxCurve = Math.sqrt(turnRadius * MAX_CENTRIFUGAL_FORCE);
-  const decelDist = Math.abs(curVel - maxCurve) / MAX_ACCELERATION * 4;
+  const currentVel = car.maximumSpeed * 50 * car.currentSpeedFactor;
+  const maxCurveVel = Math.sqrt(turnRadius * MAX_CENTRIFUGAL_FORCE);
+  let turnDecelDist = currentVel > maxCurveVel ? (currentVel ** 2 - maxCurveVel ** 2) / (2 * MAX_ACCELERATION) : 0;
 
-  if ((isNearTopCrossroad && car.isMakingTurn && distToTop <= decelDist) ||
-      (isNearBottomCrossroad && car.isMakingTurn && distToBottom <= decelDist) ||
-      (isOnVerticalSegment && ((car.verticalDirection === 'down' && car.y > centerY + car.b - decelDist) ||
-                               (car.verticalDirection === 'up'   && car.y < centerY - car.b + decelDist)))) {
-    targetFactor = Math.min(1, maxCurve / (car.maximumSpeed * 50));
+  let distToTurn = 0;
+  let hasTurnDecel = false;
+  if (isNearTopCrossroad && car.isMakingTurn) {
+    distToTurn = distToTop;
+    hasTurnDecel = true;
+  } else if (isNearBottomCrossroad && car.isMakingTurn) {
+    distToTurn = distToBottom;
+    hasTurnDecel = true;
+  } else if (isOnVerticalSegment && ((car.verticalDirection === 'down' && car.y > centerY + car.b - turnDecelDist) ||
+                                     (car.verticalDirection === 'up'   && car.y < centerY - car.b + turnDecelDist))) {
+    distToTurn = car.verticalDirection === 'down' ? (centerY + car.b - car.y) : (car.y - (centerY - car.b));
+    hasTurnDecel = true;
+  }
+
+  if (hasTurnDecel && distToTurn <= turnDecelDist) {
+    const targetCurveFactor = Math.sqrt(maxCurveVel ** 2 + 2 * MAX_ACCELERATION * distToTurn) / (car.maximumSpeed * 50);
+    targetFactor = Math.min(targetFactor, targetCurveFactor);
+  } else if (hasTurnDecel) {
+    targetFactor = Math.min(targetFactor, 1);
+  }
+
+  // Precautionary slowing to be able to stop at yield line
+  if (car.turnState === 'approaching' || car.turnState === 'rejoining') {
+    let distToStop = 0;
+    if (car.path === 'ellipse') {
+      const yieldX = car.x > centerX ? VERTICAL_ROAD_RIGHT : VERTICAL_ROAD_LEFT;
+      distToStop = Math.abs(frontBumperX - yieldX);
+    } else if (car.path === 'vertical') {
+      const yieldY = car.verticalDirection === 'up' ? (centerY - (360 - ROAD_WIDTH / 2)) : (centerY + (360 - ROAD_WIDTH / 2));
+      distToStop = Math.abs(frontBumperY - yieldY);
+    }
+    if (distToStop > 0) {
+      const maxStopVel = Math.sqrt(2 * MAX_ACCELERATION * distToStop);
+      targetFactor = Math.min(targetFactor, maxStopVel / (car.maximumSpeed * 50));
+    }
   }
 
   targetFactor = Math.min(targetFactor, collisionSlowdown);
@@ -1196,7 +1155,7 @@ function updateCar(car) {
   const dy = targetY - car.y;
   let targetHeading = (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) ? car.heading : Math.atan2(dy, dx);
   let headingError  = targetHeading - car.heading;
-  while (headingError >  Math.PI) headingError -= 2 * Math.PI;
+  while (headingError > Math.PI) headingError -= 2 * Math.PI;
   while (headingError < -Math.PI) headingError += 2 * Math.PI;
   if (isNaN(headingError)) headingError = 0;
 
