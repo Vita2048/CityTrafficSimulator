@@ -36,12 +36,57 @@
     button:hover {
         background-color: #45a049;
     }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: center;
+      margin: 10px 0;
+    }
+    .controls button {
+      margin: 0;
+    }
+    #statusPanel {
+      width: min(1300px, 96vw);
+      background: #ffffff;
+      border: 1px solid #cccccc;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 10px;
+      box-sizing: border-box;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    .statusRow {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .statusLabel {
+      font-weight: 700;
+      color: #1f2937;
+    }
+    .statusValue {
+      color: #111827;
+    }
   </style>
 </head>
 <body>
+  <div id="statusPanel">
+    <div class="statusRow"><span class="statusLabel">Controller:</span><span id="driverStatus" class="statusValue">Heuristics</span></div>
+    <div class="statusRow"><span class="statusLabel">Pre-Training:</span><span id="pretrainStatus" class="statusValue">Idle</span></div>
+    <div class="statusRow"><span class="statusLabel">RL:</span><span id="rlStatus" class="statusValue">Idle</span></div>
+  </div>
   <canvas id="trafficCanvas" width="1300" height="900"></canvas>
-  <button onclick="resetSimulation()">Reset Simulation</button>
-  <button id="toggleSimulationButton" onclick="toggleSimulation()">Stop Simulation</button>
+  <div class="controls">
+    <button onclick="resetSimulation()">Reset Simulation</button>
+    <button id="toggleSimulationButton" onclick="toggleSimulation()">Stop Simulation</button>
+    <button id="pretrainButton" onclick="togglePreTrain()">Pre-Train NN</button>
+    <button id="rlButton" onclick="toggleRL()">Start RL</button>
+    <button id="useNNButton" onclick="useNN()">Use NN</button>
+    <button id="useHeuristicsButton" onclick="useHeuristics()">Use Heuristics</button>
+  </div>
 
 <script>
   const canvas = document.getElementById('trafficCanvas');
@@ -64,7 +109,19 @@
   const SPEED_SMOOTHING_FACTOR = 0.1;
   const STEERING_SMOOTHING_FACTOR = 0.1;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
-  const DEBUG_LOG = false; // Enabled for debugging
+  const DEBUG_LOG = true; // Enabled for debugging
+  const LOG_CONFIG = {
+    training: true,
+    rl: true,
+    behavior: true,
+    lifecycle: true,
+    trainingIntervalMs: 1000,
+    rlIntervalMs: 1000,
+    behaviorIntervalMs: 2000,
+    verboseYieldEvents: false,
+    verboseVehicleLights: false,
+    verboseKinematics: false
+  };
   const USE_INTUITIVE_TURN_SIGNAL = true;
   const BLINKER_CYCLE_MS = 500;
   const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
@@ -75,6 +132,20 @@
   // New tunable parameter for trajectory prediction
   const TRAJECTORY_LENGTH = 4.0;
   const APPROACH_DISTANCE = TRAJECTORY_LENGTH * CAR_LENGTH;
+  const INPUT_DIM = 12;
+  const HIDDEN_DIM = 16;
+  const OUTPUT_DIM = 2;
+  const PRETRAIN_TARGET_STEPS = 6000;
+  const PRETRAIN_BATCH_SIZE = 24;
+  const PRETRAIN_BATCHES_PER_FRAME = 8;
+  const PRETRAIN_LR = 0.0025;
+  const RL_LR = 0.00015;
+  const RL_SIGMA = 0.06;
+  const RL_BASELINE_DECAY = 0.995;
+  const RL_BEHAVIOR_CLONE_LR = 0.0007;
+  const NN_BLEND_INFERENCE = 0.55;
+  const NN_BLEND_WHILE_RL = 0.3;
+  const NN_SAFETY_MAX_LANE_ERR = ROAD_WIDTH * 0.6;
 
   // Declare car objects globally
   let car1 = {};
@@ -83,6 +154,306 @@
   let car4 = {};
   let car5 = {};
   let car6 = {};
+  let controllerMode = 'heuristics';
+  let isPreTraining = false;
+  let isRLRunning = false;
+  let pretrainSteps = 0;
+  let pretrainLossEMA = 0;
+  let rlStepCount = 0;
+  let rlRewardEMA = 0;
+  let rlBaselineEMA = 0;
+  let rlRewardAbsDevEMA = 1;
+  let rlAdvantageEMA = 0;
+  let trainingBuffer = [];
+  const TRAINING_BUFFER_MAX = 25000;
+  let simFrame = 0;
+  let lastPretrainState = false;
+  let lastRLState = false;
+  let lastControllerMode = 'heuristics';
+  let logWindowStartMs = 0;
+  let lastPretrainLogMs = 0;
+  let lastRLLogMs = 0;
+  let lastBehaviorLogMs = 0;
+  const logAccumulator = createEmptyLogAccumulator();
+
+  const nn = createNetwork(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
+
+  function createEmptyLogAccumulator() {
+    return {
+      frames: 0,
+      carsSeen: 0,
+      rewardSum: 0,
+      speedSum: 0,
+      laneErrSum: 0,
+      accelJerkSum: 0,
+      grassCount: 0,
+      ruleViolations: 0,
+      crashPairs: 0,
+      violatorCrashPairs: 0
+    };
+  }
+
+  function resetLogAccumulator() {
+    const empty = createEmptyLogAccumulator();
+    Object.keys(empty).forEach(k => {
+      logAccumulator[k] = empty[k];
+    });
+  }
+
+  function logEvent(channel, message, force = false) {
+    if (!DEBUG_LOG) return;
+    if (!force) {
+      if (channel === 'training' && !LOG_CONFIG.training) return;
+      if (channel === 'rl' && !LOG_CONFIG.rl) return;
+      if (channel === 'behavior' && !LOG_CONFIG.behavior) return;
+      if (channel === 'lifecycle' && !LOG_CONFIG.lifecycle) return;
+    }
+    console.log(`[${channel.toUpperCase()}] ${message}`);
+  }
+
+  function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
+  function randn() {
+    const u = 1 - Math.random();
+    const v = 1 - Math.random();
+    return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  }
+
+  function createNetwork(inputDim, hiddenDim, outputDim) {
+    const w1 = Array.from({ length: hiddenDim }, () =>
+      Array.from({ length: inputDim }, () => (Math.random() * 2 - 1) * 0.08)
+    );
+    const b1 = Array.from({ length: hiddenDim }, () => 0);
+    const w2 = Array.from({ length: outputDim }, () =>
+      Array.from({ length: hiddenDim }, () => (Math.random() * 2 - 1) * 0.08)
+    );
+    const b2 = Array.from({ length: outputDim }, () => 0);
+    return { inputDim, hiddenDim, outputDim, w1, b1, w2, b2 };
+  }
+
+  function networkForward(net, input) {
+    const hidden = new Array(net.hiddenDim);
+    for (let h = 0; h < net.hiddenDim; h++) {
+      let s = net.b1[h];
+      for (let i = 0; i < net.inputDim; i++) s += net.w1[h][i] * input[i];
+      hidden[h] = Math.tanh(s);
+    }
+    const out = new Array(net.outputDim);
+    for (let o = 0; o < net.outputDim; o++) {
+      let s = net.b2[o];
+      for (let h = 0; h < net.hiddenDim; h++) s += net.w2[o][h] * hidden[h];
+      out[o] = s;
+    }
+    return { hidden, out };
+  }
+
+  function networkBackward(net, input, hidden, gradOut, lr) {
+    const gradHidden = new Array(net.hiddenDim).fill(0);
+    for (let o = 0; o < net.outputDim; o++) {
+      for (let h = 0; h < net.hiddenDim; h++) {
+        gradHidden[h] += gradOut[o] * net.w2[o][h];
+        net.w2[o][h] -= lr * gradOut[o] * hidden[h];
+      }
+      net.b2[o] -= lr * gradOut[o];
+    }
+    for (let h = 0; h < net.hiddenDim; h++) {
+      const dz = gradHidden[h] * (1 - hidden[h] * hidden[h]);
+      for (let i = 0; i < net.inputDim; i++) {
+        net.w1[h][i] -= lr * dz * input[i];
+      }
+      net.b1[h] -= lr * dz;
+    }
+  }
+
+  function trainNetworkSupervised(sample, lr) {
+    const { input, target } = sample;
+    const { hidden, out } = networkForward(nn, input);
+    const predSpeed = 1 / (1 + Math.exp(-out[0]));
+    const predSteer = Math.tanh(out[1]);
+    const speedErr = predSpeed - target[0];
+    const steerErr = predSteer - target[1];
+
+    const gradOut0 = 2 * speedErr * predSpeed * (1 - predSpeed);
+    const gradOut1 = 2 * steerErr * (1 - predSteer * predSteer);
+    networkBackward(nn, input, hidden, [gradOut0, gradOut1], lr);
+    return speedErr * speedErr + steerErr * steerErr;
+  }
+
+  function trainPolicyGradient(transition, reward, lr) {
+    if (!transition || !Number.isFinite(reward)) return;
+    const { input, meanSpeed, meanSteer, sampleSpeed, sampleSteer } = transition;
+    const { hidden } = networkForward(nn, input);
+    const centered = reward - rlBaselineEMA;
+    const denom = Math.max(0.25, rlRewardAbsDevEMA);
+    const advantage = clamp(centered / denom, -2.5, 2.5);
+    const invVar = 1 / (RL_SIGMA * RL_SIGMA);
+    const dMeanSpeed = -advantage * (sampleSpeed - meanSpeed) * invVar;
+    const dMeanSteer = -advantage * (sampleSteer - meanSteer) * invVar;
+    const gradOut0 = clamp(dMeanSpeed * meanSpeed * (1 - meanSpeed), -1.2, 1.2);
+    const gradOut1 = clamp(dMeanSteer * (1 - meanSteer * meanSteer), -1.2, 1.2);
+    networkBackward(nn, input, hidden, [gradOut0, gradOut1], lr);
+    rlAdvantageEMA = rlStepCount === 0 ? advantage : rlAdvantageEMA * 0.98 + advantage * 0.02;
+  }
+
+  function runPretrainStep() {
+    if (trainingBuffer.length < PRETRAIN_BATCH_SIZE) return;
+    for (let b = 0; b < PRETRAIN_BATCHES_PER_FRAME; b++) {
+      let batchLoss = 0;
+      for (let i = 0; i < PRETRAIN_BATCH_SIZE; i++) {
+        const idx = Math.floor(Math.random() * trainingBuffer.length);
+        batchLoss += trainNetworkSupervised(trainingBuffer[idx], PRETRAIN_LR);
+      }
+      batchLoss /= PRETRAIN_BATCH_SIZE;
+      pretrainLossEMA = pretrainLossEMA === 0 ? batchLoss : pretrainLossEMA * 0.95 + batchLoss * 0.05;
+      pretrainSteps++;
+      if (pretrainSteps >= PRETRAIN_TARGET_STEPS) {
+        isPreTraining = false;
+        break;
+      }
+    }
+  }
+
+  function setControllerMode(mode) {
+    if (controllerMode !== mode) {
+      logEvent('lifecycle', `controller switched ${controllerMode} -> ${mode}`);
+    }
+    controllerMode = mode;
+    refreshStatusPanel();
+  }
+
+  function togglePreTrain() {
+    isPreTraining = !isPreTraining;
+    if (isPreTraining && lastPretrainLogMs < 0) {
+      lastPretrainLogMs = 0;
+    }
+    logEvent('lifecycle', `pre-train ${isPreTraining ? 'started' : 'stopped'} at step=${pretrainSteps}`);
+    refreshStatusPanel();
+  }
+
+  function toggleRL() {
+    isRLRunning = !isRLRunning;
+    if (isRLRunning) {
+      lastRLLogMs = 0;
+      rlBaselineEMA = 0;
+      rlRewardAbsDevEMA = 1;
+      rlAdvantageEMA = 0;
+    }
+    logEvent('lifecycle', `RL ${isRLRunning ? 'started' : 'stopped'} at updates=${rlStepCount}`);
+    refreshStatusPanel();
+  }
+
+  function useNN() {
+    setControllerMode('nn');
+  }
+
+  function useHeuristics() {
+    setControllerMode('heuristics');
+  }
+
+  function refreshStatusPanel() {
+    const preBtn = document.getElementById('pretrainButton');
+    const rlBtn = document.getElementById('rlButton');
+    const driverEl = document.getElementById('driverStatus');
+    const preEl = document.getElementById('pretrainStatus');
+    const rlEl = document.getElementById('rlStatus');
+    if (preBtn) preBtn.textContent = isPreTraining ? 'Stop Pre-Train' : 'Pre-Train NN';
+    if (rlBtn) rlBtn.textContent = isRLRunning ? 'Stop RL' : 'Start RL';
+    if (driverEl) driverEl.textContent = controllerMode === 'nn' ? 'Neural Network' : 'Heuristics';
+    if (preEl) {
+      const pct = clamp((pretrainSteps / PRETRAIN_TARGET_STEPS) * 100, 0, 100);
+      preEl.textContent = isPreTraining
+        ? `Running (${pretrainSteps}/${PRETRAIN_TARGET_STEPS}, ${pct.toFixed(1)}%, loss ${pretrainLossEMA.toFixed(4)})`
+        : pretrainSteps >= PRETRAIN_TARGET_STEPS
+          ? `Completed (${PRETRAIN_TARGET_STEPS} steps)`
+          : `Idle (${pretrainSteps}/${PRETRAIN_TARGET_STEPS} prepared)`;
+    }
+    if (rlEl) {
+      if (isRLRunning && controllerMode !== 'nn') {
+        rlEl.textContent = `Running, waiting for NN control (${rlStepCount} updates)`;
+      } else {
+        rlEl.textContent = isRLRunning
+          ? `Running (${rlStepCount} updates, reward EMA ${rlRewardEMA.toFixed(3)})`
+          : `Idle (${rlStepCount} updates)`;
+      }
+    }
+  }
+
+  function emitPeriodicLogs() {
+    if (!DEBUG_LOG) return;
+    const now = performance.now();
+
+    if (isPreTraining && LOG_CONFIG.training && now - lastPretrainLogMs >= LOG_CONFIG.trainingIntervalMs) {
+      const pct = clamp((pretrainSteps / PRETRAIN_TARGET_STEPS) * 100, 0, 100);
+      logEvent('training', `pretrain step=${pretrainSteps}/${PRETRAIN_TARGET_STEPS} (${pct.toFixed(1)}%) lossEMA=${pretrainLossEMA.toFixed(5)} buffer=${trainingBuffer.length}`);
+      lastPretrainLogMs = now;
+    }
+
+    if (isRLRunning && controllerMode === 'nn' && LOG_CONFIG.rl && now - lastRLLogMs >= LOG_CONFIG.rlIntervalMs) {
+      logEvent('rl', `updates=${rlStepCount} rewardEMA=${rlRewardEMA.toFixed(4)} baseline=${rlBaselineEMA.toFixed(4)} advEMA=${rlAdvantageEMA.toFixed(4)} sigma=${RL_SIGMA.toFixed(3)} lr=${RL_LR}`);
+      lastRLLogMs = now;
+    }
+
+    if (LOG_CONFIG.behavior && now - lastBehaviorLogMs >= LOG_CONFIG.behaviorIntervalMs && logAccumulator.frames > 0) {
+      const cars = Math.max(1, logAccumulator.carsSeen);
+      const avgReward = logAccumulator.rewardSum / cars;
+      const avgSpeedFactor = logAccumulator.speedSum / cars;
+      const avgLaneErr = logAccumulator.laneErrSum / cars;
+      const avgJerk = logAccumulator.accelJerkSum / cars;
+      logEvent(
+        'behavior',
+        `mode=${controllerMode} frames=${logAccumulator.frames} avgReward=${avgReward.toFixed(4)} avgSpeed=${avgSpeedFactor.toFixed(3)} laneErr=${avgLaneErr.toFixed(2)} jerk=${avgJerk.toFixed(3)} grass=${logAccumulator.grassCount} ruleViol=${logAccumulator.ruleViolations} crashes=${logAccumulator.crashPairs} violatorCrashes=${logAccumulator.violatorCrashPairs}`
+      );
+      lastBehaviorLogMs = now;
+      resetLogAccumulator();
+    }
+  }
+
+  function isPointOnRoad(x, y) {
+    const rxOuter = 560 + ROAD_WIDTH / 2;
+    const ryOuter = 360 + ROAD_WIDTH / 2;
+    const rxInner = 560 - ROAD_WIDTH / 2;
+    const ryInner = 360 - ROAD_WIDTH / 2;
+    const ellipseOuter = ((x - centerX) * (x - centerX)) / (rxOuter * rxOuter) + ((y - centerY) * (y - centerY)) / (ryOuter * ryOuter) <= 1;
+    const ellipseInner = ((x - centerX) * (x - centerX)) / (rxInner * rxInner) + ((y - centerY) * (y - centerY)) / (ryInner * ryInner) >= 1;
+    const verticalRoad = x >= centerX - ROAD_WIDTH / 2 && x <= centerX + ROAD_WIDTH / 2 && y >= 40 && y <= 760;
+    return (ellipseOuter && ellipseInner) || verticalRoad;
+  }
+
+  function laneCenterError(car) {
+    if (car.path === 'vertical') {
+      const laneX = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+      return Math.abs(car.x - laneX);
+    }
+    const aTarget = car.direction === 1 ? 560 - ROAD_WIDTH / 4 : 560 + ROAD_WIDTH / 4;
+    const bTarget = car.direction === 1 ? 360 - ROAD_WIDTH / 4 : 360 + ROAD_WIDTH / 4;
+    const nx = (car.x - centerX) / aTarget;
+    const ny = (car.y - centerY) / bTarget;
+    const radialNorm = Math.sqrt(nx * nx + ny * ny);
+    return Math.abs(radialNorm - 1) * ((aTarget + bTarget) * 0.5);
+  }
+
+  function buildStateVector(car, context) {
+    const speedNorm = clamp(car.currentSpeedFactor, 0, 1);
+    const laneErrNorm = clamp(context.laneErr / (ROAD_WIDTH / 2), 0, 1);
+    const turnCode = car.turnDirection === 'left' ? -1 : car.turnDirection === 'right' ? 1 : 0;
+    const pathCode = car.path === 'vertical' ? 1 : -1;
+    return [
+      speedNorm,
+      laneErrNorm,
+      context.shouldStop ? 1 : 0,
+      context.needsAggressive ? 1 : 0,
+      car.isYielding ? 1 : 0,
+      car.isCommittedToTurn ? 1 : 0,
+      pathCode,
+      car.direction === 1 ? 1 : -1,
+      turnCode,
+      clamp(Math.sin(car.heading), -1, 1),
+      clamp(Math.cos(car.heading), -1, 1),
+      context.onGrass ? 1 : 0
+    ];
+  }
 
   // Default properties for a car
   const CAR_DEFAULTS = {
@@ -107,7 +478,14 @@
     isYielding: false,
     yieldStartTime: 0,
     isCommittedToTurn: false,
-    loggedCommit: false
+    loggedCommit: false,
+    lastRuleViolation: false,
+    pendingCrashPenalty: 0,
+    lastReward: 0,
+    lastAccelDelta: 0,
+    prevSpeedFactor: 1.0,
+    lastPolicyTransition: null,
+    lastHeuristicSample: null
   };
 
   // Helper to create a car object with default and specific properties
@@ -182,12 +560,24 @@ function resetSimulation() {
         car.lastLoggedHeading = car.heading;
         car.lastLoggedX = car.x;
         car.lastLoggedY = car.y;
+        car.lastRuleViolation = false;
+        car.pendingCrashPenalty = 0;
+        car.lastReward = 0;
+        car.lastAccelDelta = 0;
+        car.prevSpeedFactor = car.currentSpeedFactor;
+        car.lastPolicyTransition = null;
     });
 
-    if (DEBUG_LOG) {
-      console.clear();
-      console.log("--- Simulation Reset ---");
-    }
+    simFrame = 0;
+    logWindowStartMs = performance.now();
+    lastPretrainLogMs = 0;
+    lastRLLogMs = 0;
+    lastBehaviorLogMs = 0;
+    rlBaselineEMA = 0;
+    rlRewardAbsDevEMA = 1;
+    rlAdvantageEMA = 0;
+    resetLogAccumulator();
+    logEvent('lifecycle', 'simulation reset');
 
     if (!isSimulationRunning) {
       isSimulationRunning = true;
@@ -198,6 +588,7 @@ function resetSimulation() {
     if (animationFrameId) {
       cancelAnimationFrame(animationFrameId);
     }
+    refreshStatusPanel();
     gameLoop();
   }
   const spriteSheet = new Image();
@@ -530,10 +921,10 @@ function predictTrajectory(car) {
     const headingDeg = car.heading * 180 / Math.PI;
     const lastHeadingDeg = car.lastLoggedHeading * 180 / Math.PI;
     const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
-
-    if (DEBUG_LOG && (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX)) {
+    if (DEBUG_LOG && LOG_CONFIG.verboseKinematics &&
+        (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX)) {
       const turnRadius = Math.abs(car.steerAngle) > 0.001 ? WHEELBASE / Math.tan(Math.abs(car.steerAngle)) : Number.MAX_VALUE;
-      console.log(`${carName} | Pos:(${Math.round(car.x)}, ${Math.round(car.y)}) | Head:${Math.round(headingDeg)}° | Steer:${Math.round(car.steerAngle * 180 / Math.PI)}° | Path:${car.path} | VertDir:${car.verticalDirection || 'none'} | SpeedFactor:${car.currentSpeedFactor.toFixed(3)} | TurnRadius:${turnRadius.toFixed(1)} | CentrifugalForce:${((car.maximumSpeed * 50 * car.currentSpeedFactor) ** 2 / (turnRadius || car.b)).toFixed(6)} | Yielding:${car.isYielding} | TurnState:${car.turnState} | TurnDir:${car.turnDirection || 'none'}`);
+      logEvent('behavior', `${carName} speed=${car.currentSpeedFactor.toFixed(3)} steerDeg=${(car.steerAngle * 180 / Math.PI).toFixed(1)} radius=${turnRadius.toFixed(1)} path=${car.path} turnState=${car.turnState || 'none'}`);
       car.lastLoggedHeading = car.heading;
       car.lastLoggedX = car.x;
       car.lastLoggedY = car.y;
@@ -634,9 +1025,9 @@ function predictTrajectory(car) {
         );
       }
 
-      if (DEBUG_LOG && blinkerFrame && (car.turnState === 'approaching' || car.turnState === 'turning' ||
+      if (DEBUG_LOG && LOG_CONFIG.verboseVehicleLights && blinkerFrame && (car.turnState === 'approaching' || car.turnState === 'turning' ||
           (car.turnState === 'rejoining' && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)))) {
-        console.log(`${carName} displaying ${car.turnDirection} blinker: ${isBlinkerOn ? 'ON' : 'OFF'} at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), TurnState:${car.turnState}, TurnDirection:${car.turnDirection}`);
+        logEvent('behavior', `${carName} blinker=${car.turnDirection}:${isBlinkerOn ? 'ON' : 'OFF'} turnState=${car.turnState}`);
         car.lastLoggedX = car.x;
         car.lastLoggedY = car.y;
       }
@@ -655,8 +1046,8 @@ function predictTrajectory(car) {
         -259, -91.5, frameWidth, frameHeight
       );
 
-      if (DEBUG_LOG && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)) {
-        console.log(`${carName} displaying brake lights at Pos:(${Math.round(car.x)}, ${Math.round(car.y)}), SpeedFactor:${car.currentSpeedFactor.toFixed(3)}, LastSpeedFactor:${car.lastSpeedFactor.toFixed(3)}, Yielding:${car.isYielding}`);
+      if (DEBUG_LOG && LOG_CONFIG.verboseVehicleLights && (Math.abs(car.x - car.lastLoggedX) > 25 || Math.abs(car.y - car.lastLoggedY) > 25)) {
+        logEvent('behavior', `${carName} brakeLights speed=${car.currentSpeedFactor.toFixed(3)} yielding=${car.isYielding}`);
       }
     }
     car.lastSpeedFactor = car.currentSpeedFactor;
@@ -676,7 +1067,7 @@ function predictTrajectory(car) {
         }
     }
 
-    ctx.font = 'bold 80px sans-serif'; // Smaller font for additional info
+    /*ctx.font = 'bold 80px sans-serif'; // Smaller font for additional info
     ctx.fillStyle = 'white'; // White for better visibility
     ctx.fillText(`Dir: ${car.direction === 1 ? 'CW' : 'CCW'}`, 0, 100);
     ctx.fillText(`VDir: ${car.verticalDirection || 'none'}`, 0, 180);
@@ -684,7 +1075,7 @@ function predictTrajectory(car) {
     ctx.fillText(`State: ${car.turnState || 'none'}`, 0, 340);
     ctx.fillText(`TurnDir: ${car.turnDirection || 'none'}`, 0, 420);
     ctx.fillText(`Path: ${car.path || 'none'}`, 0, 540);
-    ctx.fillText(`CanDecide: ${car.canDecide}`, 0, 600);
+    ctx.fillText(`CanDecide: ${car.canDecide}`, 0, 600);*/
     ctx.restore();
 
     drawTrajectory(car, predictedTrajectory, turnType);
@@ -696,6 +1087,11 @@ function updateCar(car) {
 
   let currentSpeed = car.maximumSpeed * 50 * car.currentSpeedFactor;
   let targetX, targetY;
+  let policyInput = null;
+  let policyMeanSpeed = null;
+  let policyMeanSteer = null;
+  let policySampleSpeed = null;
+  let policySampleSteer = null;
 
   car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
 
@@ -756,6 +1152,7 @@ function updateCar(car) {
   let shouldStop        = false;
   let collisionSlowdown = 1.0;
   let needsAggressive   = false;
+  let hadPriorityConflict = false;
 
   for (const otherCar of allCars) {
     if (otherCar === car) continue;
@@ -825,7 +1222,7 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse' && otherCar.turnState !== 'rejoining') {
              mustYield = true;
              reason = 'rejoin-yield-to-main-road';
-             if (DEBUG_LOG) console.log(`%c${carName} (rejoin) yielding to ${allCars.indexOf(otherCar)+1}`, 'color: #FF69B4');
+             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} rejoin yielding to Car${allCars.indexOf(otherCar)+1}`);
           }
         }
         /* 2.1.1  vertical → ellipse right */
@@ -838,10 +1235,7 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse' && otherCar.direction === 1) {
             mustYield = true;
             reason    = 'intersection-vertical-right';
-            if (DEBUG_LOG) console.log(
-              `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical→ellipse right`,
-              'color: orange'
-            );
+            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse right`);
           }
         }
         /* 2.1.2  vertical → ellipse left  */
@@ -849,10 +1243,7 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse') {
             mustYield = true;
             reason    = 'intersection-vertical-left';
-            if (DEBUG_LOG) console.log(
-              `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical→ellipse left`,
-              'color: red'
-            );
+            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
           } else if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
             const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
             const carDist   = Math.abs(car.y - carIsectY);
@@ -860,10 +1251,7 @@ function updateCar(car) {
             if (othDist < carDist) {
               mustYield = true;
               reason    = 'intersection-vertical-left';
-              if (DEBUG_LOG) console.log(
-                `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical→ellipse left`,
-                'color: red'
-              );
+              if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
             }
           }
         }
@@ -886,10 +1274,7 @@ function updateCar(car) {
             if (othDist < myDist) {
                 mustYield = true;
                 reason    = 'vertical-turn-opposite';
-                if (DEBUG_LOG) console.log(
-                    `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} (opposite vertical turn)`,
-                    'color: violet'
-                );
+                if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} opposite vertical turn`);
             }
         }	  
 
@@ -913,16 +1298,16 @@ function updateCar(car) {
             if (isOppositeDirection && isOtherOnEllipse) {
                 mustYield = true;
                 reason = 'ellipse-left-yield-to-opposite';
-                if (DEBUG_LOG) console.log(
-                    `%c${carName} yielding to Car${allCars.indexOf(otherCar)+1} (ellipse→vertical left vs opposite on ellipse)`,
-                    'color: purple'
-                );
+                if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical left vs opposite`);
             }
         }
       }
     }
 
     if (mustYield) {
+      if (reason !== 'following') {
+        hadPriorityConflict = true;
+      }
       shouldStop = true;
       if (reason === 'following') {
         const gap = CAR_LENGTH * 0.4;
@@ -981,6 +1366,7 @@ function updateCar(car) {
   }
 
   /* commit once past the stopping line */
+  let violatedYieldRule = false;
   if (!car.isCommittedToTurn) {
     let past = false;
     if (car.path === 'ellipse' && car.isMakingTurn) {
@@ -997,6 +1383,9 @@ function updateCar(car) {
     }
     if (past && !shouldStop && car.currentSpeedFactor > 0.01) {
       car.isCommittedToTurn = true;
+    }
+    if (past && shouldStop && hadPriorityConflict) {
+      violatedYieldRule = true;
     }
   }
 
@@ -1064,6 +1453,28 @@ function updateCar(car) {
   }
 
   targetFactor = Math.min(targetFactor, collisionSlowdown);
+  const laneErrBeforeMove = laneCenterError(car);
+  const onGrassBeforeMove = !isPointOnRoad(car.x, car.y);
+  const contextBeforeMove = {
+    shouldStop,
+    needsAggressive,
+    laneErr: laneErrBeforeMove,
+    onGrass: onGrassBeforeMove
+  };
+  const heuristicTargetFactor = clamp(targetFactor, 0, 1);
+  let nnControlBlend = isRLRunning ? NN_BLEND_WHILE_RL : NN_BLEND_INFERENCE;
+  if (onGrassBeforeMove || laneErrBeforeMove > NN_SAFETY_MAX_LANE_ERR) {
+    nnControlBlend = 0;
+  }
+  if (controllerMode === 'nn') {
+    policyInput = buildStateVector(car, contextBeforeMove);
+    const { out } = networkForward(nn, policyInput);
+    policyMeanSpeed = 1 / (1 + Math.exp(-out[0]));
+    policyMeanSteer = Math.tanh(out[1]);
+    policySampleSpeed = isRLRunning ? clamp(policyMeanSpeed + randn() * RL_SIGMA, 0, 1) : policyMeanSpeed;
+    policySampleSteer = isRLRunning ? clamp(policyMeanSteer + randn() * RL_SIGMA, -1, 1) : policyMeanSteer;
+    targetFactor = clamp((1 - nnControlBlend) * heuristicTargetFactor + nnControlBlend * policySampleSpeed, 0, 1);
+  }
 
   let accel = MAX_ACCELERATION;
   if (needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
@@ -1161,13 +1572,99 @@ function updateCar(car) {
 
   let boost = 1;
   if (isOnVerticalSegment || isRejoining) boost = 1.2;
-  car.targetSteerAngle = headingError * STEERING_GAIN * boost;
-  car.targetSteerAngle = Math.max(-SYMMETRIC_MAX_TURN_STEER_ANGLE, Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, car.targetSteerAngle));
+  const heuristicTargetSteer = Math.max(
+    -SYMMETRIC_MAX_TURN_STEER_ANGLE,
+    Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, headingError * STEERING_GAIN * boost)
+  );
+  car.targetSteerAngle = heuristicTargetSteer;
+  if (controllerMode === 'nn' && policyMeanSteer !== null) {
+    const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
+    car.targetSteerAngle = clamp((1 - nnControlBlend) * heuristicTargetSteer + nnControlBlend * nnSteerAngle, -SYMMETRIC_MAX_TURN_STEER_ANGLE, SYMMETRIC_MAX_TURN_STEER_ANGLE);
+  }
 
   updateCarPhysics(car, car.maximumSpeed * 50 * car.currentSpeedFactor);
   car.x = Math.max(0, Math.min(canvas.width,  car.x));
   car.y = Math.max(0, Math.min(canvas.height, car.y));
-}    // Function to draw crossroad areas for debugging
+  car.lastRuleViolation = violatedYieldRule;
+
+  const laneErr = laneCenterError(car);
+  const onGrass = !isPointOnRoad(car.x, car.y);
+  const speedDelta = car.currentSpeedFactor - car.prevSpeedFactor;
+  const accelJerk = Math.abs(speedDelta - car.lastAccelDelta);
+  car.lastAccelDelta = speedDelta;
+  car.prevSpeedFactor = car.currentSpeedFactor;
+
+  let reward = 0;
+  reward += car.currentSpeedFactor * 0.02;
+  reward -= onGrass ? 1.0 : 0.0;
+  reward -= clamp(laneErr / (ROAD_WIDTH / 3), 0, 2.5) * 0.35;
+  reward -= clamp(accelJerk / 0.12, 0, 3.0) * 0.2;
+  reward -= car.lastRuleViolation ? 0.8 : 0;
+  reward += car.pendingCrashPenalty;
+  car.pendingCrashPenalty = 0;
+  car.lastReward = reward;
+  logAccumulator.carsSeen += 1;
+  logAccumulator.rewardSum += reward;
+  logAccumulator.speedSum += car.currentSpeedFactor;
+  logAccumulator.laneErrSum += laneErr;
+  logAccumulator.accelJerkSum += accelJerk;
+  if (onGrass) logAccumulator.grassCount += 1;
+  if (car.lastRuleViolation) logAccumulator.ruleViolations += 1;
+
+  const trainingInput = buildStateVector(car, { shouldStop, needsAggressive, laneErr, onGrass });
+  const targetSpeed = heuristicTargetFactor;
+  const targetSteer = clamp(heuristicTargetSteer / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
+  car.lastHeuristicSample = { input: trainingInput, target: [targetSpeed, targetSteer] };
+  trainingBuffer.push({ input: trainingInput, target: [targetSpeed, targetSteer] });
+  if (trainingBuffer.length > TRAINING_BUFFER_MAX) {
+    trainingBuffer.shift();
+  }
+
+  if (controllerMode === 'nn') {
+    car.lastPolicyTransition = {
+      input: policyInput || trainingInput,
+      meanSpeed: policyMeanSpeed !== null ? policyMeanSpeed : targetSpeed,
+      meanSteer: policyMeanSteer !== null ? policyMeanSteer : targetSteer,
+      sampleSpeed: policySampleSpeed !== null ? policySampleSpeed : targetSpeed,
+      sampleSteer: policySampleSteer !== null ? policySampleSteer : targetSteer
+    };
+  } else {
+    car.lastPolicyTransition = null;
+  }
+}
+
+  function assignCrashPenalties() {
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    for (let i = 0; i < allCars.length; i++) {
+      for (let j = i + 1; j < allCars.length; j++) {
+        const a = allCars[i];
+        const b = allCars[j];
+        const boxA = getCarBoundingBox(a);
+        const boxB = getCarBoundingBox(b);
+        if (!checkPolygonIntersection(boxA, boxB)) continue;
+
+        const aViolator = a.lastRuleViolation;
+        const bViolator = b.lastRuleViolation;
+        logAccumulator.crashPairs += 1;
+        if (aViolator && !bViolator) {
+          a.pendingCrashPenalty -= 8.0;
+          logAccumulator.violatorCrashPairs += 1;
+        } else if (bViolator && !aViolator) {
+          b.pendingCrashPenalty -= 8.0;
+          logAccumulator.violatorCrashPairs += 1;
+        } else if (aViolator && bViolator) {
+          a.pendingCrashPenalty -= 7.0;
+          b.pendingCrashPenalty -= 7.0;
+          logAccumulator.violatorCrashPairs += 1;
+        } else {
+          a.pendingCrashPenalty -= 3.0;
+          b.pendingCrashPenalty -= 3.0;
+        }
+      }
+    }
+  }
+
+  // Function to draw crossroad areas for debugging
   function drawCrossroadAreas() {
     ctx.save();
     ctx.globalAlpha = 0.2;
@@ -1202,12 +1699,64 @@ function updateCar(car) {
   }
 
   function update() {
+    simFrame++;
+    logAccumulator.frames++;
+
     updateCar(car1);
     updateCar(car2);
     updateCar(car3);
     updateCar(car4);
     updateCar(car5);
     updateCar(car6);
+    assignCrashPenalties();
+
+    if (isPreTraining) {
+      runPretrainStep();
+    }
+
+    if (isRLRunning && controllerMode === 'nn') {
+      const allCars = [car1, car2, car3, car4, car5, car6];
+      let frameReward = 0;
+      for (const car of allCars) {
+        rlBaselineEMA = rlStepCount === 0 ? car.lastReward : rlBaselineEMA * RL_BASELINE_DECAY + car.lastReward * (1 - RL_BASELINE_DECAY);
+        const absDev = Math.abs(car.lastReward - rlBaselineEMA);
+        rlRewardAbsDevEMA = rlStepCount === 0 ? Math.max(0.25, absDev) : rlRewardAbsDevEMA * 0.99 + Math.max(0.25, absDev) * 0.01;
+        trainPolicyGradient(car.lastPolicyTransition, car.lastReward, RL_LR);
+        if (car.lastHeuristicSample) {
+          trainNetworkSupervised(car.lastHeuristicSample, RL_BEHAVIOR_CLONE_LR);
+        }
+        frameReward += car.lastReward;
+      }
+      rlStepCount++;
+      const meanFrameReward = frameReward / allCars.length;
+      rlRewardEMA = rlStepCount === 1 ? meanFrameReward : rlRewardEMA * 0.97 + meanFrameReward * 0.03;
+    }
+
+    if ((pretrainSteps + rlStepCount) % 3 === 0) {
+      refreshStatusPanel();
+    }
+
+    if (lastControllerMode !== controllerMode) {
+      logEvent('lifecycle', `active controller: ${controllerMode}`);
+      lastControllerMode = controllerMode;
+    }
+    if (lastPretrainState !== isPreTraining) {
+      logEvent('lifecycle', `pre-train state changed -> ${isPreTraining ? 'running' : 'idle'}`);
+      lastPretrainState = isPreTraining;
+    }
+    if (lastRLState !== isRLRunning) {
+      logEvent('lifecycle', `RL state changed -> ${isRLRunning ? 'running' : 'idle'}`);
+      lastRLState = isRLRunning;
+    }
+    if (!isPreTraining && pretrainSteps >= PRETRAIN_TARGET_STEPS && lastPretrainLogMs !== -1) {
+      logEvent('training', `pre-train completed at ${pretrainSteps} steps; final lossEMA=${pretrainLossEMA.toFixed(5)}`);
+      lastPretrainLogMs = -1;
+    }
+    if (!isPreTraining && lastPretrainLogMs === -1 && pretrainSteps < PRETRAIN_TARGET_STEPS) {
+      lastPretrainLogMs = 0;
+    }
+
+    emitPeriodicLogs();
   }
 
   function toggleSimulation() {
@@ -1215,11 +1764,11 @@ function updateCar(car) {
     isSimulationRunning = !isSimulationRunning;
     if (isSimulationRunning) {
       button.textContent = 'Stop Simulation';
-      if (DEBUG_LOG) console.log("--- Simulation Resumed ---");
+      logEvent('lifecycle', 'simulation resumed');
       gameLoop();
     } else {
       button.textContent = 'Resume Simulation';
-      if (DEBUG_LOG) console.log("--- Simulation Paused ---");
+      logEvent('lifecycle', 'simulation paused');
       cancelAnimationFrame(animationFrameId);
     }
   }

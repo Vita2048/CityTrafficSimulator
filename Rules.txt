@@ -1,0 +1,61 @@
+the cars are supposed to follow:
+
+
+Definitions:
+
+A) Future Trajectory: The future trajectory of a car is calculated as a distance equal to TRAJECTORY_LENGTH times the car’s length, 
+projected along its planned path (straight or turning) based on its current speed and direction. The trajectory is represented as the 
+car’s bounding box extended over this distance.
+
+B) TRAJECTORY_LENGTH: A configurable parameter (e.g., 2, 3, or 5 car lengths) that determines the length of the trajectory checked for overlaps.
+
+C) MAX_ACCELERATION: The maximum deceleration rate (in m/s²) a car can use to stop. Cars must maintain a speed such that they can stop within the 
+TRAJECTORY_LENGTH distance without exceeding MAX_ACCELERATION.
+
+Road Types:
+Elliptical Road: The main road with priority in crossroad scenarios.
+Vertical Road: The side road with lower priority.
+
+
+Rule 1: Same Lane or Same Turn If the future trajectory (length = TRAJECTORY_LENGTH × car length) overlaps with another car’s sprite in the same lane ahead or performing the same turn ahead:Gradually slow down and stop if necessary.
+Maintain a gap of at least 0.5 car lengths but no more than 1 car length to the car ahead when stopped.
+Adjust speed to ensure the car can stop within the TRAJECTORY_LENGTH distance without exceeding MAX_ACCELERATION, using the formula:\text{Max Speed} = \sqrt{2 \times \text{MAX_ACCELERATION} \times \text{TRAJECTORY_LENGTH} \times \text{Car Length}}
+This rule has the highest priority and is checked before all other rules.
+
+Rule 2: Crossroad Overlap - If the future trajectory (length = TRAJECTORY_LENGTH × car length) overlaps with another car’s sprite at a crossroad and the car is changing direction or merging:
+
+2.1. On Vertical Road (Side Road):
+2.1.1. Turning Right (Clockwise):If the trajectory overlaps with a car on the elliptical road driving in clockwise direction, stop at the stopping point and wait until the overlap disappears.
+2.1.2. Turning Left (Counterclockwise): If the trajectory overlaps with a car on the elliptical road in either direction, stop at the stopping point and wait until the overlap disappears.
+
+
+2.2. On Elliptical Road (Main Road):
+2.2.1. Turning Left to Vertical Road: If the trajectory overlaps with a car driving in the opposite direction on the inner elliptical road, stop at the stopping point and wait until the overlap disappears.
+2.2.2. Turning Right to Vertical Road: If the trajectory overlaps with a car currently navigating the crossroad inside the vertical road, stop at the stopping point and wait until the overlap disappears.
+2.2.3. Continuing Straight: Apply Rule 1 to check for overlaps in the same lane or turn on the elliptical road.
+
+
+Speed Constraint:When approaching a crossroad, adjust speed to ensure the car can stop at the stopping point within the TRAJECTORY_LENGTH distance without exceeding MAX_ACCELERATION, using the formula above.
+
+
+
+
+when the car decides to yield, it should stop at this point:
+-When it drives on the outer elliptical road and is turning left, it should stop right before its bounding box intersects the inner lane of the elliptical road.
+-When it drives on the vertical road, it should stop at the point where the front part of the car sprite aligns with the innermost circle of the ellipse.
+
+Once the car crosses this point, it has right-of-way over cross-traffic until it finishes the turn. However, it must still obey Rule 1 and yield to any cars directly ahead of it in its target lane. If the car is making a turn at the intersection, it must slow down so that it is always able to stop at the stopping point without exceeding MAX_ACCELERATION.
+
+
+Future Trajectory Visualisation:
+Visualize predicted trajectories for each car by drawing an occupancy lane (area that the car sprite will occupy in the future) with 10% transparency of this color:
+
+If the trajectory does not change roads, draw it in green.
+
+If the trajectory starts on the elliptical road and follows a left turn to the vertical road, draw it in blue.
+
+If the trajectory starts on the elliptical road and follows a right turn to the vertical road, draw it in cyan.
+
+If the trajectory starts on the vertical road and follows a right turn to the elliptical road, draw it in yellow.
+
+If the trajectory starts on the vertical road and follows a left turn to the elliptical road, draw it in red.
