@@ -34,17 +34,13 @@ Rule 2: Crossroad Overlap - If the future trajectory (length = TRAJECTORY_LENGTH
 2.2.2. Turning Right to Vertical Road: If the trajectory overlaps with a car currently navigating the crossroad inside the vertical road, stop at the stopping point and wait until the overlap disappears.
 2.2.3. Continuing Straight: Apply Rule 1 to check for overlaps in the same lane or turn on the elliptical road.
 
+Rule 3: Do no drive on grass
+Rule 4: Drive in the lane center
+Rule 5: When approaching a crossroad, adjust speed to ensure the car can stop at the stopping point within the TRAJECTORY_LENGTH distance without exceeding MAX_ACCELERATION, using the formula above.
+Rule 6: When the car decides to yield, it should stop at this point:
+6.1. When it drives on the outer elliptical road and is turning left, it should stop right before its bounding box intersects the inner lane of the elliptical road.
+6.2 When it drives on the vertical road, it should stop at the point where the front part of the car sprite aligns with the innermost circle of the ellipse.
 
-Speed Constraint:When approaching a crossroad, adjust speed to ensure the car can stop at the stopping point within the TRAJECTORY_LENGTH distance without exceeding MAX_ACCELERATION, using the formula above.
-
-
-
-
-when the car decides to yield, it should stop at this point:
--When it drives on the outer elliptical road and is turning left, it should stop right before its bounding box intersects the inner lane of the elliptical road.
--When it drives on the vertical road, it should stop at the point where the front part of the car sprite aligns with the innermost circle of the ellipse.
-
-Once the car crosses this point, it has right-of-way over cross-traffic until it finishes the turn. However, it must still obey Rule 1 and yield to any cars directly ahead of it in its target lane. If the car is making a turn at the intersection, it must slow down so that it is always able to stop at the stopping point without exceeding MAX_ACCELERATION.
 
 
 Future Trajectory Visualisation:

@@ -165,6 +165,9 @@
   const RL_GRASS_TRIGGER_COUNT = 2;
   const GRASS_CORRECTION_UPDATES = 4;
   const GRASS_CORRECTION_LR = 0.0009;
+  const RULE1_STOP_GAP_MIN = 0.5 * CAR_LENGTH;
+  const RULE1_STOP_GAP_MAX = 1.0 * CAR_LENGTH;
+  const RULE6_STOP_LINE_TOLERANCE = 0.2 * CAR_LENGTH;
 
   // Declare car objects globally
   let car1 = {};
@@ -375,7 +378,8 @@
     const denom = Math.max(0.25, rlRewardAbsDevEMA);
     let advantage = clamp(centered / denom, -2.5, 2.5);
     if (reward < RL_BAD_REWARD_THRESHOLD) {
-      advantage *= 0.25;
+      const badness = clamp((RL_BAD_REWARD_THRESHOLD - reward) / 0.9, 0, 1.5);
+      advantage *= (1 + badness);
     }
     const sigma = Math.max(RL_SIGMA_MIN, transition.sigma || rlAdaptiveSigma || RL_SIGMA);
     const invVar = 1 / (sigma * sigma);
@@ -1424,6 +1428,12 @@ function updateCar(car) {
   let hasFollowingConflict = false;
   let leadGapPx = Infinity;
   let leadSpeedFactor = car.currentSpeedFactor;
+  let yieldRule_2_1_1 = false;
+  let yieldRule_2_1_2 = false;
+  let yieldRule_2_2_1 = false;
+  let yieldRule_2_2_2 = false;
+  let yieldRule_rejoin = false;
+  let yieldConflictMinDist = Infinity;
 
   for (const otherCar of allCars) {
     if (otherCar === car) continue;
@@ -1499,6 +1509,8 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse' && otherCar.turnState !== 'rejoining') {
              mustYield = true;
              reason = 'rejoin-yield-to-main-road';
+             yieldRule_rejoin = true;
+             yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
              if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} rejoin yielding to Car${allCars.indexOf(otherCar)+1}`);
           }
         }
@@ -1512,6 +1524,8 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse' && otherCar.direction === 1) {
             mustYield = true;
             reason    = 'intersection-vertical-right';
+            yieldRule_2_1_1 = true;
+            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse right`);
           }
         }
@@ -1520,6 +1534,8 @@ function updateCar(car) {
           if (otherCar.path === 'ellipse') {
             mustYield = true;
             reason    = 'intersection-vertical-left';
+            yieldRule_2_1_2 = true;
+            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
           } else if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
             const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
@@ -1528,6 +1544,8 @@ function updateCar(car) {
             if (othDist < carDist) {
               mustYield = true;
               reason    = 'intersection-vertical-left';
+              yieldRule_2_1_2 = true;
+              yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
               if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
             }
           }
@@ -1575,8 +1593,35 @@ function updateCar(car) {
             if (isOppositeDirection && isOtherOnEllipse) {
                 mustYield = true;
                 reason = 'ellipse-left-yield-to-opposite';
+                yieldRule_2_2_1 = true;
+                yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
                 if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical left vs opposite`);
             }
+        }
+
+        /* 2.2.2 ellipse -> vertical right yields to cars navigating vertical crossroad */
+        const isEllipseToVerticalRight = car.turnDirection === 'right' &&
+                                         car.isMakingTurn &&
+                                         car.path === 'ellipse' &&
+                                         !car.isCommittedToTurn;
+        if (isEllipseToVerticalRight && otherCar.path === 'vertical') {
+          const otherInTopCrossroad =
+            otherCar.x > topCrossroadArea.x &&
+            otherCar.x < topCrossroadArea.x + topCrossroadArea.width &&
+            otherCar.y > topCrossroadArea.y &&
+            otherCar.y < topCrossroadArea.y + topCrossroadArea.height;
+          const otherInBottomCrossroad =
+            otherCar.x > bottomCrossroadArea.x &&
+            otherCar.x < bottomCrossroadArea.x + bottomCrossroadArea.width &&
+            otherCar.y > bottomCrossroadArea.y &&
+            otherCar.y < bottomCrossroadArea.y + bottomCrossroadArea.height;
+          if (otherInTopCrossroad || otherInBottomCrossroad) {
+            mustYield = true;
+            reason = 'ellipse-right-yield-to-vertical';
+            yieldRule_2_2_2 = true;
+            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
+            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical right vs vertical crossroad`);
+          }
         }
       }
     }
@@ -1626,21 +1671,25 @@ function updateCar(car) {
   /* ----------  Stopping-point / Commit logic  ---------- */
   const VERTICAL_ROAD_LEFT  = centerX - ROAD_WIDTH / 2;
   const VERTICAL_ROAD_RIGHT = centerX + ROAD_WIDTH / 2;
+  const yieldLineTop = centerY - (360 - ROAD_WIDTH / 2);
+  const yieldLineBottom = centerY + (360 - ROAD_WIDTH / 2);
 
   let isAtYieldLine = false;
+  let signedDistToYieldLine = Infinity;
 
   if (!car.isCommittedToTurn) {
     if (car.path === 'ellipse' && car.isMakingTurn) {
-      isAtYieldLine = car.x > centerX
-        ? frontBumperX <= VERTICAL_ROAD_RIGHT
-        : frontBumperX >= VERTICAL_ROAD_LEFT;
+      signedDistToYieldLine = car.x > centerX
+        ? frontBumperX - VERTICAL_ROAD_RIGHT
+        : VERTICAL_ROAD_LEFT - frontBumperX;
+      isAtYieldLine = signedDistToYieldLine <= 0;
     }
     const isVerticalManeuver = car.isMakingTurn && car.verticalDirection !== null;
     if (isVerticalManeuver) {
-      const yieldLineTop    = centerY - (360 - ROAD_WIDTH / 2);
-      const yieldLineBottom = centerY + (360 - ROAD_WIDTH / 2);
-      isAtYieldLine = (car.verticalDirection === 'up'   && frontBumperY <= yieldLineTop) ||
-                      (car.verticalDirection === 'down' && frontBumperY >= yieldLineBottom);
+      signedDistToYieldLine = (car.verticalDirection === 'up')
+        ? (frontBumperY - yieldLineTop)
+        : (yieldLineBottom - frontBumperY);
+      isAtYieldLine = signedDistToYieldLine <= 0;
     }
   }
 
@@ -1667,10 +1716,8 @@ function updateCar(car) {
     }
     const isVerticalManeuver = car.isMakingTurn && car.verticalDirection !== null;
     if (isVerticalManeuver) {
-      const lineTop    = centerY - (360 - ROAD_WIDTH / 2);
-      const lineBottom = centerY + (360 - ROAD_WIDTH / 2);
-      past = (car.verticalDirection === 'up'   && frontBumperY < lineTop) ||
-             (car.verticalDirection === 'down' && frontBumperY > lineBottom);
+      past = (car.verticalDirection === 'up'   && frontBumperY < yieldLineTop) ||
+             (car.verticalDirection === 'down' && frontBumperY > yieldLineBottom);
     }
     if (past && !shouldStop && car.currentSpeedFactor > 0.01) {
       car.isCommittedToTurn = true;
@@ -1889,18 +1936,69 @@ function updateCar(car) {
 
   const laneErr = laneCenterError(car);
   const onGrass = !isPointOnRoad(car.x, car.y);
+  const neighborContextAfterMove = getNeighborContext(car, allCars);
   const speedDelta = car.currentSpeedFactor - car.prevSpeedFactor;
   const accelJerk = Math.abs(speedDelta - car.lastAccelDelta);
   car.lastAccelDelta = speedDelta;
   car.prevSpeedFactor = car.currentSpeedFactor;
 
   let reward = 0;
+  const currentVelAfterMove = car.maximumSpeed * 50 * car.currentSpeedFactor;
   reward += car.currentSpeedFactor * 0.02;
   reward -= onGrass ? 1.6 : 0.0;
   reward -= clamp(laneErr / (ROAD_WIDTH / 3), 0, 2.5) * 0.35;
   reward -= clamp(accelJerk / 0.12, 0, 3.0) * 0.2;
   reward -= followRisk * 0.9;
+  reward -= neighborContextAfterMove.minTtcRisk * 0.55;
+  reward -= neighborContextAfterMove.conflictTtcRisk * 1.2;
+  reward -= neighborContextAfterMove.leadTtcRisk * 0.30;
   reward -= car.lastRuleViolation ? 0.8 : 0;
+
+  // Rule 1: maintain safe speed relative to lead and stop with 0.5-1.0 car lengths when queued.
+  if (hasLeadVehicle) {
+    const effectiveStopDistance = clamp(leadGapPx, 0, TRAJECTORY_LENGTH * CAR_LENGTH);
+    const maxFollowVel = Math.sqrt(2 * MAX_ACCELERATION * Math.max(0.001, effectiveStopDistance));
+    const followSpeedExcess = Math.max(0, currentVelAfterMove - maxFollowVel);
+    reward -= clamp(followSpeedExcess / Math.max(0.001, car.maximumSpeed * 50), 0, 2.0) * 0.9;
+  }
+  if (hasLeadVehicle && car.currentSpeedFactor < 0.06 && hasFollowingConflict) {
+    const tooClose = Math.max(0, RULE1_STOP_GAP_MIN - leadGapPx);
+    const tooFar = Math.max(0, leadGapPx - RULE1_STOP_GAP_MAX);
+    const stopGapPenalty = clamp(tooClose / RULE1_STOP_GAP_MIN, 0, 2) + clamp(tooFar / (RULE1_STOP_GAP_MAX * 1.5), 0, 1.5);
+    reward -= stopGapPenalty * 0.55;
+  }
+
+  // Rule 5: approaching crossroad must preserve ability to stop at stop line.
+  const isApproachingYieldLine = !car.isCommittedToTurn &&
+                                 (car.turnState === 'approaching' || car.turnState === 'rejoining') &&
+                                 Number.isFinite(signedDistToYieldLine) &&
+                                 signedDistToYieldLine > 0 &&
+                                 signedDistToYieldLine <= TRAJECTORY_LENGTH * CAR_LENGTH;
+  if (isApproachingYieldLine) {
+    const maxApproachVel = Math.sqrt(2 * MAX_ACCELERATION * signedDistToYieldLine);
+    const approachSpeedExcess = Math.max(0, currentVelAfterMove - maxApproachVel);
+    reward -= clamp(approachSpeedExcess / Math.max(0.001, car.maximumSpeed * 50), 0, 2.0) * 1.1;
+  }
+
+  // Rule 6: if yielding, stop near the designated stop line.
+  if (car.isYielding && hadPriorityConflict && car.currentSpeedFactor < 0.06 && Number.isFinite(signedDistToYieldLine)) {
+    const stopLineOffset = Math.abs(signedDistToYieldLine);
+    const offStopLine = Math.max(0, stopLineOffset - RULE6_STOP_LINE_TOLERANCE);
+    reward -= clamp(offStopLine / (0.8 * CAR_LENGTH), 0, 2) * 0.9;
+  }
+
+  const yieldProximity = Number.isFinite(yieldConflictMinDist)
+    ? clamp(1 - yieldConflictMinDist / TRAJECTORY_LOOKAHEAD_DISTANCE, 0, 1)
+    : 0;
+  if (yieldRule_2_1_2 || yieldRule_2_2_1) {
+    reward -= yieldProximity * car.currentSpeedFactor * 1.5;
+  } else if (yieldRule_2_1_1) {
+    reward -= yieldProximity * car.currentSpeedFactor * 1.2;
+  } else if (yieldRule_2_2_2) {
+    reward -= yieldProximity * car.currentSpeedFactor * 1.35;
+  } else if (yieldRule_rejoin) {
+    reward -= yieldProximity * car.currentSpeedFactor * 1.3;
+  }
   reward += car.pendingCrashPenalty;
   car.pendingCrashPenalty = 0;
   car.lastReward = reward;
@@ -1913,7 +2011,6 @@ function updateCar(car) {
   if (onGrass) logAccumulator.grassCount += 1;
   if (car.lastRuleViolation) logAccumulator.ruleViolations += 1;
 
-  const neighborContextAfterMove = getNeighborContext(car, allCars);
   const trainingInput = buildStateVector(car, {
     shouldStop,
     needsAggressive,
@@ -2072,9 +2169,11 @@ function updateCar(car) {
         rlBaselineEMA = rlStepCount === 0 ? car.lastReward : rlBaselineEMA * RL_BASELINE_DECAY + car.lastReward * (1 - RL_BASELINE_DECAY);
         const absDev = Math.abs(car.lastReward - rlBaselineEMA);
         rlRewardAbsDevEMA = rlStepCount === 0 ? Math.max(0.25, absDev) : rlRewardAbsDevEMA * 0.99 + Math.max(0.25, absDev) * 0.01;
-        if (car.lastReward > RL_BAD_REWARD_THRESHOLD) {
-          trainPolicyGradient(car.lastPolicyTransition, car.lastReward, RL_LR * pgScale);
-        }
+        const pgReward =
+          car.lastReward +
+          (car.crashThisFrame ? RL_CRASH_REWARD_BONUS_PENALTY : 0) +
+          (car.lastOnGrass ? -0.8 : 0);
+        trainPolicyGradient(car.lastPolicyTransition, pgReward, RL_LR * pgScale);
         if (car.lastHeuristicSample) {
           for (let m = 0; m < bcMultiplier; m++) {
             trainNetworkSupervised(car.lastHeuristicSample, RL_BEHAVIOR_CLONE_LR);
@@ -2090,10 +2189,7 @@ function updateCar(car) {
             }
           }
         }
-        const replayReward =
-          car.lastReward +
-          (car.crashThisFrame ? RL_CRASH_REWARD_BONUS_PENALTY : 0) +
-          (car.lastOnGrass ? -0.8 : 0);
+        const replayReward = pgReward;
         pushReplayTransition(car.lastPolicyTransition, replayReward, car.crashThisFrame);
         frameReward += replayReward;
       }
