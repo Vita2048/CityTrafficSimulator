@@ -132,7 +132,7 @@
   // New tunable parameter for trajectory prediction
   const TRAJECTORY_LENGTH = 4.0;
   const APPROACH_DISTANCE = TRAJECTORY_LENGTH * CAR_LENGTH;
-  const INPUT_DIM = 26;
+  const INPUT_DIM = 47;
   const HIDDEN_DIM = 16;
   const OUTPUT_DIM = 2;
   const PRETRAIN_TARGET_STEPS = 6000;
@@ -141,11 +141,11 @@
   const PRETRAIN_LR = 0.0025;
   const RL_LR = 0.00015;
   const RL_SIGMA = 0.06;
-  const RL_SIGMA_MIN = 0.02;
-  const RL_BASELINE_DECAY = 0.995;
+  const RL_SIGMA_MIN = 0.035;
+  const RL_BASELINE_DECAY = 0.99;
   const RL_BEHAVIOR_CLONE_LR = 0.0007;
-  const NN_BLEND_INFERENCE = 0.55;
-  const NN_BLEND_WHILE_RL = 0.22;
+  const NN_BLEND_INFERENCE = 1.0;
+  const NN_BLEND_WHILE_RL = 1.0;
   const NN_SAFETY_MAX_LANE_ERR = ROAD_WIDTH * 0.45;
   const RL_BAD_REWARD_THRESHOLD = -0.45;
   const RL_MAX_SPEED_DEV_FROM_HEURISTIC = 0.22;
@@ -153,7 +153,7 @@
   const RL_REPLAY_MAX = 50000;
   const RL_REPLAY_UPDATES_PER_FRAME = 14;
   const RL_REPLAY_BAD_REWARD_CUTOFF = -0.18;
-  const RL_CRASH_REWARD_BONUS_PENALTY = -1.2;
+  const RL_CRASH_REWARD_BONUS_PENALTY = -5.0;
   const CRASH_CORRECTION_UPDATES = 10;
   const CRASH_CORRECTION_LR = 0.0011;
   const RL_RECOVERY_STEPS_ON_CRASH = 180;
@@ -168,6 +168,10 @@
   const RULE1_STOP_GAP_MIN = 0.5 * CAR_LENGTH;
   const RULE1_STOP_GAP_MAX = 1.0 * CAR_LENGTH;
   const RULE6_STOP_LINE_TOLERANCE = 0.2 * CAR_LENGTH;
+  const ROAD_EDGE_RAY_COUNT = 8;
+  const ROAD_EDGE_RAY_MAX_DISTANCE = ROAD_WIDTH * 2.5;
+  const ROAD_EDGE_RAY_STEP = 6;
+  const VERTICAL_STOP_GAP_PENALTY_MULTIPLIER = 1.8;
 
   // Declare car objects globally
   let car1 = {};
@@ -192,6 +196,7 @@
   let rlReplay = [];
   let rlReplayUpdateScale = 1;
   let rlRecoveryStepsRemaining = 0;
+  let rlRecoveryBcMultiplierDynamic = RL_RECOVERY_BC_MULTIPLIER;
   let rlCrashEMA = 0;
   let rlGrassEMA = 0;
   let frameCrashPairs = 0;
@@ -553,6 +558,39 @@
     return Math.abs(radialNorm - 1) * ((aTarget + bTarget) * 0.5);
   }
 
+  function normalizeAngle(angle) {
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
+    return angle;
+  }
+
+  function getRoadEdgeDistanceSensors(car) {
+    const sensors = [];
+    for (let i = 0; i < ROAD_EDGE_RAY_COUNT; i++) {
+      const rayAngle = car.heading + (i * 2 * Math.PI) / ROAD_EDGE_RAY_COUNT;
+      let dist = ROAD_EDGE_RAY_MAX_DISTANCE;
+      for (let d = 0; d <= ROAD_EDGE_RAY_MAX_DISTANCE; d += ROAD_EDGE_RAY_STEP) {
+        const sampleX = car.x + Math.cos(rayAngle) * d;
+        const sampleY = car.y + Math.sin(rayAngle) * d;
+        if (!isPointOnRoad(sampleX, sampleY)) {
+          dist = d;
+          break;
+        }
+      }
+      sensors.push(clamp(dist / ROAD_EDGE_RAY_MAX_DISTANCE, 0, 1));
+    }
+    return sensors;
+  }
+
+  function getTargetHeadingLookaheadNorm(car, lookAheadDistance) {
+    const { targetX, targetY } = getLookaheadPointForPrediction(car, lookAheadDistance);
+    const dx = targetX - car.x;
+    const dy = targetY - car.y;
+    const targetHeading = (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) ? car.heading : Math.atan2(dy, dx);
+    const headingError = normalizeAngle(targetHeading - car.heading);
+    return clamp(headingError / Math.PI, -1, 1);
+  }
+
   function computeLongitudinalTTC(car, otherCar) {
     const hx = Math.cos(car.heading);
     const hy = Math.sin(car.heading);
@@ -682,12 +720,39 @@
       nearbyCountNorm: 0,
       minTtcRisk: 0
     };
+    const signedDistToYieldLineNorm = Number.isFinite(context.signedDistToYieldLineNorm)
+      ? clamp(context.signedDistToYieldLineNorm, -1.5, 1.5)
+      : 1.5;
+    const onMainRoad = context.onMainRoad ? 1 : 0;
+    const isEllipseToVerticalLeft = context.isEllipseToVerticalLeft ? 1 : 0;
+    const isEllipseToVerticalRight = context.isEllipseToVerticalRight ? 1 : 0;
+    const isVerticalToEllipseRight = context.isVerticalToEllipseRight ? 1 : 0;
+    const isVerticalToEllipseLeft = context.isVerticalToEllipseLeft ? 1 : 0;
+    const isSameLaneAhead = context.isSameLaneAhead ? 1 : 0;
+    const overlapSameLane = context.overlapType === 'same-lane' ? 1 : 0;
+    const overlapCrossroadClockwise = context.overlapType === 'crossroad-clockwise' ? 1 : 0;
+    const overlapCrossroadCounterclockwise = context.overlapType === 'crossroad-counterclockwise' ? 1 : 0;
+    const overlapMerging = context.overlapType === 'merging' ? 1 : 0;
+    const priorityStatus = Number.isFinite(context.priorityStatus) ? clamp(context.priorityStatus, -1, 1) : 0;
+    const roadEdgeSensors = Array.isArray(context.roadEdgeSensors) ? context.roadEdgeSensors.slice(0, ROAD_EDGE_RAY_COUNT) : [];
+    while (roadEdgeSensors.length < ROAD_EDGE_RAY_COUNT) roadEdgeSensors.push(1);
+    const currentAccelerationNorm = Number.isFinite(context.currentAcceleration)
+      ? clamp(context.currentAcceleration / 0.08, -1.5, 1.5)
+      : 0;
+    const headingLookahead50Norm = Number.isFinite(context.headingLookahead50Norm)
+      ? clamp(context.headingLookahead50Norm, -1, 1)
+      : 0;
+    const headingLookahead100Norm = Number.isFinite(context.headingLookahead100Norm)
+      ? clamp(context.headingLookahead100Norm, -1, 1)
+      : 0;
     const vec = [
       speedNorm,
       laneErrNorm,
+      currentAccelerationNorm,
       context.shouldStop ? 1 : 0,
       clamp(context.needsAggressive, 0, 1),
       car.isYielding ? 1 : 0,
+      context.isAtStopPoint ? 1 : 0,
       car.isCommittedToTurn ? 1 : 0,
       pathCode,
       car.direction === 1 ? 1 : -1,
@@ -695,6 +760,9 @@
       clamp(Math.sin(car.heading), -1, 1),
       clamp(Math.cos(car.heading), -1, 1),
       context.onGrass ? 1 : 0,
+      ...roadEdgeSensors,
+      headingLookahead50Norm,
+      headingLookahead100Norm,
       n.nearestDistNorm,
       n.nearestDxNorm,
       n.nearestDyNorm,
@@ -704,9 +772,18 @@
       n.leadTtcRisk,
       n.rearRisk,
       n.rearClosing,
-      n.conflictRisk,
-      n.conflictClosing,
-      n.conflictTtcRisk,
+      signedDistToYieldLineNorm,
+      onMainRoad,
+      isEllipseToVerticalLeft,
+      isEllipseToVerticalRight,
+      isVerticalToEllipseRight,
+      isVerticalToEllipseLeft,
+      isSameLaneAhead,
+      overlapSameLane,
+      overlapCrossroadClockwise,
+      overlapCrossroadCounterclockwise,
+      overlapMerging,
+      priorityStatus,
       n.nearbyCountNorm,
       n.minTtcRisk
     ];
@@ -745,6 +822,7 @@
     lastReward: 0,
     lastAccelDelta: 0,
     prevSpeedFactor: 1.0,
+    lastHeuristicLead: false,
     lastPolicyTransition: null,
     lastHeuristicSample: null,
     crashThisFrame: false,
@@ -1059,31 +1137,31 @@ function checkTrajectoryVsArea(trajectory, area) {
     return false;
 }
 
-function getLookaheadPointForPrediction(car) {
+function getLookaheadPointForPrediction(car, lookAheadDistance = LOOK_AHEAD_DISTANCE) {
     let targetX, targetY;
 
     if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical')) {
         const currentEllipseAngle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-        const lookAheadAngleOnEllipse = currentEllipseAngle + car.direction * (LOOK_AHEAD_DISTANCE / car.b);
+        const lookAheadAngleOnEllipse = currentEllipseAngle + car.direction * (lookAheadDistance / car.b);
         targetX = centerX + car.a * Math.cos(lookAheadAngleOnEllipse);
         targetY = centerY + car.b * Math.sin(lookAheadAngleOnEllipse);
     }
     else if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
         if (car.y < centerY) {
             targetX = DOWNWARD_LANE_X;
-            targetY = car.y + LOOK_AHEAD_DISTANCE;
+            targetY = car.y + lookAheadDistance;
         } else {
             targetX = UPWARD_LANE_X;
-            targetY = car.y - LOOK_AHEAD_DISTANCE;
+            targetY = car.y - lookAheadDistance;
         }
     }
     else if (car.path === 'vertical') {
         let laneCenter = car.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
         targetX = laneCenter;
-        targetY = car.y + (car.verticalDirection === "down" ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
+        targetY = car.y + (car.verticalDirection === "down" ? lookAheadDistance : -lookAheadDistance);
     }
     else {
-        const lookAheadAngle = car.angle + car.direction * (LOOK_AHEAD_DISTANCE / car.b);
+        const lookAheadAngle = car.angle + car.direction * (lookAheadDistance / car.b);
         targetX = centerX + car.a * Math.cos(lookAheadAngle);
         targetY = centerY + car.b * Math.sin(lookAheadAngle);
     }
@@ -1732,6 +1810,36 @@ function updateCar(car) {
     car.isYielding = false;
   }
 
+  const signedDistToYieldLineNorm = Number.isFinite(signedDistToYieldLine)
+    ? signedDistToYieldLine / (TRAJECTORY_LENGTH * CAR_LENGTH)
+    : 1.5;
+  const isAtStopPoint = car.isYielding &&
+                        hadPriorityConflict &&
+                        !car.isCommittedToTurn &&
+                        Number.isFinite(signedDistToYieldLine) &&
+                        Math.abs(signedDistToYieldLine) <= RULE6_STOP_LINE_TOLERANCE;
+  const onMainRoad = car.path === 'ellipse' && car.verticalDirection === null;
+  const isEllipseToVerticalLeft = car.isMakingTurn && car.turnDirection === 'left' &&
+                                  (car.path === 'ellipse' || (car.path === 'vertical' && car.turnState === 'turning'));
+  const isEllipseToVerticalRight = car.isMakingTurn && car.turnDirection === 'right' &&
+                                   (car.path === 'ellipse' || (car.path === 'vertical' && car.turnState === 'turning'));
+  const isVerticalToEllipseRight = car.turnDirection === 'right' &&
+                                   (car.path === 'vertical' || car.turnState === 'rejoining');
+  const isVerticalToEllipseLeft = car.turnDirection === 'left' &&
+                                  (car.path === 'vertical' || car.turnState === 'rejoining');
+  const isSameLaneAhead = hasFollowingConflict;
+  let overlapType = 'none';
+  if (yieldRule_rejoin || yieldRule_2_2_2) {
+    overlapType = 'merging';
+  } else if (yieldRule_2_1_1) {
+    overlapType = 'crossroad-clockwise';
+  } else if (yieldRule_2_1_2 || yieldRule_2_2_1) {
+    overlapType = 'crossroad-counterclockwise';
+  } else if (hasFollowingConflict) {
+    overlapType = 'same-lane';
+  }
+  const priorityStatus = onMainRoad ? 1 : -1;
+
   /* ----------  Speed & steering  ---------- */
   let targetFactor = 1;
   let turnRadius   = car.b;
@@ -1793,13 +1901,30 @@ function updateCar(car) {
   targetFactor = Math.min(targetFactor, collisionSlowdown);
   const laneErrBeforeMove = laneCenterError(car);
   const onGrassBeforeMove = !isPointOnRoad(car.x, car.y);
+  const roadEdgeSensorsBeforeMove = getRoadEdgeDistanceSensors(car);
+  const headingLookahead50BeforeMove = getTargetHeadingLookaheadNorm(car, 50);
+  const headingLookahead100BeforeMove = getTargetHeadingLookaheadNorm(car, 100);
   const neighborContextBeforeMove = getNeighborContext(car, allCars);
   const contextBeforeMove = {
     shouldStop,
     needsAggressive,
     laneErr: laneErrBeforeMove,
     onGrass: onGrassBeforeMove,
-    neighborContext: neighborContextBeforeMove
+    roadEdgeSensors: roadEdgeSensorsBeforeMove,
+    headingLookahead50Norm: headingLookahead50BeforeMove,
+    headingLookahead100Norm: headingLookahead100BeforeMove,
+    currentAcceleration: car.lastAccelDelta,
+    neighborContext: neighborContextBeforeMove,
+    isAtStopPoint,
+    signedDistToYieldLineNorm,
+    onMainRoad,
+    isEllipseToVerticalLeft,
+    isEllipseToVerticalRight,
+    isVerticalToEllipseRight,
+    isVerticalToEllipseLeft,
+    isSameLaneAhead,
+    overlapType,
+    priorityStatus
   };
   const heuristicTargetFactor = clamp(targetFactor, 0, 1);
   let nnControlBlend = isRLRunning ? NN_BLEND_WHILE_RL : NN_BLEND_INFERENCE;
@@ -1821,6 +1946,9 @@ function updateCar(car) {
     const currentSteerNorm = clamp(car.steerAngle / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
     policySampleSteer = clamp(policySampleSteer, currentSteerNorm - RL_MAX_STEER_DEV_FROM_HEURISTIC, currentSteerNorm + RL_MAX_STEER_DEV_FROM_HEURISTIC);
     targetFactor = clamp((1 - nnControlBlend) * heuristicTargetFactor + nnControlBlend * policySampleSpeed, 0, 1);
+    car.lastHeuristicLead = (1 - nnControlBlend) >= nnControlBlend;
+  } else {
+    car.lastHeuristicLead = true;
   }
 
   let accel = MAX_ACCELERATION;
@@ -1965,7 +2093,8 @@ function updateCar(car) {
     const tooClose = Math.max(0, RULE1_STOP_GAP_MIN - leadGapPx);
     const tooFar = Math.max(0, leadGapPx - RULE1_STOP_GAP_MAX);
     const stopGapPenalty = clamp(tooClose / RULE1_STOP_GAP_MIN, 0, 2) + clamp(tooFar / (RULE1_STOP_GAP_MAX * 1.5), 0, 1.5);
-    reward -= stopGapPenalty * 0.55;
+    const stopGapWeight = 0.55 * (car.path === 'vertical' ? VERTICAL_STOP_GAP_PENALTY_MULTIPLIER : 1);
+    reward -= stopGapPenalty * stopGapWeight;
   }
 
   // Rule 5: approaching crossroad must preserve ability to stop at stop line.
@@ -2011,12 +2140,34 @@ function updateCar(car) {
   if (onGrass) logAccumulator.grassCount += 1;
   if (car.lastRuleViolation) logAccumulator.ruleViolations += 1;
 
+  const roadEdgeSensorsAfterMove = getRoadEdgeDistanceSensors(car);
+  const headingLookahead50AfterMove = getTargetHeadingLookaheadNorm(car, 50);
+  const headingLookahead100AfterMove = getTargetHeadingLookaheadNorm(car, 100);
+  const isAtStopPointAfterMove = car.isYielding &&
+                                 hadPriorityConflict &&
+                                 !car.isCommittedToTurn &&
+                                 Number.isFinite(signedDistToYieldLine) &&
+                                 Math.abs(signedDistToYieldLine) <= RULE6_STOP_LINE_TOLERANCE;
   const trainingInput = buildStateVector(car, {
     shouldStop,
     needsAggressive,
     laneErr,
     onGrass,
-    neighborContext: neighborContextAfterMove
+    roadEdgeSensors: roadEdgeSensorsAfterMove,
+    headingLookahead50Norm: headingLookahead50AfterMove,
+    headingLookahead100Norm: headingLookahead100AfterMove,
+    currentAcceleration: speedDelta,
+    neighborContext: neighborContextAfterMove,
+    isAtStopPoint: isAtStopPointAfterMove,
+    signedDistToYieldLineNorm,
+    onMainRoad,
+    isEllipseToVerticalLeft,
+    isEllipseToVerticalRight,
+    isVerticalToEllipseRight,
+    isVerticalToEllipseLeft,
+    isSameLaneAhead,
+    overlapType,
+    priorityStatus
   });
   const targetSpeed = heuristicTargetFactor;
   const targetSteer = clamp(heuristicTargetSteer / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
@@ -2150,10 +2301,18 @@ function updateCar(car) {
     rlGrassEMA = rlGrassEMA * 0.98 + frameGrassCount * 0.02;
     if (isRLRunning && frameCrashPairs > 0) {
       rlRecoveryStepsRemaining = Math.max(rlRecoveryStepsRemaining, RL_RECOVERY_STEPS_ON_CRASH);
+      const crashedCars = allCars.filter(c => c.crashThisFrame);
+      const heuristicLeadCrashes = crashedCars.filter(c => c.lastHeuristicLead).length;
+      const heuristicLeadRatio = heuristicLeadCrashes / Math.max(1, crashedCars.length);
+      const adjusted = RL_RECOVERY_BC_MULTIPLIER * (1 - 0.65 * heuristicLeadRatio);
+      rlRecoveryBcMultiplierDynamic = clamp(adjusted, 1, RL_RECOVERY_BC_MULTIPLIER);
     }
     if (isRLRunning && frameGrassCount >= RL_GRASS_TRIGGER_COUNT) {
       rlRecoveryStepsRemaining = Math.max(rlRecoveryStepsRemaining, RL_RECOVERY_STEPS_ON_GRASS);
       rlAdaptiveSigma = Math.max(RL_SIGMA_MIN, rlAdaptiveSigma * 0.9);
+    }
+    if (rlRecoveryStepsRemaining <= 0) {
+      rlRecoveryBcMultiplierDynamic = RL_RECOVERY_BC_MULTIPLIER;
     }
     rlReplayUpdateScale = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_REPLAY_SCALE : 1;
 
@@ -2164,7 +2323,7 @@ function updateCar(car) {
     if (isRLRunning && controllerMode === 'nn') {
       let frameReward = 0;
       const pgScale = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_PG_SCALE : 1;
-      const bcMultiplier = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_BC_MULTIPLIER : 1;
+      const bcMultiplier = rlRecoveryStepsRemaining > 0 ? Math.max(1, Math.floor(rlRecoveryBcMultiplierDynamic)) : 1;
       for (const car of allCars) {
         rlBaselineEMA = rlStepCount === 0 ? car.lastReward : rlBaselineEMA * RL_BASELINE_DECAY + car.lastReward * (1 - RL_BASELINE_DECAY);
         const absDev = Math.abs(car.lastReward - rlBaselineEMA);
