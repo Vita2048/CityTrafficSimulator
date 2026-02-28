@@ -130,9 +130,9 @@
   const AGGRESSIVE_DECELERATION_FACTOR = 2.0; // Factor to multiply MAX_ACCELERATION when aggressive stop is needed (e.g., 2.0 allows double the normal deceleration)
 
   // New tunable parameter for trajectory prediction
-  const TRAJECTORY_LENGTH = 4.0;
-  const APPROACH_DISTANCE = TRAJECTORY_LENGTH * CAR_LENGTH;
-  const INPUT_DIM = 47;
+  const BASE_TRAJECTORY_LENGTH = 4.0;
+  const RECOVERY_TRAJECTORY_LENGTH = 5.5;
+  const INPUT_DIM = 48;
   const HIDDEN_DIM = 16;
   const OUTPUT_DIM = 2;
   const PRETRAIN_TARGET_STEPS = 6000;
@@ -142,14 +142,14 @@
   const RL_LR = 0.00015;
   const RL_SIGMA = 0.06;
   const RL_SIGMA_MIN = 0.035;
-  const RL_BASELINE_DECAY = 0.99;
+  const RL_BASELINE_DECAY = 0.995;
   const RL_BEHAVIOR_CLONE_LR = 0.0007;
   const NN_BLEND_INFERENCE = 1.0;
   const NN_BLEND_WHILE_RL = 1.0;
   const NN_SAFETY_MAX_LANE_ERR = ROAD_WIDTH * 0.45;
   const RL_BAD_REWARD_THRESHOLD = -0.45;
-  const RL_MAX_SPEED_DEV_FROM_HEURISTIC = 0.22;
-  const RL_MAX_STEER_DEV_FROM_HEURISTIC = 0.35;
+  const RL_MAX_SPEED_DEV_FROM_HEURISTIC = 0.42;
+  const RL_MAX_STEER_DEV_FROM_HEURISTIC = 0.55;
   const RL_REPLAY_MAX = 50000;
   const RL_REPLAY_UPDATES_PER_FRAME = 14;
   const RL_REPLAY_BAD_REWARD_CUTOFF = -0.18;
@@ -162,12 +162,27 @@
   const RL_RECOVERY_BC_MULTIPLIER = 3;
   const RL_RECOVERY_PG_SCALE = 0.15;
   const RL_RECOVERY_REPLAY_SCALE = 0.25;
+  const RL_REPLAY_SCALE_MIN = 0.25;
+  const RL_REPLAY_SCALE_MAX = 2.8;
+  const RL_RECOVERY_CRASH_SEQUENCE_FRAMES = 20;
+  const RL_RECOVERY_CRASH_SEQUENCE_PASSES = 2;
+  const RL_RECOVERY_CRASH_SEQUENCE_LR = 0.001;
   const RL_GRASS_TRIGGER_COUNT = 2;
   const GRASS_CORRECTION_UPDATES = 4;
   const GRASS_CORRECTION_LR = 0.0009;
   const RULE1_STOP_GAP_MIN = 0.5 * CAR_LENGTH;
   const RULE1_STOP_GAP_MAX = 1.0 * CAR_LENGTH;
   const RULE6_STOP_LINE_TOLERANCE = 0.2 * CAR_LENGTH;
+  const RULE6_STOP_GAUSSIAN_SIGMA = 0.22 * CAR_LENGTH;
+  const RULE6_STOP_LINE_GAUSSIAN_BONUS = 0.75;
+  const RULE6_STOP_LINE_EARLY_PENALTY = 0.35;
+  const RULE6_STOP_LINE_LATE_PENALTY = 0.95;
+  const JERK_PENALTY_BASE = 0.38;
+  const JERK_PENALTY_YIELD_EXTRA = 0.32;
+  const ELLIPSE_CRUISE_TARGET_SPEED = 0.86;
+  const ELLIPSE_CRUISE_MIN_SPEED = 0.62;
+  const ELLIPSE_CRUISE_REWARD_WEIGHT = 0.13;
+  const ELLIPSE_CRUISE_SLOW_PENALTY = 0.08;
   const ROAD_EDGE_RAY_COUNT = 8;
   const ROAD_EDGE_RAY_MAX_DISTANCE = ROAD_WIDTH * 2.5;
   const ROAD_EDGE_RAY_STEP = 6;
@@ -202,6 +217,8 @@
   let frameCrashPairs = 0;
   let frameVerticalRearEndPairs = 0;
   let frameGrassCount = 0;
+  let frameRuleViolationCount = 0;
+  let activeTrajectoryLength = BASE_TRAJECTORY_LENGTH;
   let lastCrashEventLogMs = 0;
   let trainingBuffer = [];
   const TRAINING_BUFFER_MAX = 25000;
@@ -253,6 +270,19 @@
 
   function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
+  }
+
+  function getTrajectoryDistancePx() {
+    return activeTrajectoryLength * CAR_LENGTH;
+  }
+
+  function getApproachDistancePx() {
+    return getTrajectoryDistancePx();
+  }
+
+  function normalizeTtcForState(ttc, horizonSec = 4) {
+    if (!Number.isFinite(ttc)) return 1;
+    return clamp(ttc / horizonSec, 0, 1);
   }
 
   function randn() {
@@ -443,6 +473,7 @@
       rlBestNetworkSnapshot = cloneNetwork(nn);
       rlReplayUpdateScale = 1;
       rlRecoveryStepsRemaining = 0;
+      activeTrajectoryLength = BASE_TRAJECTORY_LENGTH;
       rlCrashEMA = 0;
       rlGrassEMA = 0;
     }
@@ -497,7 +528,7 @@
     }
 
     if (isRLRunning && controllerMode === 'nn' && LOG_CONFIG.rl && now - lastRLLogMs >= LOG_CONFIG.rlIntervalMs) {
-      logEvent('rl', `updates=${rlStepCount} rewardEMA=${rlRewardEMA.toFixed(4)} baseline=${rlBaselineEMA.toFixed(4)} advEMA=${rlAdvantageEMA.toFixed(4)} sigma=${rlAdaptiveSigma.toFixed(3)} crashEMA=${rlCrashEMA.toFixed(3)} grassEMA=${rlGrassEMA.toFixed(3)} recovery=${rlRecoveryStepsRemaining} lr=${RL_LR}`);
+      logEvent('rl', `updates=${rlStepCount} rewardEMA=${rlRewardEMA.toFixed(4)} baseline=${rlBaselineEMA.toFixed(4)} advEMA=${rlAdvantageEMA.toFixed(4)} sigma=${rlAdaptiveSigma.toFixed(3)} crashEMA=${rlCrashEMA.toFixed(3)} grassEMA=${rlGrassEMA.toFixed(3)} recovery=${rlRecoveryStepsRemaining} replayScale=${rlReplayUpdateScale.toFixed(2)} trajLen=${activeTrajectoryLength.toFixed(2)} lr=${RL_LR}`);
       lastRLLogMs = now;
     }
 
@@ -631,6 +662,7 @@
     let conflictTTC = Infinity;
     let nearbyCount = 0;
     let minTTC = Infinity;
+    let priorityAdvantage = 0;
 
     for (const otherCar of allCars) {
       if (otherCar === car) continue;
@@ -672,6 +704,11 @@
     const nearestDyNorm = Number.isFinite(nearestDist) ? clamp(nearestDy / TRAJECTORY_LOOKAHEAD_DISTANCE, -1, 1) : 0;
     if (nearestCar) {
       nearestRelSpeed = clamp(car.currentSpeedFactor - nearestCar.currentSpeedFactor, -1, 1);
+      if (car.path === 'ellipse' && nearestCar.path === 'vertical') {
+        priorityAdvantage = 1;
+      } else if (car.path === 'vertical' && nearestCar.path === 'ellipse') {
+        priorityAdvantage = -1;
+      }
     }
 
     const leadRisk = Number.isFinite(leadGap) ? clamp(1 - leadGap / (CAR_LENGTH * 4), 0, 1) : 0;
@@ -680,6 +717,9 @@
     const conflictRisk = Number.isFinite(conflictDist) ? clamp(1 - conflictDist / TRAJECTORY_LOOKAHEAD_DISTANCE, 0, 1) : 0;
     const conflictTtcRisk = Number.isFinite(conflictTTC) ? clamp((4 - conflictTTC) / 4, 0, 1) : 0;
     const minTtcRisk = Number.isFinite(minTTC) ? clamp((4 - minTTC) / 4, 0, 1) : 0;
+    const leadTtcNorm = normalizeTtcForState(leadTTC);
+    const conflictTtcNorm = normalizeTtcForState(conflictTTC);
+    const minTtcNorm = normalizeTtcForState(minTTC);
 
     return {
       nearestDistNorm,
@@ -695,7 +735,11 @@
       conflictClosing: clamp(conflictClosing, 0, 1),
       conflictTtcRisk,
       nearbyCountNorm: clamp(nearbyCount / 5, 0, 1),
-      minTtcRisk
+      minTtcRisk,
+      leadTtcNorm,
+      conflictTtcNorm,
+      minTtcNorm,
+      priorityAdvantage
     };
   }
 
@@ -718,7 +762,11 @@
       conflictClosing: 0,
       conflictTtcRisk: 0,
       nearbyCountNorm: 0,
-      minTtcRisk: 0
+      minTtcRisk: 0,
+      leadTtcNorm: 1,
+      conflictTtcNorm: 1,
+      minTtcNorm: 1,
+      priorityAdvantage: 0
     };
     const signedDistToYieldLineNorm = Number.isFinite(context.signedDistToYieldLineNorm)
       ? clamp(context.signedDistToYieldLineNorm, -1.5, 1.5)
@@ -769,7 +817,7 @@
       n.nearestRelSpeed,
       n.leadRisk,
       n.leadClosing,
-      n.leadTtcRisk,
+      n.leadTtcNorm,
       n.rearRisk,
       n.rearClosing,
       signedDistToYieldLineNorm,
@@ -783,9 +831,10 @@
       overlapCrossroadClockwise,
       overlapCrossroadCounterclockwise,
       overlapMerging,
+      clamp(n.priorityAdvantage, -1, 1),
       priorityStatus,
       n.nearbyCountNorm,
-      n.minTtcRisk
+      n.minTtcNorm
     ];
     if (vec.length !== INPUT_DIM) {
       logEvent('behavior', `state vector size mismatch: got=${vec.length} expected=${INPUT_DIM}`, true);
@@ -826,12 +875,13 @@
     lastPolicyTransition: null,
     lastHeuristicSample: null,
     crashThisFrame: false,
-    lastOnGrass: false
+    lastOnGrass: false,
+    recentHeuristicSamples: null
   };
 
   // Helper to create a car object with default and specific properties
   function createCar(overrides) {
-    return { ...CAR_DEFAULTS, ...overrides };
+    return { ...CAR_DEFAULTS, recentHeuristicSamples: [], ...overrides };
   }
 
 function resetSimulation() {
@@ -924,6 +974,7 @@ function resetSimulation() {
     rlBestNetworkSnapshot = cloneNetwork(nn);
     rlReplayUpdateScale = 1;
     rlRecoveryStepsRemaining = 0;
+    activeTrajectoryLength = BASE_TRAJECTORY_LENGTH;
     rlCrashEMA = 0;
     rlGrassEMA = 0;
     resetLogAccumulator();
@@ -1173,7 +1224,7 @@ function getLookaheadPointForPrediction(car, lookAheadDistance = LOOK_AHEAD_DIST
 function predictTrajectory(car) {
     const trajectory = [];
     const steps = 60;
-    const totalDistance = TRAJECTORY_LENGTH * CAR_LENGTH;
+    const totalDistance = getTrajectoryDistancePx();
     const stepLength = totalDistance / steps;
 
     let ghost = JSON.parse(JSON.stringify(car));
@@ -1448,11 +1499,13 @@ function updateCar(car) {
   const isOnVerticalSegment = car.path === 'vertical';
   const isRejoining         = car.path === 'ellipse' && car.verticalDirection !== null;
 
-  const isNearTopCrossroad    = car.path === 'ellipse' && car.y < centerY && Math.abs(car.x - centerX) < APPROACH_DISTANCE;
-  const isNearBottomCrossroad = car.path === 'ellipse' && car.y > centerY && Math.abs(car.x - centerX) < APPROACH_DISTANCE;
+  const approachDistance = getApproachDistancePx();
+  const trajectoryDistance = getTrajectoryDistancePx();
+  const isNearTopCrossroad    = car.path === 'ellipse' && car.y < centerY && Math.abs(car.x - centerX) < approachDistance;
+  const isNearBottomCrossroad = car.path === 'ellipse' && car.y > centerY && Math.abs(car.x - centerX) < approachDistance;
 
-  const isApproachingTopVerticalCrossroad    = car.path === 'vertical' && car.verticalDirection === 'up'   && car.y < (centerY - car.b) + APPROACH_DISTANCE;
-  const isApproachingBottomVerticalCrossroad = car.path === 'vertical' && car.verticalDirection === 'down' && car.y > (centerY + car.b) - APPROACH_DISTANCE;
+  const isApproachingTopVerticalCrossroad    = car.path === 'vertical' && car.verticalDirection === 'up'   && car.y < (centerY - car.b) + approachDistance;
+  const isApproachingBottomVerticalCrossroad = car.path === 'vertical' && car.verticalDirection === 'down' && car.y > (centerY + car.b) - approachDistance;
 
   const distToTop    = Math.abs(car.y - (centerY - car.b));
   const distToBottom = Math.abs(car.y - (centerY + car.b));
@@ -1811,7 +1864,7 @@ function updateCar(car) {
   }
 
   const signedDistToYieldLineNorm = Number.isFinite(signedDistToYieldLine)
-    ? signedDistToYieldLine / (TRAJECTORY_LENGTH * CAR_LENGTH)
+    ? signedDistToYieldLine / trajectoryDistance
     : 1.5;
   const isAtStopPoint = car.isYielding &&
                         hadPriorityConflict &&
@@ -1847,8 +1900,8 @@ function updateCar(car) {
   if (car.isMakingTurn && car.path === 'ellipse' && (isNearTopCrossroad || isNearBottomCrossroad)) {
     turnRadius = ROAD_WIDTH / 2;
   } else if (isOnVerticalSegment) {
-    const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - APPROACH_DISTANCE;
-    const nearTopRejoin    = car.verticalDirection === 'up'   && car.y < centerY - car.b + APPROACH_DISTANCE;
+    const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - approachDistance;
+    const nearTopRejoin    = car.verticalDirection === 'up'   && car.y < centerY - car.b + approachDistance;
     if (nearBottomRejoin || nearTopRejoin) {
       turnRadius = car.b;
       if (!car.isCommittedToTurn) car.turnState = 'rejoining';
@@ -2075,7 +2128,7 @@ function updateCar(car) {
   reward += car.currentSpeedFactor * 0.02;
   reward -= onGrass ? 1.6 : 0.0;
   reward -= clamp(laneErr / (ROAD_WIDTH / 3), 0, 2.5) * 0.35;
-  reward -= clamp(accelJerk / 0.12, 0, 3.0) * 0.2;
+  reward -= clamp(accelJerk / 0.10, 0, 3.0) * JERK_PENALTY_BASE;
   reward -= followRisk * 0.9;
   reward -= neighborContextAfterMove.minTtcRisk * 0.55;
   reward -= neighborContextAfterMove.conflictTtcRisk * 1.2;
@@ -2084,7 +2137,7 @@ function updateCar(car) {
 
   // Rule 1: maintain safe speed relative to lead and stop with 0.5-1.0 car lengths when queued.
   if (hasLeadVehicle) {
-    const effectiveStopDistance = clamp(leadGapPx, 0, TRAJECTORY_LENGTH * CAR_LENGTH);
+    const effectiveStopDistance = clamp(leadGapPx, 0, trajectoryDistance);
     const maxFollowVel = Math.sqrt(2 * MAX_ACCELERATION * Math.max(0.001, effectiveStopDistance));
     const followSpeedExcess = Math.max(0, currentVelAfterMove - maxFollowVel);
     reward -= clamp(followSpeedExcess / Math.max(0.001, car.maximumSpeed * 50), 0, 2.0) * 0.9;
@@ -2102,18 +2155,45 @@ function updateCar(car) {
                                  (car.turnState === 'approaching' || car.turnState === 'rejoining') &&
                                  Number.isFinite(signedDistToYieldLine) &&
                                  signedDistToYieldLine > 0 &&
-                                 signedDistToYieldLine <= TRAJECTORY_LENGTH * CAR_LENGTH;
+                                 signedDistToYieldLine <= trajectoryDistance;
   if (isApproachingYieldLine) {
     const maxApproachVel = Math.sqrt(2 * MAX_ACCELERATION * signedDistToYieldLine);
     const approachSpeedExcess = Math.max(0, currentVelAfterMove - maxApproachVel);
     reward -= clamp(approachSpeedExcess / Math.max(0.001, car.maximumSpeed * 50), 0, 2.0) * 1.1;
+    reward -= clamp(accelJerk / 0.08, 0, 3.0) * JERK_PENALTY_YIELD_EXTRA;
   }
 
-  // Rule 6: if yielding, stop near the designated stop line.
+  // Encourage confident cruising on the main ellipse when far from crossroads and low-risk.
+  const isEllipseCruiseZone = onMainRoad &&
+                              !isNearTopCrossroad &&
+                              !isNearBottomCrossroad &&
+                              !car.isYielding &&
+                              !hadPriorityConflict &&
+                              !hasFollowingConflict &&
+                              !isApproachingYieldLine;
+  if (isEllipseCruiseZone) {
+    const safetyGate = clamp(1 - neighborContextAfterMove.minTtcRisk * 1.2 - followRisk * 0.9, 0, 1);
+    if (safetyGate > 0) {
+      const cruiseReward = clamp(
+        (car.currentSpeedFactor - ELLIPSE_CRUISE_MIN_SPEED) / Math.max(0.05, ELLIPSE_CRUISE_TARGET_SPEED - ELLIPSE_CRUISE_MIN_SPEED),
+        0,
+        1
+      );
+      const tooSlow = clamp((ELLIPSE_CRUISE_MIN_SPEED - car.currentSpeedFactor) / ELLIPSE_CRUISE_MIN_SPEED, 0, 1.5);
+      reward += cruiseReward * ELLIPSE_CRUISE_REWARD_WEIGHT * safetyGate;
+      reward -= tooSlow * ELLIPSE_CRUISE_SLOW_PENALTY * safetyGate;
+    }
+  }
+
+  // Rule 6: if yielding, stop near the designated stop line with strong preference for exact alignment.
   if (car.isYielding && hadPriorityConflict && car.currentSpeedFactor < 0.06 && Number.isFinite(signedDistToYieldLine)) {
-    const stopLineOffset = Math.abs(signedDistToYieldLine);
-    const offStopLine = Math.max(0, stopLineOffset - RULE6_STOP_LINE_TOLERANCE);
-    reward -= clamp(offStopLine / (0.8 * CAR_LENGTH), 0, 2) * 0.9;
+    const stopLineOffset = signedDistToYieldLine;
+    const gaussian = Math.exp(-(stopLineOffset * stopLineOffset) / (2 * RULE6_STOP_GAUSSIAN_SIGMA * RULE6_STOP_GAUSSIAN_SIGMA));
+    reward += gaussian * RULE6_STOP_LINE_GAUSSIAN_BONUS;
+    const earlyOffset = Math.max(0, stopLineOffset - RULE6_STOP_LINE_TOLERANCE);
+    const lateOffset = Math.max(0, -stopLineOffset - RULE6_STOP_LINE_TOLERANCE);
+    reward -= clamp(earlyOffset / CAR_LENGTH, 0, 2.5) * RULE6_STOP_LINE_EARLY_PENALTY;
+    reward -= clamp(lateOffset / CAR_LENGTH, 0, 2.5) * RULE6_STOP_LINE_LATE_PENALTY;
   }
 
   const yieldProximity = Number.isFinite(yieldConflictMinDist)
@@ -2138,7 +2218,10 @@ function updateCar(car) {
   logAccumulator.laneErrSum += laneErr;
   logAccumulator.accelJerkSum += accelJerk;
   if (onGrass) logAccumulator.grassCount += 1;
-  if (car.lastRuleViolation) logAccumulator.ruleViolations += 1;
+  if (car.lastRuleViolation) {
+    logAccumulator.ruleViolations += 1;
+    frameRuleViolationCount += 1;
+  }
 
   const roadEdgeSensorsAfterMove = getRoadEdgeDistanceSensors(car);
   const headingLookahead50AfterMove = getTargetHeadingLookaheadNorm(car, 50);
@@ -2172,6 +2255,11 @@ function updateCar(car) {
   const targetSpeed = heuristicTargetFactor;
   const targetSteer = clamp(heuristicTargetSteer / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
   car.lastHeuristicSample = { input: trainingInput, target: [targetSpeed, targetSteer] };
+  if (!Array.isArray(car.recentHeuristicSamples)) car.recentHeuristicSamples = [];
+  car.recentHeuristicSamples.push({ input: trainingInput.slice(), target: [targetSpeed, targetSteer] });
+  if (car.recentHeuristicSamples.length > RL_RECOVERY_CRASH_SEQUENCE_FRAMES) {
+    car.recentHeuristicSamples.shift();
+  }
   trainingBuffer.push({ input: trainingInput, target: [targetSpeed, targetSteer] });
   if (trainingBuffer.length > TRAINING_BUFFER_MAX) {
     trainingBuffer.shift();
@@ -2282,6 +2370,7 @@ function updateCar(car) {
     frameCrashPairs = 0;
     frameVerticalRearEndPairs = 0;
     frameGrassCount = 0;
+    frameRuleViolationCount = 0;
     const allCars = [car1, car2, car3, car4, car5, car6];
     for (const car of allCars) {
       car.crashThisFrame = false;
@@ -2314,7 +2403,23 @@ function updateCar(car) {
     if (rlRecoveryStepsRemaining <= 0) {
       rlRecoveryBcMultiplierDynamic = RL_RECOVERY_BC_MULTIPLIER;
     }
-    rlReplayUpdateScale = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_REPLAY_SCALE : 1;
+    const rulePressure = clamp(frameRuleViolationCount / Math.max(1, allCars.length), 0, 1.5);
+    const crashPressure = clamp(frameCrashPairs / 2.0, 0, 1.5);
+    const grassPressure = clamp(frameGrassCount / Math.max(1, allCars.length), 0, 1.5);
+    const instability = clamp(rulePressure * 0.9 + crashPressure * 0.95 + grassPressure * 0.55 + rlCrashEMA * 0.2, 0, 1.7);
+    const replayBase = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_REPLAY_SCALE : 1;
+    const replayTarget = replayBase * (1 + instability);
+    rlReplayUpdateScale = clamp(
+      rlReplayUpdateScale * 0.88 + replayTarget * 0.12,
+      RL_REPLAY_SCALE_MIN,
+      RL_REPLAY_SCALE_MAX
+    );
+    const trajectoryTarget = rlRecoveryStepsRemaining > 0 ? RECOVERY_TRAJECTORY_LENGTH : BASE_TRAJECTORY_LENGTH;
+    activeTrajectoryLength = clamp(
+      activeTrajectoryLength * 0.92 + trajectoryTarget * 0.08,
+      BASE_TRAJECTORY_LENGTH,
+      RECOVERY_TRAJECTORY_LENGTH
+    );
 
     if (isPreTraining) {
       runPretrainStep();
@@ -2345,6 +2450,13 @@ function updateCar(car) {
           if (car.crashThisFrame) {
             for (let k = 0; k < CRASH_CORRECTION_UPDATES; k++) {
               trainNetworkSupervised(car.lastHeuristicSample, CRASH_CORRECTION_LR);
+            }
+            const recent = Array.isArray(car.recentHeuristicSamples) ? car.recentHeuristicSamples : [];
+            const seqPasses = rlRecoveryStepsRemaining > 0 ? RL_RECOVERY_CRASH_SEQUENCE_PASSES + 1 : RL_RECOVERY_CRASH_SEQUENCE_PASSES;
+            for (let pass = 0; pass < seqPasses; pass++) {
+              for (const seqSample of recent) {
+                trainNetworkSupervised(seqSample, RL_RECOVERY_CRASH_SEQUENCE_LR);
+              }
             }
           }
         }
