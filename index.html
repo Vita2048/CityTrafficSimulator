@@ -230,6 +230,7 @@
   let lastPretrainLogMs = 0;
   let lastRLLogMs = 0;
   let lastBehaviorLogMs = 0;
+  let lastModelIssueLogMs = 0;
   const logAccumulator = createEmptyLogAccumulator();
 
   const nn = createNetwork(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
@@ -270,6 +271,84 @@
 
   function clamp(v, min, max) {
     return Math.max(min, Math.min(max, v));
+  }
+
+  function normalizeAngle(angle) {
+    if (!Number.isFinite(angle)) return 0;
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
+    return angle;
+  }
+
+  function rebuildCarGeometryFromCenter(car) {
+    car.heading = normalizeAngle(car.heading);
+    car.rearX = car.x - Math.cos(car.heading) * WHEELBASE * 0.5;
+    car.rearY = car.y - Math.sin(car.heading) * WHEELBASE * 0.5;
+    car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
+    car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
+  }
+
+  function snapCarBackToTrack(car, carName = 'Car') {
+    const laneSign = car.direction === -1 ? 1 : -1;
+    const fallbackA = 560 + laneSign * (ROAD_WIDTH / 4);
+    const fallbackB = 360 + laneSign * (ROAD_WIDTH / 4);
+    car.a = Number.isFinite(car.a) && car.a > 0 ? car.a : fallbackA;
+    car.b = Number.isFinite(car.b) && car.b > 0 ? car.b : fallbackB;
+
+    let angle = Number.isFinite(car.angle) ? car.angle : 0;
+    if (!Number.isFinite(car.x) || !Number.isFinite(car.y)) {
+      angle = 0;
+    } else {
+      angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+    }
+    if (!Number.isFinite(angle)) angle = 0;
+
+    car.path = 'ellipse';
+    car.verticalDirection = null;
+    car.turnState = null;
+    car.isMakingTurn = false;
+    car.isCommittedToTurn = false;
+    car.isYielding = false;
+    car.turnDirection = 'straight';
+    car.rejoinBuffer = 0;
+    car.angle = angle;
+    car.x = centerX + car.a * Math.cos(angle);
+    car.y = centerY + car.b * Math.sin(angle);
+    car.heading = normalizeAngle(car.direction === -1 ? angle - Math.PI / 2 : angle + Math.PI / 2);
+    car.currentSpeedFactor = Number.isFinite(car.currentSpeedFactor) ? clamp(car.currentSpeedFactor, 0, 1) : 0.3;
+    car.targetSteerAngle = 0;
+    car.steerAngle = 0;
+    rebuildCarGeometryFromCenter(car);
+    logEvent('behavior', `${carName} recovered to track after invalid state`, true);
+  }
+
+  function sanitizeCarState(car, carName = 'Car') {
+    const finiteCore = Number.isFinite(car.x) && Number.isFinite(car.y) &&
+      Number.isFinite(car.rearX) && Number.isFinite(car.rearY) &&
+      Number.isFinite(car.frontX) && Number.isFinite(car.frontY) &&
+      Number.isFinite(car.heading) && Number.isFinite(car.currentSpeedFactor);
+    if (!finiteCore) {
+      snapCarBackToTrack(car, carName);
+      return;
+    }
+
+    car.currentSpeedFactor = clamp(car.currentSpeedFactor, 0, 1);
+    car.heading = normalizeAngle(car.heading);
+
+    const offscreenMargin = Math.max(canvas.width, canvas.height) * 0.4;
+    const farOffscreen = car.x < -offscreenMargin || car.x > canvas.width + offscreenMargin ||
+      car.y < -offscreenMargin || car.y > canvas.height + offscreenMargin;
+    if (farOffscreen) {
+      snapCarBackToTrack(car, carName);
+      return;
+    }
+
+    const expectedRearX = car.x - Math.cos(car.heading) * WHEELBASE * 0.5;
+    const expectedRearY = car.y - Math.sin(car.heading) * WHEELBASE * 0.5;
+    const rearDrift = Math.hypot(car.rearX - expectedRearX, car.rearY - expectedRearY);
+    if (!Number.isFinite(rearDrift) || rearDrift > WHEELBASE * 3) {
+      rebuildCarGeometryFromCenter(car);
+    }
   }
 
   function getTrajectoryDistancePx() {
@@ -324,6 +403,53 @@
       for (let h = 0; h < dst.hiddenDim; h++) dst.w2[o][h] = src.w2[o][h];
       dst.b2[o] = src.b2[o];
     }
+  }
+
+  function isFiniteNumber(v) {
+    return Number.isFinite(v);
+  }
+
+  function isFiniteArray(arr) {
+    if (!Array.isArray(arr)) return false;
+    for (let i = 0; i < arr.length; i++) {
+      if (!Number.isFinite(arr[i])) return false;
+    }
+    return true;
+  }
+
+  function isNetworkFinite(net) {
+    if (!net) return false;
+    if (!isFiniteArray(net.b1) || !isFiniteArray(net.b2)) return false;
+    if (!Array.isArray(net.w1) || !Array.isArray(net.w2)) return false;
+    for (let h = 0; h < net.w1.length; h++) {
+      if (!isFiniteArray(net.w1[h])) return false;
+    }
+    for (let o = 0; o < net.w2.length; o++) {
+      if (!isFiniteArray(net.w2[o])) return false;
+    }
+    return true;
+  }
+
+  function logModelIssue(message) {
+    const now = performance.now();
+    if (now - lastModelIssueLogMs > 900) {
+      logEvent('rl', message, true);
+      lastModelIssueLogMs = now;
+    }
+  }
+
+  function recoverModel(reason) {
+    if (rlBestNetworkSnapshot && isNetworkFinite(rlBestNetworkSnapshot)) {
+      copyNetworkInto(nn, rlBestNetworkSnapshot);
+      logModelIssue(`model recovered from checkpoint (${reason})`);
+    } else {
+      const fresh = createNetwork(INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
+      copyNetworkInto(nn, fresh);
+      rlBestNetworkSnapshot = cloneNetwork(nn);
+      rlBestScore = -Infinity;
+      logModelIssue(`model reinitialized (${reason})`);
+    }
+    rlAdaptiveSigma = RL_SIGMA_MIN;
   }
 
   function pushReplayTransition(transition, reward, isCrash) {
@@ -393,22 +519,49 @@
 
   function trainNetworkSupervised(sample, lr) {
     const { input, target } = sample;
+    if (!isFiniteArray(input) || !isFiniteArray(target)) return 0;
+    if (!isNetworkFinite(nn)) {
+      recoverModel('invalid-weights-before-supervised');
+      return 0;
+    }
     const { hidden, out } = networkForward(nn, input);
+    if (!isFiniteArray(out) || !isFiniteArray(hidden)) {
+      recoverModel('invalid-forward-supervised');
+      return 0;
+    }
     const predSpeed = 1 / (1 + Math.exp(-out[0]));
     const predSteer = Math.tanh(out[1]);
+    if (!isFiniteNumber(predSpeed) || !isFiniteNumber(predSteer)) {
+      recoverModel('invalid-prediction-supervised');
+      return 0;
+    }
     const speedErr = predSpeed - target[0];
     const steerErr = predSteer - target[1];
 
     const gradOut0 = 2 * speedErr * predSpeed * (1 - predSpeed);
     const gradOut1 = 2 * steerErr * (1 - predSteer * predSteer);
     networkBackward(nn, input, hidden, [gradOut0, gradOut1], lr);
+    if (!isNetworkFinite(nn)) {
+      recoverModel('invalid-weights-after-supervised');
+      return 0;
+    }
     return speedErr * speedErr + steerErr * steerErr;
   }
 
   function trainPolicyGradient(transition, reward, lr) {
     if (!transition || !Number.isFinite(reward)) return;
     const { input, meanSpeed, meanSteer, sampleSpeed, sampleSteer } = transition;
+    if (!isFiniteArray(input)) return;
+    if (![meanSpeed, meanSteer, sampleSpeed, sampleSteer].every(Number.isFinite)) return;
+    if (!isNetworkFinite(nn)) {
+      recoverModel('invalid-weights-before-pg');
+      return;
+    }
     const { hidden } = networkForward(nn, input);
+    if (!isFiniteArray(hidden)) {
+      recoverModel('invalid-forward-pg');
+      return;
+    }
     const centered = reward - rlBaselineEMA;
     const denom = Math.max(0.25, rlRewardAbsDevEMA);
     let advantage = clamp(centered / denom, -2.5, 2.5);
@@ -422,7 +575,15 @@
     const dMeanSteer = -advantage * (sampleSteer - meanSteer) * invVar;
     const gradOut0 = clamp(dMeanSpeed * meanSpeed * (1 - meanSpeed), -1.2, 1.2);
     const gradOut1 = clamp(dMeanSteer * (1 - meanSteer * meanSteer), -1.2, 1.2);
+    if (![gradOut0, gradOut1].every(Number.isFinite)) {
+      recoverModel('invalid-gradients-pg');
+      return;
+    }
     networkBackward(nn, input, hidden, [gradOut0, gradOut1], lr);
+    if (!isNetworkFinite(nn)) {
+      recoverModel('invalid-weights-after-pg');
+      return;
+    }
     rlAdvantageEMA = rlStepCount === 0 ? advantage : rlAdvantageEMA * 0.98 + advantage * 0.02;
   }
 
@@ -1486,6 +1647,8 @@ function updateCar(car) {
   const carNumber = allCars.indexOf(car) + 1;
   const carName   = `Car${carNumber}`;
 
+  sanitizeCarState(car, carName);
+
   let currentSpeed = car.maximumSpeed * 50 * car.currentSpeedFactor;
   let targetX, targetY;
   let policyInput = null;
@@ -1980,34 +2143,59 @@ function updateCar(car) {
     priorityStatus
   };
   const heuristicTargetFactor = clamp(targetFactor, 0, 1);
-  let nnControlBlend = isRLRunning ? NN_BLEND_WHILE_RL : NN_BLEND_INFERENCE;
-  if (isRLRunning && rlRecoveryStepsRemaining > 0) {
-    nnControlBlend = Math.min(nnControlBlend, RL_RECOVERY_BLEND);
-  }
-  if (onGrassBeforeMove || laneErrBeforeMove > NN_SAFETY_MAX_LANE_ERR) {
-    nnControlBlend = 0;
-  }
   if (controllerMode === 'nn') {
+    if (!isNetworkFinite(nn)) {
+      recoverModel('invalid-weights-before-control');
+      car.lastHeuristicLead = true;
+    }
     policyInput = buildStateVector(car, contextBeforeMove);
     const { out } = networkForward(nn, policyInput);
-    policyMeanSpeed = 1 / (1 + Math.exp(-out[0]));
-    policyMeanSteer = Math.tanh(out[1]);
-    const sigma = Math.max(RL_SIGMA_MIN, rlAdaptiveSigma);
-    policySampleSpeed = isRLRunning ? clamp(policyMeanSpeed + randn() * sigma, 0, 1) : policyMeanSpeed;
-    policySampleSteer = isRLRunning ? clamp(policyMeanSteer + randn() * sigma, -1, 1) : policyMeanSteer;
-    policySampleSpeed = clamp(policySampleSpeed, heuristicTargetFactor - RL_MAX_SPEED_DEV_FROM_HEURISTIC, heuristicTargetFactor + RL_MAX_SPEED_DEV_FROM_HEURISTIC);
-    const currentSteerNorm = clamp(car.steerAngle / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
-    policySampleSteer = clamp(policySampleSteer, currentSteerNorm - RL_MAX_STEER_DEV_FROM_HEURISTIC, currentSteerNorm + RL_MAX_STEER_DEV_FROM_HEURISTIC);
-    targetFactor = clamp((1 - nnControlBlend) * heuristicTargetFactor + nnControlBlend * policySampleSpeed, 0, 1);
-    car.lastHeuristicLead = (1 - nnControlBlend) >= nnControlBlend;
+    if (isFiniteArray(out) && Number.isFinite(out[0]) && Number.isFinite(out[1])) {
+      policyMeanSpeed = 1 / (1 + Math.exp(-out[0]));
+      policyMeanSteer = Math.tanh(out[1]);
+      const sigma = Math.max(RL_SIGMA_MIN, rlAdaptiveSigma);
+      const sampledSpeed = isRLRunning ? policyMeanSpeed + randn() * sigma : policyMeanSpeed;
+      const sampledSteer = isRLRunning ? policyMeanSteer + randn() * sigma : policyMeanSteer;
+      if (Number.isFinite(policyMeanSpeed) && Number.isFinite(policyMeanSteer) &&
+          Number.isFinite(sampledSpeed) && Number.isFinite(sampledSteer)) {
+        policySampleSpeed = clamp(sampledSpeed, 0, 1);
+        policySampleSteer = clamp(sampledSteer, -1, 1);
+        targetFactor = clamp(policySampleSpeed, 0, 1);
+        car.lastHeuristicLead = false;
+      } else {
+        recoverModel('invalid-sampled-action');
+        policyInput = null;
+        policyMeanSpeed = null;
+        policyMeanSteer = null;
+        policySampleSpeed = null;
+        policySampleSteer = null;
+        targetFactor = heuristicTargetFactor;
+        car.lastHeuristicLead = true;
+      }
+    } else {
+      recoverModel('invalid-forward-control');
+      policyInput = null;
+      policyMeanSpeed = null;
+      policyMeanSteer = null;
+      policySampleSpeed = null;
+      policySampleSteer = null;
+      targetFactor = heuristicTargetFactor;
+      car.lastHeuristicLead = true;
+    }
   } else {
     car.lastHeuristicLead = true;
   }
 
-  let accel = MAX_ACCELERATION;
-  if (needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
+  if (!Number.isFinite(targetFactor)) {
+    logModelIssue(`${carName} targetFactor invalid; fallback to heuristic`);
+    targetFactor = heuristicTargetFactor;
+    car.lastHeuristicLead = true;
+  }
 
-  if (isAtYieldLine && shouldStop) {
+  let accel = MAX_ACCELERATION;
+  if (controllerMode !== 'nn' && needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
+
+  if (controllerMode !== 'nn' && isAtYieldLine && shouldStop) {
     car.currentSpeedFactor = 0;
   } else {
     if (car.currentSpeedFactor < targetFactor) {
@@ -2016,6 +2204,11 @@ function updateCar(car) {
       car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
     }
   }
+  if (!Number.isFinite(car.currentSpeedFactor)) {
+    logModelIssue(`${carName} speed factor invalid; clamping to heuristic`);
+    car.currentSpeedFactor = heuristicTargetFactor;
+  }
+  car.currentSpeedFactor = clamp(car.currentSpeedFactor, 0, 1);
 
   /* ----------  Path guidance  ---------- */
   if (car.isMakingTurn && car.path === 'ellipse' && car.turnState !== 'rejoining') {
@@ -2107,12 +2300,20 @@ function updateCar(car) {
   car.targetSteerAngle = heuristicTargetSteer;
   if (controllerMode === 'nn' && policyMeanSteer !== null) {
     const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
-    car.targetSteerAngle = clamp((1 - nnControlBlend) * heuristicTargetSteer + nnControlBlend * nnSteerAngle, -SYMMETRIC_MAX_TURN_STEER_ANGLE, SYMMETRIC_MAX_TURN_STEER_ANGLE);
+    car.targetSteerAngle = clamp(nnSteerAngle, -SYMMETRIC_MAX_TURN_STEER_ANGLE, SYMMETRIC_MAX_TURN_STEER_ANGLE);
   }
 
   updateCarPhysics(car, car.maximumSpeed * 50 * car.currentSpeedFactor);
-  car.x = Math.max(0, Math.min(canvas.width,  car.x));
-  car.y = Math.max(0, Math.min(canvas.height, car.y));
+  const clampedX = Math.max(0, Math.min(canvas.width, car.x));
+  const clampedY = Math.max(0, Math.min(canvas.height, car.y));
+  if (clampedX !== car.x || clampedY !== car.y || !Number.isFinite(clampedX) || !Number.isFinite(clampedY)) {
+    car.x = Number.isFinite(clampedX) ? clampedX : centerX;
+    car.y = Number.isFinite(clampedY) ? clampedY : centerY;
+    rebuildCarGeometryFromCenter(car);
+  } else {
+    car.x = clampedX;
+    car.y = clampedY;
+  }
   car.lastRuleViolation = violatedYieldRule;
 
   const laneErr = laneCenterError(car);
