@@ -359,6 +359,33 @@
     return getTrajectoryDistancePx();
   }
 
+  // Nominal ellipse semi-axes (lane center is ± ROAD_WIDTH/4 from these).
+  const ELLIPSE_A0 = 560;
+  const ELLIPSE_B0 = 360;
+
+  /**
+   * Distance along the vertical road to the crossroad junction the car is heading toward.
+   * Uses fixed road geometry so approach/decision timing does not depend on a stale car.b
+   * from a previous maneuver.
+   */
+  function getDistToVerticalJunction(car) {
+    if (car.path !== 'vertical' || !car.verticalDirection) return Infinity;
+    if (car.verticalDirection === 'up') {
+      return car.y - (centerY - ELLIPSE_B0);
+    }
+    return (centerY + ELLIPSE_B0) - car.y;
+  }
+
+  /**
+   * True when a vertical car has already chosen left/right for the upcoming ellipse rejoin.
+   * Excludes turnState === 'turning' (that flag means ellipse→vertical entry is still settling).
+   */
+  function hasPlannedVerticalExit(car) {
+    return car.path === 'vertical' &&
+      car.turnState !== 'turning' &&
+      (car.turnDirection === 'left' || car.turnDirection === 'right');
+  }
+
   function normalizeTtcForState(ttc, horizonSec = 4) {
     if (!Number.isFinite(ttc)) return 1;
     return clamp(ttc / horizonSec, 0, 1);
@@ -1349,9 +1376,16 @@ function checkTrajectoryVsArea(trajectory, area) {
     return false;
 }
 
-// Ellipse lookahead used by live driving (angle offset = car.speed * 5).
+// Ellipse lookahead used by live driving and trajectory prediction.
+// During vertical→ellipse rejoin, use a moderate distance-based angular look-ahead
+// so the merge target stays ahead of the car (~90° turn), not behind it (U-turn).
 function getEllipseLookaheadPoint(car) {
-    const look = car.angle + car.direction * car.speed * 5;
+    const isRejoining = car.path === 'ellipse' && car.verticalDirection !== null;
+    const meanRadius = Math.max(1, (car.a + car.b) * 0.5);
+    const angleOffset = isRejoining
+      ? car.direction * (LOOK_AHEAD_DISTANCE / meanRadius)
+      : car.direction * car.speed * 5;
+    const look = car.angle + angleOffset;
     return {
       targetX: centerX + car.a * Math.cos(look),
       targetY: centerY + car.b * Math.sin(look)
@@ -1413,10 +1447,21 @@ function getEllipseLookaheadPoint(car) {
         car.isCommittedToTurn = false;
       }
 
-      const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - ROAD_WIDTH / 2;
-      const nearTopRejoin = car.verticalDirection === 'up' && car.y < centerY - car.b + ROAD_WIDTH / 2;
+      // Start rejoin steering in the junction using fixed road geometry (not car.b),
+      // so outer/inner lane choices share the same entry window and have room to arc
+      // onto the ellipse without cutting across grass.
+      const rejoinWindow = ROAD_WIDTH;
+      const nearBottomRejoin = car.verticalDirection === 'down' &&
+        car.y > centerY + ELLIPSE_B0 - rejoinWindow;
+      const nearTopRejoin = car.verticalDirection === 'up' &&
+        car.y < centerY - ELLIPSE_B0 + rejoinWindow;
       if (nearBottomRejoin || nearTopRejoin) {
-        if (!car.isCommittedToTurn) car.turnState = 'rejoining';
+        // Always mark rejoining in the junction. If turnState were left as
+        // 'approaching' after path flips to ellipse, the ellipse→vertical branch
+        // above would fire and reverse the car 180° back down the vertical road.
+        car.turnState = 'rejoining';
+        // Follow ellipse geometry once committed, or when prediction forces commitment
+        // for an already-planned left/right exit (see predictTrajectory).
         if (car.isCommittedToTurn) {
           car.path = 'ellipse';
           car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
@@ -1490,9 +1535,13 @@ function getEllipseLookaheadPoint(car) {
     }
 
     if (isOnVerticalSegment) {
-      const nearBottomRejoin = ghost.verticalDirection === 'down' && ghost.y > centerY + ghost.b - ROAD_WIDTH / 2;
-      const nearTopRejoin = ghost.verticalDirection === 'up' && ghost.y < centerY - ghost.b + ROAD_WIDTH / 2;
-      if ((nearBottomRejoin || nearTopRejoin) && ghost.isCommittedToTurn) {
+      const rejoinWindow = ROAD_WIDTH;
+      const nearBottomRejoin = ghost.verticalDirection === 'down' &&
+        ghost.y > centerY + ELLIPSE_B0 - rejoinWindow;
+      const nearTopRejoin = ghost.verticalDirection === 'up' &&
+        ghost.y < centerY - ELLIPSE_B0 + rejoinWindow;
+      const plannedExit = ghost.turnDirection === 'left' || ghost.turnDirection === 'right';
+      if ((nearBottomRejoin || nearTopRejoin) && (ghost.isCommittedToTurn || plannedExit)) {
         ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
         return getEllipseLookaheadPoint(ghost);
       }
@@ -1561,6 +1610,11 @@ function getEllipseLookaheadPoint(car) {
     const stepLength = Math.min(nominalFrameDist, totalDistance / 40);
     const steps = Math.max(1, Math.ceil(totalDistance / stepLength));
 
+    // Once left/right is chosen for a vertical→ellipse exit, trajectory must follow that
+    // planned path through the junction even if the live car has not yet crossed the
+    // yield line (isCommittedToTurn). Commitment only gates live yield behavior.
+    const plannedVerticalExit = hasPlannedVerticalExit(car);
+
     // Clone only kinematic + path state (avoid cloning arrays / policy history).
     const ghost = {
       x: car.x,
@@ -1579,11 +1633,11 @@ function getEllipseLookaheadPoint(car) {
       b: car.b,
       angle: car.angle,
       speed: car.speed,
-      isMakingTurn: car.isMakingTurn,
+      isMakingTurn: car.isMakingTurn || plannedVerticalExit,
       turnDirection: car.turnDirection,
-      turnState: car.turnState,
-      isCommittedToTurn: car.isCommittedToTurn,
-      canDecide: car.canDecide,
+      turnState: car.turnState || (plannedVerticalExit ? 'approaching' : null),
+      isCommittedToTurn: car.isCommittedToTurn || plannedVerticalExit,
+      canDecide: false,
       rejoinBuffer: car.rejoinBuffer,
       // Prediction follows planned path geometry; do not freeze for yield stops.
       isYielding: false
@@ -1658,13 +1712,15 @@ function getEllipseLookaheadPoint(car) {
   function drawTrajectory(car, trajectoryStates, turnType) {
     if (trajectoryStates.length < 2) return;
 
-    let color = 'rgba(0, 255, 0, 0.05)'; // Green
+    let color = 'rgba(0, 255, 0, 0.05)'; // Green — no road change
     if (turnType === 'ellipse-to-vertical-left') {
         color = 'rgba(0, 0, 255, 0.05)'; // Blue
+    } else if (turnType === 'ellipse-to-vertical-right') {
+        color = 'rgba(0, 255, 255, 0.05)'; // Cyan
     } else if (turnType === 'vertical-to-ellipse-right') {
-        color = 'rgba(255, 140, 0, 0.05)'; // Dark Orange ("Blue Amber")
+        color = 'rgba(255, 255, 0, 0.05)'; // Yellow
     } else if (turnType === 'vertical-to-ellipse-left') {
-        color = 'rgba(255, 69, 0, 0.05)';  // Orange-Red ("Red Amber")
+        color = 'rgba(255, 0, 0, 0.05)';  // Red
     }
     ctx.fillStyle = color;
 
@@ -1781,9 +1837,12 @@ function getEllipseLookaheadPoint(car) {
     if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
         if (car.turnDirection === 'left') {
             turnType = 'ellipse-to-vertical-left';
+        } else if (car.turnDirection === 'right') {
+            turnType = 'ellipse-to-vertical-right';
         }
     }
-    else if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical')) {
+    else if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical') ||
+             hasPlannedVerticalExit(car)) {
         if (car.turnDirection === 'left') {
             turnType = 'vertical-to-ellipse-left';
         } else if (car.turnDirection === 'right') {
@@ -1829,11 +1888,16 @@ function updateCar(car) {
   const isNearTopCrossroad    = car.path === 'ellipse' && car.y < centerY && Math.abs(car.x - centerX) < approachDistance;
   const isNearBottomCrossroad = car.path === 'ellipse' && car.y > centerY && Math.abs(car.x - centerX) < approachDistance;
 
-  const isApproachingTopVerticalCrossroad    = car.path === 'vertical' && car.verticalDirection === 'up'   && car.y < (centerY - car.b) + approachDistance;
-  const isApproachingBottomVerticalCrossroad = car.path === 'vertical' && car.verticalDirection === 'down' && car.y > (centerY + car.b) - approachDistance;
+  // Decide left/right before the future trajectory reaches the junction: when distance
+  // to the crossroad first falls within the trajectory length (stable geometry).
+  const distToVerticalJunction = getDistToVerticalJunction(car);
+  const isApproachingVerticalCrossroad =
+    car.path === 'vertical' &&
+    Number.isFinite(distToVerticalJunction) &&
+    distToVerticalJunction <= approachDistance;
 
-  const distToTop    = Math.abs(car.y - (centerY - car.b));
-  const distToBottom = Math.abs(car.y - (centerY + car.b));
+  const distToTop    = Math.abs(car.y - (centerY - ELLIPSE_B0));
+  const distToBottom = Math.abs(car.y - (centerY + ELLIPSE_B0));
 
   /* ----------  Decide turn once per intersection  ---------- */
   if (car.canDecide && car.turnState === null) {
@@ -1855,19 +1919,19 @@ function updateCar(car) {
         car.turnDirection = 'straight';
       }
       car.canDecide = false;
-    } else if (isApproachingTopVerticalCrossroad || isApproachingBottomVerticalCrossroad) {
+    } else if (isApproachingVerticalCrossroad) {
         car.isMakingTurn = true;
         car.turnState    = 'approaching';
         car.turnDirection = Math.random() < 0.5 ? 'left' : 'right';
 
         if (car.turnDirection === 'left') {
           car.direction = -1;
-          car.a = 560 + ROAD_WIDTH / 4;
-          car.b = 360 + ROAD_WIDTH / 4;
+          car.a = ELLIPSE_A0 + ROAD_WIDTH / 4;
+          car.b = ELLIPSE_B0 + ROAD_WIDTH / 4;
         } else {
           car.direction = 1;
-          car.a = 560 - ROAD_WIDTH / 4;
-          car.b = 360 - ROAD_WIDTH / 4;
+          car.a = ELLIPSE_A0 - ROAD_WIDTH / 4;
+          car.b = ELLIPSE_B0 - ROAD_WIDTH / 4;
         }
         car.canDecide = false;
     }
@@ -2225,11 +2289,11 @@ function updateCar(car) {
   if (car.isMakingTurn && car.path === 'ellipse' && (isNearTopCrossroad || isNearBottomCrossroad)) {
     turnRadius = ROAD_WIDTH / 2;
   } else if (isOnVerticalSegment) {
-    const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - approachDistance;
-    const nearTopRejoin    = car.verticalDirection === 'up'   && car.y < centerY - car.b + approachDistance;
-    if (nearBottomRejoin || nearTopRejoin) {
+    if (isApproachingVerticalCrossroad || (car.turnState === 'approaching' || car.turnState === 'rejoining')) {
       turnRadius = car.b;
-      if (!car.isCommittedToTurn) car.turnState = 'rejoining';
+      if (!car.isCommittedToTurn && hasPlannedVerticalExit(car) && distToVerticalJunction <= ROAD_WIDTH) {
+        car.turnState = 'rejoining';
+      }
     } else {
       turnRadius = Number.MAX_VALUE;
     }
@@ -2247,9 +2311,8 @@ function updateCar(car) {
   } else if (isNearBottomCrossroad && car.isMakingTurn) {
     distToTurn = distToBottom;
     hasTurnDecel = true;
-  } else if (isOnVerticalSegment && ((car.verticalDirection === 'down' && car.y > centerY + car.b - turnDecelDist) ||
-                                     (car.verticalDirection === 'up'   && car.y < centerY - car.b + turnDecelDist))) {
-    distToTurn = car.verticalDirection === 'down' ? (centerY + car.b - car.y) : (car.y - (centerY - car.b));
+  } else if (isOnVerticalSegment && hasPlannedVerticalExit(car) && distToVerticalJunction <= Math.max(turnDecelDist, approachDistance)) {
+    distToTurn = Math.max(0, distToVerticalJunction);
     hasTurnDecel = true;
   }
 
