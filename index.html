@@ -1349,97 +1349,259 @@ function checkTrajectoryVsArea(trajectory, area) {
     return false;
 }
 
-function getLookaheadPointForPrediction(car, lookAheadDistance = LOOK_AHEAD_DISTANCE) {
-    let targetX, targetY;
+// Ellipse lookahead used by live driving (angle offset = car.speed * 5).
+function getEllipseLookaheadPoint(car) {
+    const look = car.angle + car.direction * car.speed * 5;
+    return {
+      targetX: centerX + car.a * Math.cos(look),
+      targetY: centerY + car.b * Math.sin(look)
+    };
+  }
 
-    if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical')) {
-        const currentEllipseAngle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-        const lookAheadAngleOnEllipse = currentEllipseAngle + car.direction * (lookAheadDistance / car.b);
-        targetX = centerX + car.a * Math.cos(lookAheadAngleOnEllipse);
-        targetY = centerY + car.b * Math.sin(lookAheadAngleOnEllipse);
-    }
-    else if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
-        if (car.y < centerY) {
-            targetX = DOWNWARD_LANE_X;
-            targetY = car.y + lookAheadDistance;
-        } else {
-            targetX = UPWARD_LANE_X;
-            targetY = car.y - lookAheadDistance;
+  function getVerticalLookaheadPoint(car, lookAheadDistance = LOOK_AHEAD_DISTANCE) {
+    const laneCenter = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+    return {
+      targetX: laneCenter,
+      targetY: car.y + (car.verticalDirection === 'down' ? lookAheadDistance : -lookAheadDistance)
+    };
+  }
+
+  /**
+   * Shared path-state machine + lookahead target used by both live cars and trajectory
+   * prediction. Mutates path / turnState / commitment fields exactly as updateCar does.
+   * Returns the steering target the car would aim for this step.
+   */
+  function applyPathGuidance(car) {
+    let targetX, targetY;
+    const isOnVerticalSegment = car.path === 'vertical';
+    const isRejoining = car.path === 'ellipse' && car.verticalDirection !== null;
+
+    if (car.isMakingTurn && car.path === 'ellipse' && car.turnState !== 'rejoining') {
+      const atTop = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y < centerY;
+      const atBottom = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y > centerY;
+      if (atTop) {
+        car.path = 'vertical';
+        car.verticalDirection = 'down';
+        car.turnState = 'turning';
+        if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
+        targetX = DOWNWARD_LANE_X;
+        targetY = car.y + LOOK_AHEAD_DISTANCE;
+      } else if (atBottom) {
+        car.path = 'vertical';
+        car.verticalDirection = 'up';
+        car.turnState = 'turning';
+        if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
+        targetX = UPWARD_LANE_X;
+        targetY = car.y - LOOK_AHEAD_DISTANCE;
+      } else {
+        const look = getEllipseLookaheadPoint(car);
+        targetX = look.targetX;
+        targetY = look.targetY;
+      }
+    } else if (isOnVerticalSegment) {
+      const verticalTarget = getVerticalLookaheadPoint(car);
+      targetX = verticalTarget.targetX;
+      targetY = verticalTarget.targetY;
+
+      const laneCenter = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
+      const headingErr = Math.abs(car.heading - (car.verticalDirection === 'up' ? -Math.PI / 2 : Math.PI / 2));
+      if (!car.isYielding && headingErr < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
+        car.turnState = null;
+        car.isMakingTurn = false;
+        car.canDecide = true;
+        car.turnDirection = null;
+        car.isCommittedToTurn = false;
+      }
+
+      const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - ROAD_WIDTH / 2;
+      const nearTopRejoin = car.verticalDirection === 'up' && car.y < centerY - car.b + ROAD_WIDTH / 2;
+      if (nearBottomRejoin || nearTopRejoin) {
+        if (!car.isCommittedToTurn) car.turnState = 'rejoining';
+        if (car.isCommittedToTurn) {
+          car.path = 'ellipse';
+          car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+          const look = getEllipseLookaheadPoint(car);
+          targetX = look.targetX;
+          targetY = look.targetY;
         }
-    }
-    else if (car.path === 'vertical') {
-        let laneCenter = car.verticalDirection === "up" ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-        targetX = laneCenter;
-        targetY = car.y + (car.verticalDirection === "down" ? lookAheadDistance : -lookAheadDistance);
-    }
-    else {
-        const lookAheadAngle = car.angle + car.direction * (lookAheadDistance / car.b);
-        targetX = centerX + car.a * Math.cos(lookAheadAngle);
-        targetY = centerY + car.b * Math.sin(lookAheadAngle);
+      }
+    } else {
+      car.path = 'ellipse';
+      if (!isRejoining) {
+        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+      }
+      const look = getEllipseLookaheadPoint(car);
+      targetX = look.targetX;
+      targetY = look.targetY;
+
+      const radial = Math.hypot(car.x - centerX, (car.y - centerY) * car.a / car.b);
+      const onEllipse = Math.abs(radial - car.a) < ROAD_WIDTH / 2;
+      if (isRejoining && onEllipse && car.rejoinBuffer > REJOIN_BUFFER_DISTANCE) {
+        car.verticalDirection = null;
+        car.rejoinBuffer = 0;
+        car.turnState = null;
+        car.isMakingTurn = false;
+        car.turnDirection = null;
+        car.isCommittedToTurn = false;
+      }
+      if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
+        car.canDecide = true;
+      }
     }
 
     return { targetX, targetY };
-}
+  }
 
-// Function to predict a car's future trajectory
-function predictTrajectory(car) {
-    const trajectory = [];
-    const steps = 60;
-    const totalDistance = getTrajectoryDistancePx();
-    const stepLength = totalDistance / steps;
+  /** Pure lookahead for sensors / NN features (does not mutate car). */
+  function getLookaheadPointForPrediction(car, lookAheadDistance = LOOK_AHEAD_DISTANCE) {
+    const ghost = {
+      x: car.x,
+      y: car.y,
+      angle: car.angle,
+      a: car.a,
+      b: car.b,
+      speed: car.speed,
+      direction: car.direction,
+      path: car.path,
+      verticalDirection: car.verticalDirection,
+      isMakingTurn: car.isMakingTurn,
+      turnState: car.turnState,
+      turnDirection: car.turnDirection,
+      isCommittedToTurn: car.isCommittedToTurn,
+      isYielding: car.isYielding,
+      canDecide: car.canDecide,
+      rejoinBuffer: car.rejoinBuffer,
+      heading: car.heading
+    };
 
-    let ghost = JSON.parse(JSON.stringify(car));
+    const isOnVerticalSegment = ghost.path === 'vertical';
+    const isRejoining = ghost.path === 'ellipse' && ghost.verticalDirection !== null;
 
-    const speed = car.maximumSpeed * 50 * car.currentSpeedFactor;
-    if (speed < 0.1 && !car.isMakingTurn) {
-         return trajectory;
+    if (ghost.isMakingTurn && ghost.path === 'ellipse' && ghost.turnState !== 'rejoining') {
+      const atTop = Math.abs(ghost.x - centerX) < ROAD_WIDTH * 0.9 && ghost.y < centerY;
+      const atBottom = Math.abs(ghost.x - centerX) < ROAD_WIDTH * 0.9 && ghost.y > centerY;
+      if (atTop) {
+        return { targetX: DOWNWARD_LANE_X, targetY: ghost.y + lookAheadDistance };
+      }
+      if (atBottom) {
+        return { targetX: UPWARD_LANE_X, targetY: ghost.y - lookAheadDistance };
+      }
+      return getEllipseLookaheadPoint(ghost);
     }
+
+    if (isOnVerticalSegment) {
+      const nearBottomRejoin = ghost.verticalDirection === 'down' && ghost.y > centerY + ghost.b - ROAD_WIDTH / 2;
+      const nearTopRejoin = ghost.verticalDirection === 'up' && ghost.y < centerY - ghost.b + ROAD_WIDTH / 2;
+      if ((nearBottomRejoin || nearTopRejoin) && ghost.isCommittedToTurn) {
+        ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
+        return getEllipseLookaheadPoint(ghost);
+      }
+      return getVerticalLookaheadPoint(ghost, lookAheadDistance);
+    }
+
+    if (!isRejoining) {
+      ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
+    }
+    return getEllipseLookaheadPoint(ghost);
+  }
+
+  function computeTargetSteerAngle(car, targetX, targetY) {
+    const dx = targetX - car.x;
+    const dy = targetY - car.y;
+    let targetHeading = (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) ? car.heading : Math.atan2(dy, dx);
+    let headingError = targetHeading - car.heading;
+    while (headingError > Math.PI) headingError -= 2 * Math.PI;
+    while (headingError < -Math.PI) headingError += 2 * Math.PI;
+    if (isNaN(headingError)) headingError = 0;
+
+    const isOnVerticalSegment = car.path === 'vertical';
+    const isRejoining = car.path === 'ellipse' && car.verticalDirection !== null;
+    const boost = (isOnVerticalSegment || isRejoining) ? 1.2 : 1.0;
+    return Math.max(
+      -SYMMETRIC_MAX_TURN_STEER_ANGLE,
+      Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, headingError * STEERING_GAIN * boost)
+    );
+  }
+
+  /**
+   * Integrate one bicycle-model step over a fixed path distance (used by prediction).
+   * Mirrors updateCarPhysics kinematic integration without speed-limit side effects.
+   */
+  function integrateBicycleStep(car, stepLength) {
+    car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR;
+    const MAX_STEER_CLAMP = Math.PI / 3;
+    car.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, car.steerAngle));
+
+    if (Math.abs(car.steerAngle) > 0.001) {
+      const deltaHeading = Math.tan(car.steerAngle) * stepLength / WHEELBASE;
+      car.heading += deltaHeading;
+      while (car.heading > Math.PI) car.heading -= 2 * Math.PI;
+      while (car.heading < -Math.PI) car.heading += 2 * Math.PI;
+    }
+
+    car.rearX += Math.cos(car.heading) * stepLength;
+    car.rearY += Math.sin(car.heading) * stepLength;
+    car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
+    car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
+    car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
+    car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
+
+    if (car.path === 'ellipse' && car.verticalDirection !== null) {
+      car.rejoinBuffer += stepLength;
+    }
+  }
+
+  // Predict future occupancy along the same planned path the car actually drives.
+  function predictTrajectory(car) {
+    const trajectory = [];
+    const totalDistance = getTrajectoryDistancePx();
+    // Match live sim: one steer-smoothing update per nominal frame travel distance,
+    // so steering response vs distance matches updateCarPhysics.
+    const nominalFrameDist = Math.max(0.5, car.maximumSpeed * 50);
+    const stepLength = Math.min(nominalFrameDist, totalDistance / 40);
+    const steps = Math.max(1, Math.ceil(totalDistance / stepLength));
+
+    // Clone only kinematic + path state (avoid cloning arrays / policy history).
+    const ghost = {
+      x: car.x,
+      y: car.y,
+      rearX: car.rearX,
+      rearY: car.rearY,
+      frontX: car.frontX,
+      frontY: car.frontY,
+      heading: car.heading,
+      steerAngle: car.steerAngle,
+      targetSteerAngle: car.targetSteerAngle,
+      path: car.path,
+      verticalDirection: car.verticalDirection,
+      direction: car.direction,
+      a: car.a,
+      b: car.b,
+      angle: car.angle,
+      speed: car.speed,
+      isMakingTurn: car.isMakingTurn,
+      turnDirection: car.turnDirection,
+      turnState: car.turnState,
+      isCommittedToTurn: car.isCommittedToTurn,
+      canDecide: car.canDecide,
+      rejoinBuffer: car.rejoinBuffer,
+      // Prediction follows planned path geometry; do not freeze for yield stops.
+      isYielding: false
+    };
 
     for (let i = 0; i < steps; i++) {
-        if (ghost.path === "ellipse") {
-            ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
-        }
+      if (ghost.path === 'ellipse') {
+        ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
+      }
 
-        const { targetX, targetY } = getLookaheadPointForPrediction(ghost);
+      const { targetX, targetY } = applyPathGuidance(ghost);
+      ghost.targetSteerAngle = computeTargetSteerAngle(ghost, targetX, targetY);
+      integrateBicycleStep(ghost, stepLength);
 
-        const dx = targetX - ghost.x;
-        const dy = targetY - ghost.y;
-        let targetHeading = (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) ? ghost.heading : Math.atan2(dy, dx);
-
-        let headingError = targetHeading - ghost.heading;
-        while (headingError > Math.PI) headingError -= 2 * Math.PI;
-        while (headingError < -Math.PI) headingError += 2 * Math.PI;
-        if (isNaN(headingError)) headingError = 0;
-
-        let steeringBoost = 1.0;
-        const isRejoining = ghost.path === "ellipse" && ghost.verticalDirection !== null;
-        if (ghost.path === "vertical" || isRejoining) {
-            steeringBoost = 1.2;
-        }
-
-        ghost.targetSteerAngle = headingError * STEERING_GAIN * steeringBoost;
-        ghost.targetSteerAngle = Math.max(-SYMMETRIC_MAX_TURN_STEER_ANGLE, Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, ghost.targetSteerAngle));
-
-        ghost.steerAngle += (ghost.targetSteerAngle - ghost.steerAngle) * STEERING_SMOOTHING_FACTOR;
-        const MAX_STEER_CLAMP = Math.PI / 3;
-        ghost.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, ghost.steerAngle));
-
-        const deltaHeading = Math.tan(ghost.steerAngle) * stepLength / WHEELBASE;
-        ghost.heading += deltaHeading;
-        while (ghost.heading > Math.PI) ghost.heading -= 2 * Math.PI;
-        while (ghost.heading < -Math.PI) ghost.heading += 2 * Math.PI;
-
-        ghost.rearX += Math.cos(ghost.heading) * stepLength;
-        ghost.rearY += Math.sin(ghost.heading) * stepLength;
-
-        ghost.x = ghost.rearX + Math.cos(ghost.heading) * WHEELBASE * 0.5;
-        ghost.y = ghost.rearY + Math.sin(ghost.heading) * WHEELBASE * 0.5;
-
-        // Add the full state (position and heading) to the trajectory array
-        trajectory.push({ x: ghost.x, y: ghost.y, heading: ghost.heading });
+      trajectory.push({ x: ghost.x, y: ghost.y, heading: ghost.heading });
     }
     return trajectory;
-}
+  }
 
   function updateCarPhysics(car, speed) {
     car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR;
@@ -2210,93 +2372,9 @@ function updateCar(car) {
   }
   car.currentSpeedFactor = clamp(car.currentSpeedFactor, 0, 1);
 
-  /* ----------  Path guidance  ---------- */
-  if (car.isMakingTurn && car.path === 'ellipse' && car.turnState !== 'rejoining') {
-    const atTop    = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y < centerY;
-    const atBottom = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y > centerY;
-    if (atTop) {
-      car.path = 'vertical';
-      car.verticalDirection = 'down';
-      car.turnState = 'turning';
-      targetX = DOWNWARD_LANE_X;
-      targetY = car.y + LOOK_AHEAD_DISTANCE;
-      if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
-    } else if (atBottom) {
-      car.path = 'vertical';
-      car.verticalDirection = 'up';
-      car.turnState = 'turning';
-      targetX = UPWARD_LANE_X;
-      targetY = car.y - LOOK_AHEAD_DISTANCE;
-      if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
-    } else {
-      const look = car.angle + car.direction * car.speed * 5;
-      targetX = centerX + car.a * Math.cos(look);
-      targetY = centerY + car.b * Math.sin(look);
-    }
-  } else if (isOnVerticalSegment) {
-    const laneCenter = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-    targetX = laneCenter;
-    targetY = car.y + (car.verticalDirection === 'down' ? LOOK_AHEAD_DISTANCE : -LOOK_AHEAD_DISTANCE);
-
-    const headingErr = Math.abs(car.heading - (car.verticalDirection === 'up' ? -Math.PI / 2 : Math.PI / 2));
-    if (!car.isYielding && headingErr < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
-      car.turnState = null;
-      car.isMakingTurn = false;
-      car.canDecide = true;
-      car.turnDirection = null;
-      car.isCommittedToTurn = false;
-    }
-
-    const nearBottomRejoin = car.verticalDirection === 'down' && car.y > centerY + car.b - ROAD_WIDTH / 2;
-    const nearTopRejoin    = car.verticalDirection === 'up'   && car.y < centerY - car.b + ROAD_WIDTH / 2;
-    if (nearBottomRejoin || nearTopRejoin) {
-      if (!car.isCommittedToTurn) car.turnState = 'rejoining';
-      if (car.isCommittedToTurn) {
-        car.path = 'ellipse';
-        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-        const look = car.angle + car.direction * car.speed * 5;
-        targetX = centerX + car.a * Math.cos(look);
-        targetY = centerY + car.b * Math.sin(look);
-      }
-    }
-  } else {
-    car.path = 'ellipse';
-    if (!isRejoining) {
-      car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-    }
-    const look = car.angle + car.direction * car.speed * 5;
-    targetX = centerX + car.a * Math.cos(look);
-    targetY = centerY + car.b * Math.sin(look);
-
-    const radial = Math.hypot(car.x - centerX, (car.y - centerY) * car.a / car.b);
-    const onEllipse = Math.abs(radial - car.a) < ROAD_WIDTH / 2;
-    if (isRejoining && onEllipse && car.rejoinBuffer > REJOIN_BUFFER_DISTANCE) {
-      car.verticalDirection = null;
-      car.rejoinBuffer = 0;
-      car.turnState = null;
-      car.isMakingTurn = false;
-      car.turnDirection = null;
-      car.isCommittedToTurn = false;
-    }
-    if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
-      car.canDecide = true;
-    }
-  }
-
-  const dx = targetX - car.x;
-  const dy = targetY - car.y;
-  let targetHeading = (Math.abs(dx) < 0.1 && Math.abs(dy) < 0.1) ? car.heading : Math.atan2(dy, dx);
-  let headingError  = targetHeading - car.heading;
-  while (headingError > Math.PI) headingError -= 2 * Math.PI;
-  while (headingError < -Math.PI) headingError += 2 * Math.PI;
-  if (isNaN(headingError)) headingError = 0;
-
-  let boost = 1;
-  if (isOnVerticalSegment || isRejoining) boost = 1.2;
-  const heuristicTargetSteer = Math.max(
-    -SYMMETRIC_MAX_TURN_STEER_ANGLE,
-    Math.min(SYMMETRIC_MAX_TURN_STEER_ANGLE, headingError * STEERING_GAIN * boost)
-  );
+  /* ----------  Path guidance (shared with trajectory prediction)  ---------- */
+  ({ targetX, targetY } = applyPathGuidance(car));
+  const heuristicTargetSteer = computeTargetSteerAngle(car, targetX, targetY);
   car.targetSteerAngle = heuristicTargetSteer;
   if (controllerMode === 'nn' && policyMeanSteer !== null) {
     const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
