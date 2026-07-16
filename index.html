@@ -111,7 +111,12 @@
   const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4;
   const MAX_CENTRIFUGAL_FORCE = 0.02;
   const MAX_ACCELERATION = 0.08;
-  const SPEED_SMOOTHING_FACTOR = 0.1;
+  const SPEED_SMOOTHING_FACTOR = 0.12;
+  // Comfort braking at crossroads: limit how hard/jerkily speed commands change.
+  const COMFORT_DECEL_FACTOR = 1.2;       // × MAX_ACCELERATION for normal yield/curve braking
+  const EMERGENCY_DECEL_FACTOR = 2.2;     // × MAX_ACCELERATION only when impact is imminent
+  const TARGET_COMMAND_SMOOTH_UP = 0.18;  // blend rate when raising speed target
+  const TARGET_COMMAND_SMOOTH_DOWN = 0.32;// blend rate when lowering speed target (still rate-capped)
   const STEERING_SMOOTHING_FACTOR = 0.1;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
   const DEBUG_LOG = true; // Enabled for debugging
@@ -136,8 +141,11 @@
   const BLINKER_CYCLE_MS = 500;
   const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
   const YIELD_TIMEOUT = 3000; // Reduced to 3 seconds to break deadlocks faster
+  const GRIDLOCK_STUCK_MS = 1800; // How long nearly-stopped before gridlock resolver acts
+  const GRIDLOCK_MIN_CARS = 2;    // Pair freezes at a junction count (was 3 — missed 2-car deadlocks)
+  const GRIDLOCK_FORCE_FRAMES = 70; // Frames a chosen car may creep to break the standoff
   const TRAJECTORY_LOOKAHEAD_DISTANCE = 300; // Increased distance (in pixels) to check for future overlaps
-  const AGGRESSIVE_DECELERATION_FACTOR = 2.0; // Factor to multiply MAX_ACCELERATION when aggressive stop is needed (e.g., 2.0 allows double the normal deceleration)
+  const AGGRESSIVE_DECELERATION_FACTOR = 1.55; // Mild boost when conflict is near (emergency path uses EMERGENCY_DECEL_FACTOR)
 
   // New tunable parameter for trajectory prediction
   const BASE_TRAJECTORY_LENGTH = 4.0;
@@ -1344,7 +1352,10 @@
     recentHeuristicSamples: null,
     debugDecision: null,
     debugHistory: null,
-    stoppedSince: 0
+    stoppedSince: 0,
+    cmdSpeedFactor: null,
+    smoothedCollisionSlowdown: null,
+    forceUnstickFrames: 0
   };
 
   // Helper to create a car object with default and specific properties
@@ -1429,6 +1440,10 @@ function resetSimulation() {
         car.lastOnGrass = false;
         car.debugDecision = null;
         car.debugHistory = [];
+        car.stoppedSince = 0;
+        car.cmdSpeedFactor = null;
+        car.smoothedCollisionSlowdown = null;
+        car.forceUnstickFrames = 0;
     });
 
     simFrame = 0;
@@ -1684,6 +1699,244 @@ function hasMainRoadPriorityOver(car, other) {
     if (!carIsRejoining && otherIsRejoining) return true;
     if (carIsRejoining && !otherIsRejoining) return false;
     return false;
+}
+
+/** Ellipse car that is (or is mid) turning off the ring onto the vertical road. */
+function isEllipseExitingToVertical(c) {
+    if (!c || !c.isMakingTurn) return false;
+    if (c.turnDirection !== 'left' && c.turnDirection !== 'right') return false;
+    // Still on ellipse, committed to a vertical exit.
+    if (c.path === 'ellipse' && c.verticalDirection === null) return true;
+    // Just transitioned ellipse → vertical (turnState 'turning'; vertical→ellipse uses approaching/rejoining).
+    if (c.path === 'vertical' && c.turnState === 'turning') return true;
+    return false;
+}
+
+/** Vertical car planning / performing exit onto the ellipse. */
+function isVerticalExitingToEllipse(c) {
+    if (!c) return false;
+    if (c.turnDirection !== 'left' && c.turnDirection !== 'right') return false;
+    // turnState === 'turning' means ellipse→vertical mid-entry (see hasPlannedVerticalExit).
+    // Must NOT classify those as vertical→ellipse, or two ellipse exits (left+right)
+    // get treated as a "complementary" pair and force-unstick plows one into the other.
+    if (c.turnState === 'turning') return false;
+    if (c.path === 'vertical' && (c.turnState === 'approaching' || c.turnState === 'rejoining')) return true;
+    if (c.turnState === 'rejoining') return true;
+    // Vertical car that has chosen a turn but is still on the side road (not yet approaching flag).
+    if (c.path === 'vertical' && c.isMakingTurn && c.verticalDirection !== null) return true;
+    return false;
+}
+
+/**
+ * Complementary crossroad pair that usually does not share a conflict zone:
+ * vertical→ellipse right vs ellipse→vertical left (and the mirror left/right pair).
+ * Used to avoid false yields when trajectories only graze in the junction box.
+ */
+function isComplementaryCrossroadPair(car, other) {
+    // Two cars both entering the vertical from the ellipse share the junction —
+    // never treat that as a non-conflicting complementary pair.
+    if (isEllipseExitingToVertical(car) && isEllipseExitingToVertical(other)) return false;
+    const carVertRight = isVerticalExitingToEllipse(car) && car.turnDirection === 'right';
+    const carVertLeft = isVerticalExitingToEllipse(car) && car.turnDirection === 'left';
+    const otherEllLeft = isEllipseExitingToVertical(other) && other.turnDirection === 'left';
+    const otherEllRight = isEllipseExitingToVertical(other) && other.turnDirection === 'right';
+    if (carVertRight && otherEllLeft) return true;
+    if (carVertLeft && otherEllRight) return true;
+    // Symmetric view (if the other car is evaluating yield the other way).
+    const otherVertRight = isVerticalExitingToEllipse(other) && other.turnDirection === 'right';
+    const otherVertLeft = isVerticalExitingToEllipse(other) && other.turnDirection === 'left';
+    const carEllLeft = isEllipseExitingToVertical(car) && car.turnDirection === 'left';
+    const carEllRight = isEllipseExitingToVertical(car) && car.turnDirection === 'right';
+    if (otherVertRight && carEllLeft) return true;
+    if (otherVertLeft && carEllRight) return true;
+    return false;
+}
+
+/**
+ * True when yield should be skipped because the other car is on a complementary
+ * crossroad path (vertical-right ↔ ellipse-left, etc.).
+ * Only refuse the skip on true body overlap — the old 1.0·carLength / short-horizon
+ * checks caused complementary pairs (screenshot Car5/Car6) to freeze each other.
+ */
+function shouldSkipYieldForDivergingManeuver(car, other) {
+    if (!isComplementaryCrossroadPair(car, other)) return false;
+    if (checkPolygonIntersection(getCarBoundingBox(car), getCarBoundingBox(other))) return false;
+    const hitDist = getStaticOccupancyHitDistance(car, other);
+    // Immediate occupancy only — complementary arcs are allowed to pass closely.
+    if (Number.isFinite(hitDist) && hitDist < CAR_LENGTH * 0.3) return false;
+    return true;
+}
+
+/** Ellipse → vertical left/right (still on ellipse or mid-transition onto vertical). */
+function isEllipseToVerticalManeuver(c) {
+    if (!c || !c.isMakingTurn) return false;
+    if (c.turnDirection !== 'left' && c.turnDirection !== 'right') return false;
+    if (c.path === 'ellipse' && c.verticalDirection === null) return true;
+    // After path flips to vertical at the junction, turnState is 'turning'.
+    if (c.path === 'vertical' && c.turnState === 'turning') return true;
+    return false;
+}
+
+function isCarInCrossroadArea(c) {
+    if (!c) return false;
+    const inTop =
+      c.x > topCrossroadArea.x && c.x < topCrossroadArea.x + topCrossroadArea.width &&
+      c.y > topCrossroadArea.y && c.y < topCrossroadArea.y + topCrossroadArea.height;
+    const inBottom =
+      c.x > bottomCrossroadArea.x && c.x < bottomCrossroadArea.x + bottomCrossroadArea.width &&
+      c.y > bottomCrossroadArea.y && c.y < bottomCrossroadArea.y + bottomCrossroadArea.height;
+    return inTop || inBottom;
+}
+
+/**
+ * Other car is still working through a vertical↔ellipse exchange (rejoin / exit turn).
+ * Kept intentionally narrow — "any car in the purple box" caused permanent over-yielding.
+ */
+function isNavigatingVerticalEllipseExchange(c) {
+    if (!c) return false;
+    if (c.turnState === 'rejoining') return true;
+    if (isVerticalExitingToEllipse(c)) return true;
+    // Mid ellipse→vertical transition (path already flipped to vertical).
+    if (c.path === 'vertical' && c.turnState === 'turning' && c.isMakingTurn) return true;
+    // Still on ellipse but mid rejoin (verticalDirection set).
+    if (c.path === 'ellipse' && c.verticalDirection !== null) return true;
+    return false;
+}
+
+/** Higher score = preferred to move first when breaking a multi-car gridlock. */
+function gridlockPriorityScore(c) {
+    let s = 0;
+    const rejoining = c.turnState === 'rejoining' || (c.path === 'ellipse' && c.verticalDirection !== null);
+    const freeEllipse = c.path === 'ellipse' && !rejoining && !c.isMakingTurn;
+    const midEllToVert = isEllipseToVerticalManeuver(c);
+    if (freeEllipse) s += 100;
+    if (midEllToVert && c.isCommittedToTurn) s += 85;
+    if (c.path === 'ellipse' && c.isMakingTurn && !midEllToVert) s += 70;
+    if (c.isCommittedToTurn) s += 35;
+    if (c.path === 'vertical' && c.turnState === 'turning') s += 30;
+    if (rejoining) s += 15;
+    if (c.path === 'vertical') s += 10;
+    // Prefer cars that have been stuck longest.
+    if (c.stoppedSince) s += Math.min(40, (performance.now() - c.stoppedSince) / 200);
+    return s;
+}
+
+function collectStuckCars(allCars, now, minMs = GRIDLOCK_STUCK_MS) {
+    return allCars.filter(c =>
+      c.currentSpeedFactor < 0.06 &&
+      c.stoppedSince &&
+      (now - c.stoppedSince) >= minMs
+    );
+}
+
+function tryForceUnstick(cars, alreadyForced, label) {
+    let forced = alreadyForced;
+    const ranked = cars.slice().sort((a, b) => gridlockPriorityScore(b) - gridlockPriorityScore(a));
+    for (const c of ranked) {
+      if (forced >= 2) break;
+      if (c.forceUnstickFrames > 0) continue;
+      // Prefer cars that still have a small open gap; never force into near body/path occupancy.
+      let minHit = Infinity;
+      let nearest = null;
+      for (const o of [car1, car2, car3, car4, car5, car6]) {
+        if (o === c) continue;
+        const d = getStaticOccupancyHitDistance(c, o);
+        if (d < minHit) {
+          minHit = d;
+          nearest = o;
+        }
+      }
+      // Hard body contact or path that hits another car within ~0.9 car lengths:
+      // creep would cause a rear-end / merge crash (Car1→Car2 bottom junction).
+      if (Number.isFinite(minHit) && minHit <= CAR_LENGTH * 0.9) continue;
+      // If complementary to the nearest obstacle, strongly prefer forcing this car.
+      if (nearest && isComplementaryCrossroadPair(c, nearest)) {
+        c.forceUnstickFrames = GRIDLOCK_FORCE_FRAMES;
+        forced++;
+        logEvent('behavior', `gridlock unstick ${getCarName(c)} (${label}, complementary vs ${getCarName(nearest)})`, true);
+        continue;
+      }
+      c.forceUnstickFrames = GRIDLOCK_FORCE_FRAMES;
+      forced++;
+      logEvent(
+        'behavior',
+        `gridlock unstick ${getCarName(c)} (${label}, stuck=${cars.length}, score=${gridlockPriorityScore(c).toFixed(0)})`,
+        true
+      );
+    }
+    return forced;
+}
+
+/**
+ * When cars are frozen, pick highest-priority ones and let them creep.
+ * Handles global freezes and local 2-car junction freezes (bottom/top crossroad).
+ */
+function resolveGridlock(allCars) {
+    const now = performance.now();
+    for (const c of allCars) {
+      if (c.forceUnstickFrames > 0) c.forceUnstickFrames--;
+    }
+
+    const already = allCars.filter(c => c.forceUnstickFrames > 0).length;
+    if (already >= 2) return;
+
+    let forced = already;
+
+    // 1) Global multi-car freeze
+    const stuckGlobal = collectStuckCars(allCars, now);
+    if (stuckGlobal.length >= GRIDLOCK_MIN_CARS) {
+      forced = tryForceUnstick(stuckGlobal, forced, 'global');
+    }
+
+    // 2) Local freeze inside each crossroad box (even if only 2 cars)
+    if (forced < 2) {
+      for (const area of [topCrossroadArea, bottomCrossroadArea]) {
+        const local = allCars.filter(c => {
+          const inBox =
+            c.x > area.x && c.x < area.x + area.width &&
+            c.y > area.y && c.y < area.y + area.height;
+          // Also include cars just outside the box but clearly at the junction exchange.
+          const nearBox = Math.hypot(
+            c.x - (area.x + area.width * 0.5),
+            c.y - (area.y + area.height * 0.5)
+          ) < ROAD_WIDTH * 2.2;
+          return (inBox || nearBox) &&
+            c.currentSpeedFactor < 0.08 &&
+            c.stoppedSince &&
+            (now - c.stoppedSince) >= GRIDLOCK_STUCK_MS * 0.7;
+        });
+        if (local.length >= 2) {
+          forced = tryForceUnstick(local, forced, 'junction');
+        }
+        if (forced >= 2) break;
+      }
+    }
+
+    // 3) Any complementary pair both nearly stopped → force the higher-priority one
+    if (forced < 2) {
+      for (let i = 0; i < allCars.length; i++) {
+        for (let j = i + 1; j < allCars.length; j++) {
+          const a = allCars[i];
+          const b = allCars[j];
+          if (a.currentSpeedFactor > 0.08 || b.currentSpeedFactor > 0.08) continue;
+          if (!isComplementaryCrossroadPair(a, b)) continue;
+          const aStuck = a.stoppedSince && (now - a.stoppedSince) > 900;
+          const bStuck = b.stoppedSince && (now - b.stoppedSince) > 900;
+          if (!aStuck && !bStuck) continue;
+          const pick = gridlockPriorityScore(a) >= gridlockPriorityScore(b) ? a : b;
+          const other = pick === a ? b : a;
+          if (pick.forceUnstickFrames > 0) continue;
+          if (checkPolygonIntersection(getCarBoundingBox(a), getCarBoundingBox(b))) continue;
+          // Do not force creep if the picker's path already hits the other car closely.
+          const hitPick = getStaticOccupancyHitDistance(pick, other);
+          if (Number.isFinite(hitPick) && hitPick <= CAR_LENGTH * 0.9) continue;
+          pick.forceUnstickFrames = GRIDLOCK_FORCE_FRAMES;
+          forced++;
+          logEvent('behavior', `gridlock unstick ${getCarName(pick)} (complementary pair)`, true);
+          if (forced >= 2) return;
+        }
+      }
+    }
 }
 
 // Define crossroad areas
@@ -2359,8 +2612,11 @@ function updateCar(car) {
       }
     }
 
-    /* Rule 2 – intersection conflicts */
-    if (!car.isCommittedToTurn || car.turnState === 'rejoining') {
+    /* Rule 2 – intersection conflicts
+       Also evaluate while mid ellipse→vertical turn even after commitment: committing
+       only means "past the stop line", not "ignore cross traffic finishing their turn". */
+    const carEllipseToVertical = isEllipseToVerticalManeuver(car);
+    if (!car.isCommittedToTurn || car.turnState === 'rejoining' || carEllipseToVertical) {
       const overlap = checkTrajectoryIntersection(car, otherCar);
       if (overlap) {
         
@@ -2368,14 +2624,18 @@ function updateCar(car) {
            Re-joining → ellipse (vertical → ellipse)
            ---------------------------------------------------------- */
         if (car.turnState === 'rejoining' && car.verticalDirection !== null) {
-          // Yield to ANY car on the ellipse if there is a trajectory overlap
-          // Exception: Do not yield to cars that are also rejoining (handled by Rule 1 above)
+          // Yield to main-road ellipse traffic when trajectories overlap.
+          // Skip complementary diverging exits (vertical-right vs ellipse-left, etc.).
           if (otherCar.path === 'ellipse' && otherCar.turnState !== 'rejoining') {
-             mustYield = true;
-             reason = 'rejoin-yield-to-main-road';
-             yieldRule_rejoin = true;
-             yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
-             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} rejoin yielding to Car${allCars.indexOf(otherCar)+1}`);
+             if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+               mustYield = true;
+               reason = 'rejoin-yield-to-main-road';
+               yieldRule_rejoin = true;
+               yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
+               if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} rejoin yielding to Car${allCars.indexOf(otherCar)+1}`);
+             } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+               logEvent('behavior', `${carName} skip rejoin yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+             }
           }
         }
         /* 2.1.1  vertical → ellipse right */
@@ -2384,23 +2644,33 @@ function updateCar(car) {
             car.turnState !== 'turning' &&
             !car.isCommittedToTurn) {
 
-          // Only yield to cars driving clockwise (same direction) on ellipse
+          // Rule 2.1.1: yield to CW ellipse traffic. Do not wait for an ellipse car that is
+          // turning left onto the vertical (complementary, non-conflicting with a right exit).
           if (otherCar.path === 'ellipse' && otherCar.direction === 1) {
-            mustYield = true;
-            reason    = 'intersection-vertical-right';
-            yieldRule_2_1_1 = true;
-            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
-            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse right`);
+            if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+              mustYield = true;
+              reason    = 'intersection-vertical-right';
+              yieldRule_2_1_1 = true;
+              yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
+              if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse right`);
+            } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+              logEvent('behavior', `${carName} skip vertical-right yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+            }
           }
         }
         /* 2.1.2  vertical → ellipse left  */
         else if (car.turnDirection === 'left' && car.turnState !== 'turning' && !car.isCommittedToTurn) {
           if (otherCar.path === 'ellipse') {
-            mustYield = true;
-            reason    = 'intersection-vertical-left';
-            yieldRule_2_1_2 = true;
-            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
-            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
+            // Yield to through traffic either way; skip only complementary ellipse→vertical exits.
+            if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+              mustYield = true;
+              reason    = 'intersection-vertical-left';
+              yieldRule_2_1_2 = true;
+              yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
+              if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
+            } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+              logEvent('behavior', `${carName} skip vertical-left yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+            }
           } else if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
             const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
             const carDist   = Math.abs(car.y - carIsectY);
@@ -2415,44 +2685,47 @@ function updateCar(car) {
           }
         }
 
-        /* Opposite-direction vertical turning conflict */
+        /* Opposite-direction vertical conflict (head-on on the vertical road) */
         if (car.path === 'vertical' &&
             otherCar.path === 'vertical' &&
-            car.verticalDirection !== otherCar.verticalDirection &&
-            car.turnState === 'turning' &&
-            otherCar.turnState === 'turning') {
+            car.verticalDirection &&
+            otherCar.verticalDirection &&
+            car.verticalDirection !== otherCar.verticalDirection) {
 
-            // If both turning into the same crossroad area, yield to the one closer
             const crossroadY = (car.verticalDirection === 'up')
-                ? centerY - car.b  // top junction
-                : centerY + car.b; // bottom junction
-
+                ? centerY - ELLIPSE_B0
+                : centerY + ELLIPSE_B0;
             const myDist    = Math.abs(car.y - crossroadY);
             const othDist   = Math.abs(otherCar.y - crossroadY);
-
-            if (othDist < myDist) {
-                mustYield = true;
-                reason    = 'vertical-turn-opposite';
-                if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} opposite vertical turn`);
+            const otherMidFromEllipse = otherCar.turnState === 'turning' && otherCar.isMakingTurn;
+            const iAmMidFromEllipse = car.turnState === 'turning' && car.isMakingTurn;
+            let verticalOppositeReason = null;
+            if (otherMidFromEllipse && !iAmMidFromEllipse) {
+                verticalOppositeReason = 'vertical-opposite-yield-to-committed';
+            } else if (!iAmMidFromEllipse && othDist < myDist - 5) {
+                verticalOppositeReason = 'vertical-turn-opposite';
+            } else if (iAmMidFromEllipse && otherMidFromEllipse && othDist < myDist) {
+                verticalOppositeReason = 'vertical-turn-opposite';
             }
-        }	  
+            if (verticalOppositeReason) {
+                mustYield = true;
+                reason = verticalOppositeReason;
+                if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+                  logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ${reason}`);
+                }
+            }
+        }
 
-        /* 2.2.1 ellipse → vertical left yields to opposite on ellipse */
-        // Explicitly check for LEFT turn direction.
-        // Check if car is on ellipse OR has just switched to vertical path while turning from ellipse.
-        const isEllipseToVerticalLeft = car.turnDirection === 'left' && 
-                                        car.isMakingTurn &&
-                                        (car.path === 'ellipse' || (car.path === 'vertical' && car.turnState === 'turning'));
+        /* 2.2.1 ellipse → vertical left yields to opposite on ellipse
+           (also while committed/mid-turn — do not cut off opposing stream). */
+        const isEllipseToVerticalLeft = car.turnDirection === 'left' && carEllipseToVertical;
 
-        if (isEllipseToVerticalLeft && !car.isCommittedToTurn) {
-            
-            // Check if otherCar is in the opposing stream
+        if (isEllipseToVerticalLeft) {
             const isOppositeDirection = (car.direction === 1 && otherCar.direction === -1) ||
                                         (car.direction === -1 && otherCar.direction === 1);
-            
-            // The other car should be on the ellipse or entering the intersection
-            const isOtherOnEllipse = otherCar.path === 'ellipse' || 
-                                     (otherCar.path === 'vertical' && otherCar.turnState === 'turning');
+            const isOtherOnEllipse = otherCar.path === 'ellipse' ||
+                                     (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
+                                     otherCar.turnState === 'rejoining';
 
             if (isOppositeDirection && isOtherOnEllipse) {
                 mustYield = true;
@@ -2463,30 +2736,69 @@ function updateCar(car) {
             }
         }
 
-        /* 2.2.2 ellipse -> vertical right yields to cars navigating vertical crossroad */
-        const isEllipseToVerticalRight = car.turnDirection === 'right' &&
-                                         car.isMakingTurn &&
-                                         car.path === 'ellipse' &&
-                                         !car.isCommittedToTurn;
-        if (isEllipseToVerticalRight && otherCar.path === 'vertical') {
-          const otherInTopCrossroad =
-            otherCar.x > topCrossroadArea.x &&
-            otherCar.x < topCrossroadArea.x + topCrossroadArea.width &&
-            otherCar.y > topCrossroadArea.y &&
-            otherCar.y < topCrossroadArea.y + topCrossroadArea.height;
-          const otherInBottomCrossroad =
-            otherCar.x > bottomCrossroadArea.x &&
-            otherCar.x < bottomCrossroadArea.x + bottomCrossroadArea.width &&
-            otherCar.y > bottomCrossroadArea.y &&
-            otherCar.y < bottomCrossroadArea.y + bottomCrossroadArea.height;
-          if (otherInTopCrossroad || otherInBottomCrossroad) {
+        /* 2.2.2 ellipse → vertical right yields to cars navigating vertical crossroad
+           (and left turns: yield to anyone still exchanging vertical↔ellipse with overlap). */
+        const isEllipseToVerticalRight = car.turnDirection === 'right' && carEllipseToVertical;
+        if (carEllipseToVertical) {
+          const otherExchanging = isNavigatingVerticalEllipseExchange(otherCar);
+          const hitEx = getStaticOccupancyHitDistance(car, otherCar);
+          const exchangeNear = Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 2.5;
+          // Right turn (2.2.2): yield to cars on the vertical that are actually in the
+          // crossroad box or actively exchanging — not every distant vertical car.
+          // Include stopped cars when our path hits them or they occupy the box:
+          // requiring speed>0.03 made us ignore a stopped mid-turn car and rear-end it.
+          const rightConflict = isEllipseToVerticalRight && otherCar.path === 'vertical' &&
+            (isCarInCrossroadArea(otherCar) || otherExchanging) &&
+            (otherCar.currentSpeedFactor > 0.03 || exchangeNear ||
+              (Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 1.5));
+          // Left / either: wait for active vertical↔ellipse exchange with real motion or near body.
+          const exchangeConflict = otherExchanging &&
+            !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
+            (otherCar.currentSpeedFactor > 0.04 || exchangeNear);
+
+          if (rightConflict || exchangeConflict) {
             mustYield = true;
-            reason = 'ellipse-right-yield-to-vertical';
-            yieldRule_2_2_2 = true;
+            reason = isEllipseToVerticalRight
+              ? 'ellipse-right-yield-to-vertical'
+              : 'ellipse-to-vertical-yield-to-exchange';
+            if (isEllipseToVerticalRight) {
+              yieldRule_2_2_2 = true;
+            } else {
+              yieldRule_2_2_1 = true;
+            }
             yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
-            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical right vs vertical crossroad`);
+            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical vs crossroad/exchange (${reason})`);
+            }
           }
         }
+      }
+    }
+
+    // Same vertical lane: only the rear car may priority-yield to the lead.
+    // Without this, two mid ellipse→vertical cars (left+right) mutually yield and freeze,
+    // then force-unstick tries to break it and can rear-end the lead (Car1→Car2 crash).
+    if (mustYield && reason !== 'following' &&
+        car.path === 'vertical' && otherCar.path === 'vertical' &&
+        car.verticalDirection && car.verticalDirection === otherCar.verticalDirection) {
+      const otherIsAhead =
+        (car.verticalDirection === 'up' && otherCar.y < car.y - 4) ||
+        (car.verticalDirection === 'down' && otherCar.y > car.y + 4);
+      if (!otherIsAhead) {
+        mustYield = false;
+        reason = null;
+      }
+    }
+
+    // Don't wait forever for a partner that is itself fully stuck and not on our body.
+    // (Following/queue still respects a stopped lead ahead — that is real traffic.)
+    if (mustYield && reason !== 'following' && otherCar.currentSpeedFactor < 0.05) {
+      const otherStuckMs = otherCar.stoppedSince ? (performance.now() - otherCar.stoppedSince) : 0;
+      const hitToOther = getStaticOccupancyHitDistance(car, otherCar);
+      if (otherStuckMs > GRIDLOCK_STUCK_MS * 0.6 &&
+          (!Number.isFinite(hitToOther) || hitToOther > CAR_LENGTH * 1.05)) {
+        mustYield = false;
+        reason = null;
       }
     }
 
@@ -2532,16 +2844,32 @@ function updateCar(car) {
         const maxYieldVel = Math.sqrt(2 * MAX_ACCELERATION * stopDist);
         const maxYieldFactor = maxYieldVel / Math.max(0.001, car.maximumSpeed * 50);
         collisionSlowdown = Math.min(collisionSlowdown, maxYieldFactor);
-        if (distance < stopBuffer + CAR_LENGTH * 0.35) {
+        // Ramp aggressiveness with distance instead of snapping to full emergency.
+        if (distance < stopBuffer + CAR_LENGTH * 0.25) {
           collisionSlowdown = 0;
-          needsAggressive = 1;
+          needsAggressive = Math.max(needsAggressive, 0.95);
         } else if (distance < CAR_LENGTH * 3.5) {
-          needsAggressive = Math.max(needsAggressive, 0.85);
+          const near = clamp(1 - (distance - stopBuffer) / (CAR_LENGTH * 3.0), 0, 1);
+          needsAggressive = Math.max(needsAggressive, 0.35 + 0.5 * near);
         } else {
-          needsAggressive = Math.max(needsAggressive, 0.55);
+          needsAggressive = Math.max(needsAggressive, 0.35);
         }
       }
     }
+  }
+
+  // Smooth only brake-release (rising cap). Falling caps apply immediately for safety;
+  // actual speed is rate-limited later so the stop still feels progressive.
+  {
+    const rawCs = collisionSlowdown;
+    if (!Number.isFinite(car.smoothedCollisionSlowdown)) {
+      car.smoothedCollisionSlowdown = rawCs;
+    } else if (rawCs < car.smoothedCollisionSlowdown) {
+      car.smoothedCollisionSlowdown = rawCs;
+    } else {
+      car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * TARGET_COMMAND_SMOOTH_UP;
+    }
+    collisionSlowdown = clamp(car.smoothedCollisionSlowdown, 0, 1);
   }
 
   const hasLeadVehicle = Number.isFinite(leadGapPx);
@@ -2564,6 +2892,13 @@ function updateCar(car) {
   let defensiveOther = null;
   for (const otherCar of allCars) {
     if (otherCar === car) continue;
+    // Complementary arcs (e.g. vertical-right vs ellipse-left at same junction) must not
+    // freeze each other with defensive hard-stops — only true body overlap matters.
+    if (isComplementaryCrossroadPair(car, otherCar) &&
+        !checkPolygonIntersection(getCarBoundingBox(car), getCarBoundingBox(otherCar))) {
+      continue;
+    }
+    if (shouldSkipYieldForDivergingManeuver(car, otherCar)) continue;
     const hitDist = getStaticOccupancyHitDistance(car, otherCar);
     if (hitDist < defensiveHitDist) {
       defensiveHitDist = hitDist;
@@ -2576,36 +2911,30 @@ function updateCar(car) {
     defensiveBrake = true;
     const otherStopped = defensiveOther.currentSpeedFactor < 0.06;
     const iHavePriority = hasMainRoadPriorityOver(car, defensiveOther);
-    const buffer = CAR_LENGTH * 0.5;
+    const buffer = CAR_LENGTH * 0.55;
     const stopDist = Math.max(0.001, defensiveHitDist - buffer);
     const maxDefVel = Math.sqrt(2 * MAX_ACCELERATION * stopDist);
     const maxDefFactor = maxDefVel / Math.max(0.001, car.maximumSpeed * 50);
 
-    if (defensiveHitDist <= 0.5) {
-      // Bodies already overlapping / about to: always hard stop.
+    // NEVER allow a speed floor when close — Car6 creeps at 0.15 into stopped Car1 was a crash.
+    // Priority only permits a gentle creep when the obstacle is still well ahead.
+    if (defensiveHitDist <= CAR_LENGTH * 1.25) {
       collisionSlowdown = 0;
       needsAggressive = 1;
       shouldStop = true;
-    } else if (iHavePriority && otherStopped && defensiveHitDist > CAR_LENGTH * 0.85) {
-      // Higher-priority car facing a stopped yielder in the far path: creep, don't deadlock.
-      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.28, maxDefFactor));
-      needsAggressive = Math.max(needsAggressive, 0.4);
-    } else if (!iHavePriority || !otherStopped) {
-      // Must not hit: full kinematic cap; hard stop only when imminent.
+    } else if (iHavePriority && otherStopped && defensiveHitDist > CAR_LENGTH * 2.0) {
+      // Far-ahead stopped yielder: slow / creep, don't freeze the main road forever.
+      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.22, maxDefFactor));
+      needsAggressive = Math.max(needsAggressive, 0.45);
+    } else {
+      // Full kinematic cap for everyone else (priority or not).
       collisionSlowdown = Math.min(collisionSlowdown, maxDefFactor);
-      if (defensiveHitDist <= CAR_LENGTH * 1.15) {
-        collisionSlowdown = 0;
-        needsAggressive = 1;
-        shouldStop = true;
-      } else if (defensiveHitDist <= CAR_LENGTH * 2.4) {
+      if (defensiveHitDist <= CAR_LENGTH * 2.2) {
         needsAggressive = Math.max(needsAggressive, 0.85);
+        if (defensiveHitDist <= CAR_LENGTH * 1.6) shouldStop = true;
       } else {
         needsAggressive = Math.max(needsAggressive, 0.45);
       }
-    } else {
-      // Priority + moving other still in path: slow carefully.
-      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.15, maxDefFactor));
-      needsAggressive = Math.max(needsAggressive, 0.7);
     }
     if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
       logEvent('behavior', `${carName} defensive vs ${defensiveOtherId} hitDist=${defensiveHitDist.toFixed(1)} prio=${iHavePriority} otherStopped=${otherStopped}`);
@@ -2649,8 +2978,11 @@ function updateCar(car) {
   const carIsRejoiningNow = car.turnState === 'rejoining' || (car.path === 'ellipse' && car.verticalDirection !== null);
   const isMainRoadActor = car.path === 'ellipse' && !carIsRejoiningNow;
   const yieldAgeMs = car.yieldStartTime ? (performance.now() - car.yieldStartTime) : 0;
+  // Do not force-through while mid ellipse→vertical against active exchange traffic
+  // (that is exactly the Car6-vs-Car5 failure mode).
   if (car.isYielding && yieldAgeMs > YIELD_TIMEOUT && !hasFollowingConflict &&
-      (hadPriorityConflict || defensiveBrake) && isMainRoadActor) {
+      (hadPriorityConflict || defensiveBrake) && isMainRoadActor &&
+      !isEllipseToVerticalManeuver(car)) {
     car.isYielding = false;
     shouldStop     = false;
     car.yieldStartTime = 0;
@@ -2709,36 +3041,95 @@ function updateCar(car) {
     }
   }
 
-  // Commitment means "do not stop at the pre-turn yield line" for the chosen turn.
-  // Rejoining cars remain lower priority and must still yield to main-road traffic
-  // even after crossing the vertical stop line (Rule 2 rejoin).
-  if (car.isCommittedToTurn && car.turnState !== 'rejoining') {
+  // Commitment means "past the stop line / free to enter" — not "ignore all traffic".
+  // Rejoining and mid ellipse→vertical turns must still honor active crossroad conflicts
+  // (e.g. Car6 left into vertical must wait for Car5 finishing a vertical→ellipse turn).
+  const midEllipseToVertical = isEllipseToVerticalManeuver(car);
+  if (car.isCommittedToTurn && car.turnState !== 'rejoining' && !midEllipseToVertical) {
     shouldStop   = false;
     car.isYielding = false;
     // Committed junction cars must not remain frozen solely by defensive caps against
     // stopped waiters (screenshot gridlock). Keep a hard stop only for true overlap.
-    if (defensiveBrake && defensiveOther && defensiveHitDist > 0.5 &&
+    if (defensiveBrake && defensiveOther && defensiveHitDist > CAR_LENGTH * 1.25 &&
         hasMainRoadPriorityOver(car, defensiveOther) && defensiveOther.currentSpeedFactor < 0.06) {
       collisionSlowdown = Math.max(collisionSlowdown, 0.32);
     }
   }
 
-  // Track continuous full-stop time (yieldStartTime is cleared when commitment clears yield).
-  if (car.currentSpeedFactor < 0.02 && (shouldStop || collisionSlowdown < 0.05 || defensiveBrake)) {
+  // Track continuous near-stop time (include slow creep freezes, not only exact zero).
+  if (car.currentSpeedFactor < 0.06 &&
+      (shouldStop || car.isYielding || collisionSlowdown < 0.2 || defensiveBrake || car.forceUnstickFrames > 0)) {
     if (!car.stoppedSince) car.stoppedSince = performance.now();
-  } else if (car.currentSpeedFactor >= 0.05) {
+  } else if (car.currentSpeedFactor >= 0.1) {
     car.stoppedSince = 0;
   }
   const stoppedAgeMs = car.stoppedSince ? (performance.now() - car.stoppedSince) : 0;
 
-  // Global stuck recovery: if fully stopped for a long time with no lead car,
-  // main-road / committed actors creep forward to break multi-car standoffs.
+  // Mid ellipse→vertical stuck in the junction: after a long yield, finish the turn.
+  if (midEllipseToVertical && car.isCommittedToTurn && !hasFollowingConflict &&
+      car.currentSpeedFactor < 0.02 && stoppedAgeMs > YIELD_TIMEOUT) {
+    const trulyOverlapping = Number.isFinite(defensiveHitDist) && defensiveHitDist <= 0.5;
+    if (!trulyOverlapping) {
+      shouldStop = false;
+      car.isYielding = false;
+      collisionSlowdown = Math.max(collisionSlowdown, 0.22);
+      if (collisionSlowdown < 0.2) collisionSlowdown = 0.22;
+      if (Number.isFinite(defensiveHitDist) && defensiveHitDist < CAR_LENGTH) {
+        collisionSlowdown = Math.min(collisionSlowdown, 0.18);
+      }
+    }
+  }
+
+  // Gridlock force (set by resolveGridlock): override yield/defensive freeze and creep.
+  // Never force into a lead car (Rule 1) or a body that is already on our path.
+  if (car.forceUnstickFrames > 0) {
+    const bodyBlocked = Number.isFinite(defensiveHitDist) && defensiveHitDist <= CAR_LENGTH * 0.75;
+    const leadBlocked = hasFollowingConflict && Number.isFinite(leadGapPx) && leadGapPx < CAR_LENGTH * 0.55;
+    if (bodyBlocked || leadBlocked) {
+      // Abort unstick: we are about to hit something real.
+      car.forceUnstickFrames = 0;
+      shouldStop = true;
+      car.isYielding = true;
+      collisionSlowdown = 0;
+      needsAggressive = 1;
+    } else {
+      shouldStop = false;
+      car.isYielding = false;
+      let creep = 0.35;
+      if (Number.isFinite(defensiveHitDist) && defensiveHitDist < CAR_LENGTH * 1.25) creep = 0.18;
+      if (Number.isFinite(defensiveHitDist) && defensiveHitDist < CAR_LENGTH * 0.9) creep = 0.12;
+      // Unstick creep, still capped by kinematic following distance when a lead exists.
+      collisionSlowdown = creep;
+      if (hasFollowingConflict && Number.isFinite(leadGapPx)) {
+        const maxFollowVel = Math.sqrt(2 * MAX_ACCELERATION * Math.max(0.001, leadGapPx));
+        const maxFollowFactor = maxFollowVel / Math.max(0.001, car.maximumSpeed * 50);
+        collisionSlowdown = Math.min(collisionSlowdown, maxFollowFactor);
+      }
+    }
+  }
+
+  // Global stuck recovery for main-road / committed actors (single-car soft unstick).
   if (!hasFollowingConflict && car.currentSpeedFactor < 0.02 &&
-      (isMainRoadActor || (car.isCommittedToTurn && car.turnState !== 'rejoining')) &&
-      stoppedAgeMs > YIELD_TIMEOUT * 0.75) {
-    shouldStop = false;
-    car.isYielding = false;
-    if (collisionSlowdown < 0.35) collisionSlowdown = 0.35;
+      (isMainRoadActor || (car.isCommittedToTurn && car.turnState !== 'rejoining') || midEllipseToVertical) &&
+      stoppedAgeMs > YIELD_TIMEOUT * 0.85) {
+    if (!Number.isFinite(defensiveHitDist) || defensiveHitDist > CAR_LENGTH * 0.9) {
+      shouldStop = false;
+      car.isYielding = false;
+      if (collisionSlowdown < 0.28) collisionSlowdown = 0.28;
+    }
+  }
+
+  // Queue unstick: if we are following a lead that has also been stopped forever,
+  // and gap is already safe, do not remain frozen as a dead queue (lead is gridlocked).
+  if (hasFollowingConflict && hasLeadVehicle && car.currentSpeedFactor < 0.02 &&
+      stoppedAgeMs > YIELD_TIMEOUT * 1.4 &&
+      leadGapPx > RULE1_STOP_GAP_MIN &&
+      leadSpeedFactor < 0.04) {
+    if (!Number.isFinite(defensiveHitDist) || defensiveHitDist > CAR_LENGTH * 0.9) {
+      // Only creep if lead is not immediately ahead body-to-body.
+      shouldStop = false;
+      collisionSlowdown = Math.max(collisionSlowdown, 0.12);
+    }
   }
 
   const signedDistToYieldLineNorm = Number.isFinite(signedDistToYieldLine)
@@ -2906,32 +3297,71 @@ function updateCar(car) {
     car.lastHeuristicLead = true;
   }
 
-  let accel = MAX_ACCELERATION;
-  if (controllerMode !== 'nn' && needsAggressive) {
-    accel *= AGGRESSIVE_DECELERATION_FACTOR * (needsAggressive >= 0.85 ? 1.5 : 1.0);
+  // Rate-limited speed command: comfort braking at crossroads, emergency only when imminent.
+  const maxSpeedPx = Math.max(0.001, car.maximumSpeed * 50);
+  const imminentStop =
+    (Number.isFinite(defensiveHitDist) && defensiveHitDist <= CAR_LENGTH * 0.75) ||
+    (hasFollowingConflict && Number.isFinite(leadGapPx) && leadGapPx < CAR_LENGTH * 0.3) ||
+    (collisionSlowdown <= 0.001 && car.currentSpeedFactor > 0.55);
+  // Scale deceleration smoothly with conflict severity instead of jumping to max.
+  const conflictSeverity = clamp(
+    Math.max(
+      needsAggressive,
+      hadPriorityConflict ? 0.45 : 0,
+      hasFollowingConflict ? followRisk : 0,
+      collisionSlowdown < 1 ? (1 - collisionSlowdown) : 0
+    ),
+    0,
+    1
+  );
+  const decelFactor = imminentStop
+    ? EMERGENCY_DECEL_FACTOR
+    : (COMFORT_DECEL_FACTOR + conflictSeverity * (AGGRESSIVE_DECELERATION_FACTOR - COMFORT_DECEL_FACTOR));
+  const accelStep = MAX_ACCELERATION / maxSpeedPx;
+  const decelStep = (MAX_ACCELERATION * decelFactor) / maxSpeedPx;
+
+  let desiredFactor = targetFactor;
+  if (controllerMode !== 'nn' && ((isAtYieldLine && shouldStop) || collisionSlowdown <= 0.001)) {
+    desiredFactor = 0;
+  }
+  desiredFactor = clamp(desiredFactor, 0, 1);
+
+  if (!Number.isFinite(car.cmdSpeedFactor)) {
+    car.cmdSpeedFactor = car.currentSpeedFactor;
   }
 
-  // Hard stop when fully blocked (yield line stop, or conflict slowdown commanded zero).
-  // Do not hard-stop on low curve/yield-line kinematic caps alone (those use targetFactor).
-  // Previous code only hard-stopped at the yield line; rejoin merges past that line kept
-  // coasting via SPEED_SMOOTHING_FACTOR and crashed into main-road traffic.
-  if (controllerMode !== 'nn' && ((isAtYieldLine && shouldStop) || collisionSlowdown <= 0)) {
-    car.currentSpeedFactor = 0;
+  if (controllerMode !== 'nn') {
+    // Primary smoothness: at most one comfort/emergency physical step per frame.
+    if (desiredFactor < car.cmdSpeedFactor) {
+      car.cmdSpeedFactor = Math.max(desiredFactor, car.cmdSpeedFactor - decelStep);
+    } else {
+      car.cmdSpeedFactor = Math.min(desiredFactor, car.cmdSpeedFactor + accelStep);
+    }
+    // Gentle secondary blend (small) so command changes aren't staircase-harsh.
+    const blend = imminentStop ? 0.65 : 0.4;
+    car.currentSpeedFactor += (car.cmdSpeedFactor - car.currentSpeedFactor) * blend;
+    // Enforce the rate limit on the displayed/applied speed as well.
+    if (car.currentSpeedFactor > car.cmdSpeedFactor + 1e-6) {
+      car.currentSpeedFactor = Math.max(car.cmdSpeedFactor, car.currentSpeedFactor - decelStep);
+    } else if (car.currentSpeedFactor < car.cmdSpeedFactor - 1e-6) {
+      car.currentSpeedFactor = Math.min(car.cmdSpeedFactor, car.currentSpeedFactor + accelStep);
+    }
+    // Settle to a true hold-stop once nearly stopped for a yield/conflict.
+    if (desiredFactor <= 0.001 && car.currentSpeedFactor < 0.035) {
+      car.currentSpeedFactor = 0;
+      car.cmdSpeedFactor = 0;
+    }
   } else {
-    const speedStep = accel / Math.max(0.001, car.maximumSpeed * 50);
+    // NN path: keep previous simple tracking toward targetFactor.
+    let accel = MAX_ACCELERATION;
+    if (needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
+    const speedStep = accel / maxSpeedPx;
     if (car.currentSpeedFactor < targetFactor) {
       car.currentSpeedFactor = Math.min(targetFactor, car.currentSpeedFactor + speedStep);
     } else {
-      // Prefer physical deceleration over pure exponential smoothing when braking for
-      // conflicts — smoothing alone never reaches a hard stop in time.
-      const smooth = car.currentSpeedFactor + (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
-      const physical = Math.max(targetFactor, car.currentSpeedFactor - speedStep);
-      if (needsAggressive > 0.25 || hadPriorityConflict || hasFollowingConflict || targetFactor < car.currentSpeedFactor - 0.08) {
-        car.currentSpeedFactor = Math.min(smooth, physical);
-      } else {
-        car.currentSpeedFactor = smooth;
-      }
+      car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
     }
+    car.cmdSpeedFactor = car.currentSpeedFactor;
   }
   if (!Number.isFinite(car.currentSpeedFactor)) {
     logModelIssue(`${carName} speed factor invalid; clamping to heuristic`);
@@ -3271,6 +3701,9 @@ function updateCar(car) {
     for (const car of allCars) {
       car.crashThisFrame = false;
     }
+
+    // Break multi-car freezes before control (avgSpeed→0 gridlocks).
+    resolveGridlock(allCars);
 
     updateCar(car1);
     updateCar(car2);
