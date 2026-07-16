@@ -1712,15 +1712,15 @@ function getEllipseLookaheadPoint(car) {
   function drawTrajectory(car, trajectoryStates, turnType) {
     if (trajectoryStates.length < 2) return;
 
-    let color = 'rgba(0, 255, 0, 0.05)'; // Green — no road change
+    let color = 'rgba(0, 255, 0, 0.02)'; // Green — no road change
     if (turnType === 'ellipse-to-vertical-left') {
-        color = 'rgba(0, 0, 255, 0.05)'; // Blue
+        color = 'rgba(0, 0, 255, 0.02)'; // Blue
     } else if (turnType === 'ellipse-to-vertical-right') {
-        color = 'rgba(0, 255, 255, 0.05)'; // Cyan
+        color = 'rgba(0, 255, 255, 0.02)'; // Cyan
     } else if (turnType === 'vertical-to-ellipse-right') {
-        color = 'rgba(255, 255, 0, 0.05)'; // Yellow
+        color = 'rgba(255, 255, 0, 0.02)'; // Yellow
     } else if (turnType === 'vertical-to-ellipse-left') {
-        color = 'rgba(255, 0, 0, 0.05)';  // Red
+        color = 'rgba(255, 0, 0, 0.02)';  // Red
     }
     ctx.fillStyle = color;
 
