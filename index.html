@@ -70,11 +70,16 @@
     .statusValue {
       color: #111827;
     }
+    .statusValue.crash {
+      color: #b91c1c;
+      font-weight: 700;
+    }
   </style>
 </head>
 <body>
   <div id="statusPanel">
     <div class="statusRow"><span class="statusLabel">Controller:</span><span id="driverStatus" class="statusValue">Heuristics</span></div>
+    <div class="statusRow"><span class="statusLabel">Simulation:</span><span id="simStatus" class="statusValue">Running</span></div>
     <div class="statusRow"><span class="statusLabel">Pre-Training:</span><span id="pretrainStatus" class="statusValue">Idle</span></div>
     <div class="statusRow"><span class="statusLabel">RL:</span><span id="rlStatus" class="statusValue">Idle</span></div>
   </div>
@@ -115,6 +120,7 @@
     rl: true,
     behavior: true,
     lifecycle: true,
+    crash: true,
     trainingIntervalMs: 1000,
     rlIntervalMs: 1000,
     behaviorIntervalMs: 2000,
@@ -122,6 +128,10 @@
     verboseVehicleLights: false,
     verboseKinematics: false
   };
+  // How many prior decision frames to keep per car for crash forensics.
+  const CRASH_HISTORY_FRAMES = 45;
+  // Automatically pause (same as Stop Simulation) when a crash is detected.
+  const PAUSE_ON_CRASH = true;
   const USE_INTUITIVE_TURN_SIGNAL = true;
   const BLINKER_CYCLE_MS = 500;
   const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
@@ -135,7 +145,7 @@
   const INPUT_DIM = 48;
   const HIDDEN_DIM = 16;
   const OUTPUT_DIM = 2;
-  const PRETRAIN_TARGET_STEPS = 6000;
+  const PRETRAIN_TARGET_STEPS = 12000;
   const PRETRAIN_BATCH_SIZE = 24;
   const PRETRAIN_BATCHES_PER_FRAME = 8;
   const PRETRAIN_LR = 0.0025;
@@ -218,8 +228,12 @@
   let frameVerticalRearEndPairs = 0;
   let frameGrassCount = 0;
   let frameRuleViolationCount = 0;
+  let frameCrashDetails = [];
   let activeTrajectoryLength = BASE_TRAJECTORY_LENGTH;
   let lastCrashEventLogMs = 0;
+  let lastCrashReport = null;
+  let lastCrashPauseReason = null;
+  let crashPauseArmed = true; // re-armed after resume / reset so each crash pauses once
   let trainingBuffer = [];
   const TRAINING_BUFFER_MAX = 25000;
   let simFrame = 0;
@@ -265,8 +279,258 @@
       if (channel === 'rl' && !LOG_CONFIG.rl) return;
       if (channel === 'behavior' && !LOG_CONFIG.behavior) return;
       if (channel === 'lifecycle' && !LOG_CONFIG.lifecycle) return;
+      if (channel === 'crash' && !LOG_CONFIG.crash) return;
     }
     console.log(`[${channel.toUpperCase()}] ${message}`);
+  }
+
+  function roundDebug(v, digits = 2) {
+    if (!Number.isFinite(v)) return null;
+    const p = Math.pow(10, digits);
+    return Math.round(v * p) / p;
+  }
+
+  function getCarIndex(car) {
+    return [car1, car2, car3, car4, car5, car6].indexOf(car);
+  }
+
+  function getCarName(car) {
+    const idx = getCarIndex(car);
+    return idx >= 0 ? `Car${idx + 1}` : 'Car?';
+  }
+
+  function captureCarKinematics(car) {
+    return {
+      id: getCarName(car),
+      x: roundDebug(car.x),
+      y: roundDebug(car.y),
+      headingDeg: roundDebug(car.heading * 180 / Math.PI, 1),
+      angleDeg: roundDebug((Number.isFinite(car.angle) ? car.angle : 0) * 180 / Math.PI, 1),
+      speedFactor: roundDebug(car.currentSpeedFactor, 3),
+      speedPx: roundDebug(car.maximumSpeed * 50 * car.currentSpeedFactor, 2),
+      steerDeg: roundDebug(car.steerAngle * 180 / Math.PI, 1),
+      targetSteerDeg: roundDebug(car.targetSteerAngle * 180 / Math.PI, 1),
+      path: car.path,
+      direction: car.direction === 1 ? 'CW' : (car.direction === -1 ? 'CCW' : car.direction),
+      verticalDirection: car.verticalDirection,
+      turnState: car.turnState,
+      turnDirection: car.turnDirection,
+      isMakingTurn: !!car.isMakingTurn,
+      isCommittedToTurn: !!car.isCommittedToTurn,
+      canDecide: !!car.canDecide,
+      isYielding: !!car.isYielding,
+      yieldAgeMs: car.yieldStartTime ? roundDebug(performance.now() - car.yieldStartTime, 0) : 0,
+      a: roundDebug(car.a, 1),
+      b: roundDebug(car.b, 1),
+      rejoinBuffer: roundDebug(car.rejoinBuffer, 1),
+      lastRuleViolation: !!car.lastRuleViolation,
+      lastHeuristicLead: !!car.lastHeuristicLead,
+      onGrass: !!car.lastOnGrass,
+      crashThisFrame: !!car.crashThisFrame
+    };
+  }
+
+  function pushCarDebugHistory(car, decision) {
+    if (!Array.isArray(car.debugHistory)) car.debugHistory = [];
+    const entry = {
+      frame: simFrame,
+      t: roundDebug(performance.now(), 0),
+      kin: captureCarKinematics(car),
+      decision: decision || null
+    };
+    car.debugHistory.push(entry);
+    if (car.debugHistory.length > CRASH_HISTORY_FRAMES) {
+      car.debugHistory.shift();
+    }
+    car.debugDecision = decision || null;
+  }
+
+  function classifyCrashScenario(a, b) {
+    const sameVerticalLane = a.path === 'vertical' && b.path === 'vertical' &&
+      a.verticalDirection && a.verticalDirection === b.verticalDirection;
+    const sameEllipseLane = a.path === 'ellipse' && b.path === 'ellipse' &&
+      a.direction === b.direction && a.verticalDirection === null && b.verticalDirection === null;
+    const eitherTurning = !!(a.isMakingTurn || b.isMakingTurn || a.turnState || b.turnState);
+    const eitherRejoining = a.turnState === 'rejoining' || b.turnState === 'rejoining';
+    const eitherCommitted = !!(a.isCommittedToTurn || b.isCommittedToTurn);
+    const eitherYielding = !!(a.isYielding || b.isYielding);
+    const crossPath = a.path !== b.path;
+    if (sameVerticalLane) return 'same-vertical-lane (possible rear-end / Rule1)';
+    if (sameEllipseLane) return 'same-ellipse-lane (possible rear-end / Rule1)';
+    if (eitherRejoining) return 'rejoin-merge conflict (Rule2 rejoin / 2.2.x)';
+    if (crossPath && eitherTurning) return 'crossroad path conflict (Rule2 turn yield)';
+    if (eitherCommitted && eitherTurning) return 'committed-turn collision (yield bypass after stop line)';
+    if (eitherYielding) return 'yield-state collision (stop-line / braking failure)';
+    if (eitherTurning) return 'turn-related collision';
+    return 'unclassified collision';
+  }
+
+  function relativeCrashGeometry(a, b) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy);
+    const bumperGapApprox = Math.max(0, dist - CAR_LENGTH);
+    const headingDiffDeg = ((b.heading - a.heading) * 180 / Math.PI);
+    let headingDiffNorm = headingDiffDeg;
+    while (headingDiffNorm > 180) headingDiffNorm -= 360;
+    while (headingDiffNorm < -180) headingDiffNorm += 360;
+    const toBHeading = Math.atan2(dy, dx);
+    const bearingFromADeg = ((toBHeading - a.heading) * 180 / Math.PI);
+    let bearingNorm = bearingFromADeg;
+    while (bearingNorm > 180) bearingNorm -= 360;
+    while (bearingNorm < -180) bearingNorm += 360;
+    const aVel = a.maximumSpeed * 50 * a.currentSpeedFactor;
+    const bVel = b.maximumSpeed * 50 * b.currentSpeedFactor;
+    const aVx = Math.cos(a.heading) * aVel;
+    const aVy = Math.sin(a.heading) * aVel;
+    const bVx = Math.cos(b.heading) * bVel;
+    const bVy = Math.sin(b.heading) * bVel;
+    const relVx = bVx - aVx;
+    const relVy = bVy - aVy;
+    // Positive closing rate means centers are approaching each other.
+    const closingRate = dist > 1e-3 ? -((dx * relVx + dy * relVy) / dist) : 0;
+    const trajectoryOverlapNow = checkTrajectoryIntersection(a, b);
+    return {
+      centerDistPx: roundDebug(dist),
+      bumperGapApproxPx: roundDebug(bumperGapApprox),
+      headingDiffDeg: roundDebug(headingDiffNorm, 1),
+      bearingFromAtoBDeg: roundDebug(bearingNorm, 1),
+      closingRatePxPerFrame: roundDebug(closingRate, 3),
+      aSpeedPx: roundDebug(aVel, 2),
+      bSpeedPx: roundDebug(bVel, 2),
+      trajectoryOverlapPredicted: !!trajectoryOverlapNow
+    };
+  }
+
+  function buildCrashReport(crashPairs) {
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    const pairs = crashPairs.map(pair => {
+      const a = pair.a;
+      const b = pair.b;
+      const da = a.debugDecision || {};
+      const db = b.debugDecision || {};
+      return {
+        pair: `${getCarName(a)} vs ${getCarName(b)}`,
+        scenario: classifyCrashScenario(a, b),
+        geometry: relativeCrashGeometry(a, b),
+        verticalRearEnd: !!pair.verticalRearEnd,
+        carA: {
+          ...captureCarKinematics(a),
+          decision: da,
+          historyTail: (a.debugHistory || []).slice(-12)
+        },
+        carB: {
+          ...captureCarKinematics(b),
+          decision: db,
+          historyTail: (b.debugHistory || []).slice(-12)
+        }
+      };
+    });
+
+    return {
+      type: 'CRASH_REPORT',
+      frame: simFrame,
+      timeMs: roundDebug(performance.now(), 0),
+      controllerMode,
+      isRLRunning,
+      activeTrajectoryLength: roundDebug(activeTrajectoryLength, 2),
+      trajectoryLookaheadPx: roundDebug(getTrajectoryDistancePx(), 1),
+      carLengthPx: roundDebug(CAR_LENGTH, 1),
+      maxAcceleration: MAX_ACCELERATION,
+      yieldTimeoutMs: YIELD_TIMEOUT,
+      crashPairCount: pairs.length,
+      pairs,
+      allCars: allCars.map(c => ({
+        ...captureCarKinematics(c),
+        decision: c.debugDecision || null
+      }))
+    };
+  }
+
+  function emitCrashDebugReport(report) {
+    lastCrashReport = report;
+    // Expose for DevTools copy: copy(window.__lastCrashReport)
+    try { window.__lastCrashReport = report; } catch (e) { /* ignore */ }
+
+    logEvent('crash', '========== CRASH DETECTED — SIMULATION PAUSED ==========', true);
+    logEvent('crash', `frame=${report.frame} mode=${report.controllerMode} pairs=${report.crashPairCount} trajLen=${report.activeTrajectoryLength} carLen=${report.carLengthPx}`, true);
+
+    for (const p of report.pairs) {
+      const g = p.geometry || {};
+      logEvent('crash', `--- ${p.pair} | scenario=${p.scenario} | verticalRearEnd=${p.verticalRearEnd}`, true);
+      logEvent('crash', `  geometry: dist=${g.centerDistPx} gap≈${g.bumperGapApproxPx} headingΔ=${g.headingDiffDeg}° bearingA→B=${g.bearingFromAtoBDeg}° closing=${g.closingRatePxPerFrame} predOverlap=${g.trajectoryOverlapPredicted}`, true);
+
+      for (const side of ['carA', 'carB']) {
+        const c = p[side];
+        const d = c.decision || {};
+        const yr = d.yieldRules || {};
+        logEvent(
+          'crash',
+          `  ${c.id}: path=${c.path} dir=${c.direction} vDir=${c.verticalDirection} ` +
+          `turn=${c.turnState}/${c.turnDirection} making=${c.isMakingTurn} committed=${c.isCommittedToTurn} ` +
+          `yield=${c.isYielding} (ageMs=${c.yieldAgeMs}) speed=${c.speedFactor} pos=(${c.x},${c.y}) hdg=${c.headingDeg}°`,
+          true
+        );
+        logEvent(
+          'crash',
+          `    decision: shouldStop=${d.shouldStop} collSlow=${d.collisionSlowdown} heurTarget=${d.heuristicTargetFactor} appliedTarget=${d.appliedTargetFactor} ` +
+          `agg=${d.needsAggressive} leadGap=${d.leadGapPx} stopLineDist=${d.signedDistToYieldLine} atYieldLine=${d.isAtYieldLine} ` +
+          `violatedYield=${d.violatedYieldRule} yieldTimeout=${d.yieldTimeoutFired} overlapType=${d.overlapType}`,
+          true
+        );
+        logEvent(
+          'crash',
+          `    yieldRules: follow=${yr.following} 2.1.1=${yr.r211} 2.1.2=${yr.r212} 2.2.1=${yr.r221} 2.2.2=${yr.r222} rejoin=${yr.rejoin}`,
+          true
+        );
+        if (Array.isArray(d.yieldTargets) && d.yieldTargets.length) {
+          logEvent('crash', `    yieldTargets: ${JSON.stringify(d.yieldTargets)}`, true);
+        } else {
+          logEvent('crash', '    yieldTargets: (none)', true);
+        }
+        if (Array.isArray(c.historyTail) && c.historyTail.length) {
+          const histSummary = c.historyTail.map(h => {
+            const hd = h.decision || {};
+            return `f${h.frame}:spd=${h.kin.speedFactor}/y=${h.kin.isYielding ? 1 : 0}/c=${h.kin.isCommittedToTurn ? 1 : 0}/ts=${h.kin.turnState || '-'} /sl=${hd.signedDistToYieldLine ?? 'n'}/tgt=${hd.heuristicTargetFactor ?? 'n'}`;
+          }).join(' | ');
+          logEvent('crash', `    history(${c.historyTail.length}): ${histSummary}`, true);
+        }
+      }
+    }
+
+    logEvent('crash', 'Full JSON report also stored at window.__lastCrashReport (DevTools: copy(window.__lastCrashReport))', true);
+    logEvent('crash', JSON.stringify(report), true);
+    logEvent('crash', '========== END CRASH REPORT ==========', true);
+  }
+
+  function setSimulationRunning(running, reason = null) {
+    const button = document.getElementById('toggleSimulationButton');
+    if (running) {
+      if (isSimulationRunning) return;
+      isSimulationRunning = true;
+      crashPauseArmed = true;
+      lastCrashPauseReason = null;
+      if (button) button.textContent = 'Stop Simulation';
+      logEvent('lifecycle', reason ? `simulation resumed (${reason})` : 'simulation resumed', true);
+      refreshStatusPanel();
+      gameLoop();
+    } else {
+      if (!isSimulationRunning) return;
+      isSimulationRunning = false;
+      if (button) button.textContent = 'Resume Simulation';
+      logEvent('lifecycle', reason ? `simulation paused (${reason})` : 'simulation paused', true);
+      cancelAnimationFrame(animationFrameId);
+      refreshStatusPanel();
+    }
+  }
+
+  function pauseSimulationForCrash(report) {
+    if (!PAUSE_ON_CRASH) return;
+    if (!crashPauseArmed) return;
+    crashPauseArmed = false;
+    lastCrashPauseReason = `crash frame ${report.frame}`;
+    emitCrashDebugReport(report);
+    setSimulationRunning(false, lastCrashPauseReason);
   }
 
   function clamp(v, min, max) {
@@ -681,11 +945,24 @@
     const preBtn = document.getElementById('pretrainButton');
     const rlBtn = document.getElementById('rlButton');
     const driverEl = document.getElementById('driverStatus');
+    const simEl = document.getElementById('simStatus');
     const preEl = document.getElementById('pretrainStatus');
     const rlEl = document.getElementById('rlStatus');
     if (preBtn) preBtn.textContent = isPreTraining ? 'Stop Pre-Train' : 'Pre-Train NN';
     if (rlBtn) rlBtn.textContent = isRLRunning ? 'Stop RL' : 'Start RL';
     if (driverEl) driverEl.textContent = controllerMode === 'nn' ? 'Neural Network' : 'Heuristics';
+    if (simEl) {
+      if (!isSimulationRunning && lastCrashPauseReason) {
+        simEl.textContent = `PAUSED on crash (frame ${simFrame}) — Resume or Reset`;
+        simEl.classList.add('crash');
+      } else if (!isSimulationRunning) {
+        simEl.textContent = 'Paused';
+        simEl.classList.remove('crash');
+      } else {
+        simEl.textContent = `Running (frame ${simFrame})`;
+        simEl.classList.remove('crash');
+      }
+    }
     if (preEl) {
       const pct = clamp((pretrainSteps / PRETRAIN_TARGET_STEPS) * 100, 0, 100);
       preEl.textContent = isPreTraining
@@ -1032,7 +1309,7 @@
 
   // Default properties for a car
   const CAR_DEFAULTS = {
-    maximumSpeed: 0.05,
+    maximumSpeed: 0.08,
     speed: 0.05,
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
@@ -1064,7 +1341,10 @@
     lastHeuristicSample: null,
     crashThisFrame: false,
     lastOnGrass: false,
-    recentHeuristicSamples: null
+    recentHeuristicSamples: null,
+    debugDecision: null,
+    debugHistory: null,
+    stoppedSince: 0
   };
 
   // Helper to create a car object with default and specific properties
@@ -1147,6 +1427,8 @@ function resetSimulation() {
         car.lastPolicyTransition = null;
         car.crashThisFrame = false;
         car.lastOnGrass = false;
+        car.debugDecision = null;
+        car.debugHistory = [];
     });
 
     simFrame = 0;
@@ -1154,6 +1436,10 @@ function resetSimulation() {
     lastPretrainLogMs = 0;
     lastRLLogMs = 0;
     lastBehaviorLogMs = 0;
+    lastCrashReport = null;
+    lastCrashPauseReason = null;
+    crashPauseArmed = true;
+    frameCrashDetails = [];
     rlBaselineEMA = 0;
     rlRewardAbsDevEMA = 1;
     rlAdvantageEMA = 0;
@@ -1348,6 +1634,56 @@ function checkTrajectoryIntersection(car, otherCar) {
     const theyWillHitMe = checkTrajectoryVsStaticBox(otherTrajectory, myBox);
 
     return iWillHitThem || theyWillHitMe;
+}
+
+/**
+ * Distance along `car`'s planned path until its sprite would hit `otherCar`'s
+ * *current* body (static occupancy). Future-vs-future is intentionally NOT used
+ * here — that caused permanent crossroad gridlocks where both cars braked for
+ * each other's predicted paths. Yield rules handle interactive right-of-way.
+ */
+function getStaticOccupancyHitDistance(car, otherCar) {
+    if (checkPolygonIntersection(getCarBoundingBox(car), getCarBoundingBox(otherCar))) {
+      return 0;
+    }
+    const myTrajectory = predictTrajectory(car);
+    if (!myTrajectory.length) return Infinity;
+
+    let traveled = 0;
+    let prevX = car.x;
+    let prevY = car.y;
+    const otherBox = getCarBoundingBox(otherCar);
+
+    for (const state of myTrajectory) {
+      traveled += Math.hypot(state.x - prevX, state.y - prevY);
+      prevX = state.x;
+      prevY = state.y;
+      const myBox = getCarBoundingBox({ x: state.x, y: state.y, heading: state.heading });
+      if (checkPolygonIntersection(myBox, otherBox)) {
+        return traveled;
+      }
+    }
+    return Infinity;
+}
+
+/** True if `car` has right-of-way over `other` for deadlock / defensive decisions. */
+function hasMainRoadPriorityOver(car, other) {
+    const carIsRejoining = car.turnState === 'rejoining' || (car.path === 'ellipse' && car.verticalDirection !== null);
+    const otherIsRejoining = other.turnState === 'rejoining' || (other.path === 'ellipse' && other.verticalDirection !== null);
+    const carOnMain = car.path === 'ellipse' && !carIsRejoining;
+    const otherOnMain = other.path === 'ellipse' && !otherIsRejoining;
+    // Free ellipse traffic outranks vertical / rejoin (Rules 2.1 vs 2.2).
+    if (carOnMain && !otherOnMain) return true;
+    if (!carOnMain && otherOnMain) return false;
+    // Car already committed into the junction outranks cars still waiting to enter.
+    if (car.isCommittedToTurn && !other.isCommittedToTurn) return true;
+    if (!car.isCommittedToTurn && other.isCommittedToTurn) return false;
+    if (car.turnState === 'turning' && (other.turnState === 'approaching' || other.turnState === 'rejoining')) return true;
+    if ((car.turnState === 'approaching' || car.turnState === 'rejoining') && other.turnState === 'turning') return false;
+    // Rejoin always yields to established ellipse traffic.
+    if (!carIsRejoining && otherIsRejoining) return true;
+    if (carIsRejoining && !otherIsRejoining) return false;
+    return false;
 }
 
 // Define crossroad areas
@@ -1954,6 +2290,7 @@ function updateCar(car) {
   let yieldRule_2_2_2 = false;
   let yieldRule_rejoin = false;
   let yieldConflictMinDist = Infinity;
+  const yieldTargets = [];
 
   for (const otherCar of allCars) {
     if (otherCar === car) continue;
@@ -1988,16 +2325,23 @@ function updateCar(car) {
     }
     // Case C: Both Ellipse (Standard ellipse road following)
     else if (car.path === 'ellipse' && otherCar.path === 'ellipse' && car.direction === otherCar.direction) {
-        // If the other car is rejoining, we generally ignore it for "lane following" until it's fully on the ellipse
-        // to prevent main-road traffic from braking prematurely for merging traffic (which should yield).
-        if (otherCar.turnState !== 'rejoining') {
-             let carA  = (car.angle   + 2 * Math.PI) % (2 * Math.PI);
-             let othA  = (otherCar.angle + 2 * Math.PI) % (2 * Math.PI);
-             if (car.direction === 1) {
-               isAheadInLane = (othA > carA && othA - carA < Math.PI) || (carA - othA > Math.PI);
-             } else {
-               isAheadInLane = (othA < carA && carA - othA < Math.PI) || (othA - carA > Math.PI);
-             }
+        // Include rejoining cars when they are already in/near our path (Rule 1 highest priority).
+        // Only ignore distant rejoiners that are not ahead — merges still must yield, but
+        // main-road traffic must not plow into a car that has already entered the lane.
+        let carA  = (car.angle   + 2 * Math.PI) % (2 * Math.PI);
+        let othA  = (otherCar.angle + 2 * Math.PI) % (2 * Math.PI);
+        if (car.direction === 1) {
+          isAheadInLane = (othA > carA && othA - carA < Math.PI) || (carA - othA > Math.PI);
+        } else {
+          isAheadInLane = (othA < carA && carA - othA < Math.PI) || (othA - carA > Math.PI);
+        }
+        // For a rejoining other car, require it to be clearly ahead in heading space
+        // (or very close) so we don't brake for a merge still deep on the vertical road.
+        if (otherCar.turnState === 'rejoining' && isAheadInLane) {
+          const aheadDot = Math.cos(car.heading) * (otherCar.x - car.x) + Math.sin(car.heading) * (otherCar.y - car.y);
+          if (aheadDot < CAR_LENGTH * 0.25 && distance > CAR_LENGTH * 1.5) {
+            isAheadInLane = false;
+          }
         }
     }
 
@@ -2151,6 +2495,18 @@ function updateCar(car) {
         hadPriorityConflict = true;
       }
       shouldStop = true;
+      yieldTargets.push({
+        other: getCarName(otherCar),
+        reason,
+        dist: roundDebug(distance),
+        otherPath: otherCar.path,
+        otherDir: otherCar.direction === 1 ? 'CW' : (otherCar.direction === -1 ? 'CCW' : otherCar.direction),
+        otherVDir: otherCar.verticalDirection,
+        otherTurnState: otherCar.turnState,
+        otherTurnDir: otherCar.turnDirection,
+        otherCommitted: !!otherCar.isCommittedToTurn,
+        otherSpeed: roundDebug(otherCar.currentSpeedFactor, 3)
+      });
       if (reason === 'following') {
         const gap = CAR_LENGTH * 0.4;
         const stopDist = CAR_LENGTH + gap;
@@ -2161,16 +2517,28 @@ function updateCar(car) {
           const p = 1 - ((distance - stopDist) / (reactDist - stopDist));
           collisionSlowdown = Math.min(collisionSlowdown, Math.max(0, 1 - Math.max(0, p)));
         }
+        // Kinematic cap: able to stop within bumper gap (Rule 1 / MAX_ACCELERATION).
+        const bumperGap = Math.max(0.001, Math.max(0, Math.cos(car.heading) * (otherCar.x - car.x) + Math.sin(car.heading) * (otherCar.y - car.y) - CAR_LENGTH));
+        const maxFollowVel = Math.sqrt(2 * MAX_ACCELERATION * bumperGap);
+        const maxFollowFactor = maxFollowVel / Math.max(0.001, car.maximumSpeed * 50);
+        collisionSlowdown = Math.min(collisionSlowdown, maxFollowFactor);
         const queueRisk = clamp((CAR_LENGTH * 2.6 - distance) / (CAR_LENGTH * 2.6), 0, 1);
         needsAggressive = Math.max(needsAggressive, queueRisk);
       } else {
-        const p = 1 - (distance / TRAJECTORY_LOOKAHEAD_DISTANCE);
-        collisionSlowdown = Math.min(collisionSlowdown, 0.7);
-        if (p > 0.8) {
+        // Priority / merge yields: plan to be stopped with a full car-length buffer,
+        // not only when already <60px (old p>0.8). Late soft braking caused rejoin crashes.
+        const stopBuffer = CAR_LENGTH * (reason === 'rejoin-yield-to-main-road' ? 1.1 : 0.85);
+        const stopDist = Math.max(0.001, distance - stopBuffer);
+        const maxYieldVel = Math.sqrt(2 * MAX_ACCELERATION * stopDist);
+        const maxYieldFactor = maxYieldVel / Math.max(0.001, car.maximumSpeed * 50);
+        collisionSlowdown = Math.min(collisionSlowdown, maxYieldFactor);
+        if (distance < stopBuffer + CAR_LENGTH * 0.35) {
           collisionSlowdown = 0;
-          needsAggressive   = 1;
-        } else if (p > 0.3) {
-          needsAggressive   = Math.max(needsAggressive, 0.6);
+          needsAggressive = 1;
+        } else if (distance < CAR_LENGTH * 3.5) {
+          needsAggressive = Math.max(needsAggressive, 0.85);
+        } else {
+          needsAggressive = Math.max(needsAggressive, 0.55);
         }
       }
     }
@@ -2186,6 +2554,62 @@ function updateCar(car) {
       shouldStop = true;
     }
     needsAggressive = Math.max(needsAggressive, clamp(followRisk + closingRate, 0, 1));
+  }
+
+  /* ----------  Defensive occupancy (static only, priority-aware) ----------
+     Prevents main-road cars from hitting a stopped merge already in the roadway,
+     without freezing whole junctions on mutual predicted-path overlaps. */
+  let defensiveHitDist = Infinity;
+  let defensiveOtherId = null;
+  let defensiveOther = null;
+  for (const otherCar of allCars) {
+    if (otherCar === car) continue;
+    const hitDist = getStaticOccupancyHitDistance(car, otherCar);
+    if (hitDist < defensiveHitDist) {
+      defensiveHitDist = hitDist;
+      defensiveOtherId = getCarName(otherCar);
+      defensiveOther = otherCar;
+    }
+  }
+  let defensiveBrake = false;
+  if (Number.isFinite(defensiveHitDist) && defensiveHitDist < trajectoryDistance && defensiveOther) {
+    defensiveBrake = true;
+    const otherStopped = defensiveOther.currentSpeedFactor < 0.06;
+    const iHavePriority = hasMainRoadPriorityOver(car, defensiveOther);
+    const buffer = CAR_LENGTH * 0.5;
+    const stopDist = Math.max(0.001, defensiveHitDist - buffer);
+    const maxDefVel = Math.sqrt(2 * MAX_ACCELERATION * stopDist);
+    const maxDefFactor = maxDefVel / Math.max(0.001, car.maximumSpeed * 50);
+
+    if (defensiveHitDist <= 0.5) {
+      // Bodies already overlapping / about to: always hard stop.
+      collisionSlowdown = 0;
+      needsAggressive = 1;
+      shouldStop = true;
+    } else if (iHavePriority && otherStopped && defensiveHitDist > CAR_LENGTH * 0.85) {
+      // Higher-priority car facing a stopped yielder in the far path: creep, don't deadlock.
+      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.28, maxDefFactor));
+      needsAggressive = Math.max(needsAggressive, 0.4);
+    } else if (!iHavePriority || !otherStopped) {
+      // Must not hit: full kinematic cap; hard stop only when imminent.
+      collisionSlowdown = Math.min(collisionSlowdown, maxDefFactor);
+      if (defensiveHitDist <= CAR_LENGTH * 1.15) {
+        collisionSlowdown = 0;
+        needsAggressive = 1;
+        shouldStop = true;
+      } else if (defensiveHitDist <= CAR_LENGTH * 2.4) {
+        needsAggressive = Math.max(needsAggressive, 0.85);
+      } else {
+        needsAggressive = Math.max(needsAggressive, 0.45);
+      }
+    } else {
+      // Priority + moving other still in path: slow carefully.
+      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.15, maxDefFactor));
+      needsAggressive = Math.max(needsAggressive, 0.7);
+    }
+    if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+      logEvent('behavior', `${carName} defensive vs ${defensiveOtherId} hitDist=${defensiveHitDist.toFixed(1)} prio=${iHavePriority} otherStopped=${otherStopped}`);
+    }
   }
 
   /* ----------  Stopping-point / Commit logic  ---------- */
@@ -2219,10 +2643,21 @@ function updateCar(car) {
   } else {
     car.yieldStartTime = 0;
   }
-  if (car.isYielding && performance.now() - car.yieldStartTime > YIELD_TIMEOUT && hadPriorityConflict && !hasFollowingConflict) {
+  let yieldTimeoutFired = false;
+  // Main-road (and committed ellipse) actors may force progress after a long standoff.
+  // Side-road / rejoin traffic must keep yielding — forcing them through reintroduced crashes.
+  const carIsRejoiningNow = car.turnState === 'rejoining' || (car.path === 'ellipse' && car.verticalDirection !== null);
+  const isMainRoadActor = car.path === 'ellipse' && !carIsRejoiningNow;
+  const yieldAgeMs = car.yieldStartTime ? (performance.now() - car.yieldStartTime) : 0;
+  if (car.isYielding && yieldAgeMs > YIELD_TIMEOUT && !hasFollowingConflict &&
+      (hadPriorityConflict || defensiveBrake) && isMainRoadActor) {
     car.isYielding = false;
     shouldStop     = false;
     car.yieldStartTime = 0;
+    yieldTimeoutFired = true;
+    // Critical: also release hard collision slowdown, otherwise timeout is a no-op.
+    collisionSlowdown = Math.max(collisionSlowdown, 0.4);
+    needsAggressive = Math.max(needsAggressive, 0.5);
   }
 
   /* commit once past the stopping line */
@@ -2240,16 +2675,70 @@ function updateCar(car) {
              (car.verticalDirection === 'down' && frontBumperY > yieldLineBottom);
     }
     if (past && !shouldStop && car.currentSpeedFactor > 0.01) {
-      car.isCommittedToTurn = true;
+      // Gap acceptance: block commit only on real trajectory conflict with active main-road cars.
+      // (Removed the blanket opposite-direction distance gate that permanently stuck left rejoins.)
+      let entryBlocked = false;
+      const needsGapCheck =
+        car.isMakingTurn &&
+        (car.path === 'vertical' || car.path === 'ellipse') &&
+        (car.turnDirection === 'left' || car.turnDirection === 'right');
+      if (needsGapCheck) {
+        for (const otherCar of allCars) {
+          if (otherCar === car) continue;
+          const otherIsRejoining = otherCar.turnState === 'rejoining' ||
+            (otherCar.path === 'ellipse' && otherCar.verticalDirection !== null);
+          if (otherCar.path !== 'ellipse' || otherIsRejoining) continue;
+          if (otherCar.currentSpeedFactor < 0.04) continue; // ignore fully stopped traffic for gap
+          if (checkTrajectoryIntersection(car, otherCar)) {
+            entryBlocked = true;
+            break;
+          }
+        }
+      }
+      if (!entryBlocked) {
+        car.isCommittedToTurn = true;
+      } else {
+        shouldStop = true;
+        hadPriorityConflict = true;
+        collisionSlowdown = 0;
+        needsAggressive = 1;
+      }
     }
     if (past && shouldStop && hadPriorityConflict) {
       violatedYieldRule = true;
     }
   }
 
-  if (car.isCommittedToTurn) {
+  // Commitment means "do not stop at the pre-turn yield line" for the chosen turn.
+  // Rejoining cars remain lower priority and must still yield to main-road traffic
+  // even after crossing the vertical stop line (Rule 2 rejoin).
+  if (car.isCommittedToTurn && car.turnState !== 'rejoining') {
     shouldStop   = false;
     car.isYielding = false;
+    // Committed junction cars must not remain frozen solely by defensive caps against
+    // stopped waiters (screenshot gridlock). Keep a hard stop only for true overlap.
+    if (defensiveBrake && defensiveOther && defensiveHitDist > 0.5 &&
+        hasMainRoadPriorityOver(car, defensiveOther) && defensiveOther.currentSpeedFactor < 0.06) {
+      collisionSlowdown = Math.max(collisionSlowdown, 0.32);
+    }
+  }
+
+  // Track continuous full-stop time (yieldStartTime is cleared when commitment clears yield).
+  if (car.currentSpeedFactor < 0.02 && (shouldStop || collisionSlowdown < 0.05 || defensiveBrake)) {
+    if (!car.stoppedSince) car.stoppedSince = performance.now();
+  } else if (car.currentSpeedFactor >= 0.05) {
+    car.stoppedSince = 0;
+  }
+  const stoppedAgeMs = car.stoppedSince ? (performance.now() - car.stoppedSince) : 0;
+
+  // Global stuck recovery: if fully stopped for a long time with no lead car,
+  // main-road / committed actors creep forward to break multi-car standoffs.
+  if (!hasFollowingConflict && car.currentSpeedFactor < 0.02 &&
+      (isMainRoadActor || (car.isCommittedToTurn && car.turnState !== 'rejoining')) &&
+      stoppedAgeMs > YIELD_TIMEOUT * 0.75) {
+    shouldStop = false;
+    car.isYielding = false;
+    if (collisionSlowdown < 0.35) collisionSlowdown = 0.35;
   }
 
   const signedDistToYieldLineNorm = Number.isFinite(signedDistToYieldLine)
@@ -2418,15 +2907,30 @@ function updateCar(car) {
   }
 
   let accel = MAX_ACCELERATION;
-  if (controllerMode !== 'nn' && needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
+  if (controllerMode !== 'nn' && needsAggressive) {
+    accel *= AGGRESSIVE_DECELERATION_FACTOR * (needsAggressive >= 0.85 ? 1.5 : 1.0);
+  }
 
-  if (controllerMode !== 'nn' && isAtYieldLine && shouldStop) {
+  // Hard stop when fully blocked (yield line stop, or conflict slowdown commanded zero).
+  // Do not hard-stop on low curve/yield-line kinematic caps alone (those use targetFactor).
+  // Previous code only hard-stopped at the yield line; rejoin merges past that line kept
+  // coasting via SPEED_SMOOTHING_FACTOR and crashed into main-road traffic.
+  if (controllerMode !== 'nn' && ((isAtYieldLine && shouldStop) || collisionSlowdown <= 0)) {
     car.currentSpeedFactor = 0;
   } else {
+    const speedStep = accel / Math.max(0.001, car.maximumSpeed * 50);
     if (car.currentSpeedFactor < targetFactor) {
-      car.currentSpeedFactor = Math.min(targetFactor, car.currentSpeedFactor + accel / (car.maximumSpeed * 50));
+      car.currentSpeedFactor = Math.min(targetFactor, car.currentSpeedFactor + speedStep);
     } else {
-      car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+      // Prefer physical deceleration over pure exponential smoothing when braking for
+      // conflicts — smoothing alone never reaches a hard stop in time.
+      const smooth = car.currentSpeedFactor + (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+      const physical = Math.max(targetFactor, car.currentSpeedFactor - speedStep);
+      if (needsAggressive > 0.25 || hadPriorityConflict || hasFollowingConflict || targetFactor < car.currentSpeedFactor - 0.08) {
+        car.currentSpeedFactor = Math.min(smooth, physical);
+      } else {
+        car.currentSpeedFactor = smooth;
+      }
     }
   }
   if (!Number.isFinite(car.currentSpeedFactor)) {
@@ -2619,10 +3123,57 @@ function updateCar(car) {
   } else {
     car.lastPolicyTransition = null;
   }
+
+  // Forensic decision snapshot used by crash reports (pre-move decision + post-move outcome).
+  pushCarDebugHistory(car, {
+    shouldStop,
+    isYielding: !!car.isYielding,
+    hadPriorityConflict,
+    hasFollowingConflict,
+    collisionSlowdown: roundDebug(collisionSlowdown, 3),
+    heuristicTargetFactor: roundDebug(heuristicTargetFactor, 3),
+    appliedTargetFactor: roundDebug(targetFactor, 3),
+    needsAggressive: roundDebug(needsAggressive, 3),
+    leadGapPx: Number.isFinite(leadGapPx) ? roundDebug(leadGapPx) : null,
+    leadSpeedFactor: Number.isFinite(leadSpeedFactor) ? roundDebug(leadSpeedFactor, 3) : null,
+    yieldRules: {
+      following: !!hasFollowingConflict,
+      r211: !!yieldRule_2_1_1,
+      r212: !!yieldRule_2_1_2,
+      r221: !!yieldRule_2_2_1,
+      r222: !!yieldRule_2_2_2,
+      rejoin: !!yieldRule_rejoin
+    },
+    yieldTargets: yieldTargets.slice(),
+    yieldConflictMinDist: Number.isFinite(yieldConflictMinDist) && yieldConflictMinDist < Infinity
+      ? roundDebug(yieldConflictMinDist)
+      : null,
+    defensiveHitDist: Number.isFinite(defensiveHitDist) && defensiveHitDist < Infinity
+      ? roundDebug(defensiveHitDist)
+      : null,
+    defensiveOtherId,
+    defensiveBrake: !!defensiveBrake,
+    signedDistToYieldLine: Number.isFinite(signedDistToYieldLine) ? roundDebug(signedDistToYieldLine) : null,
+    isAtYieldLine: !!isAtYieldLine,
+    isAtStopPoint: !!isAtStopPoint,
+    violatedYieldRule: !!violatedYieldRule,
+    yieldTimeoutFired: !!yieldTimeoutFired,
+    overlapType,
+    isNearTopCrossroad: !!isNearTopCrossroad,
+    isNearBottomCrossroad: !!isNearBottomCrossroad,
+    distToVerticalJunction: Number.isFinite(distToVerticalJunction) ? roundDebug(distToVerticalJunction) : null,
+    trajectoryDistance: roundDebug(trajectoryDistance),
+    followRisk: roundDebug(followRisk, 3),
+    closingRateVsLead: roundDebug(closingRate, 3),
+    laneErr: roundDebug(laneErr),
+    onGrass: !!onGrass,
+    reward: roundDebug(reward, 3)
+  });
 }
 
   function assignCrashPenalties() {
     const allCars = [car1, car2, car3, car4, car5, car6];
+    frameCrashDetails = [];
     for (let i = 0; i < allCars.length; i++) {
       for (let j = i + 1; j < allCars.length; j++) {
         const a = allCars[i];
@@ -2643,9 +3194,11 @@ function updateCar(car) {
           (b.verticalDirection === 'up' && b.y < a.y) ||
           (b.verticalDirection === 'down' && b.y > a.y)
         );
+        let verticalRearEnd = false;
         if (sameVerticalLane && (aAhead || bAhead)) {
           frameVerticalRearEndPairs += 1;
           logAccumulator.verticalRearEndPairs += 1;
+          verticalRearEnd = true;
         }
 
         const aViolator = a.lastRuleViolation;
@@ -2654,6 +3207,7 @@ function updateCar(car) {
         b.crashThisFrame = true;
         frameCrashPairs += 1;
         logAccumulator.crashPairs += 1;
+        frameCrashDetails.push({ a, b, verticalRearEnd, aViolator: !!aViolator, bViolator: !!bViolator });
         if (aViolator && !bViolator) {
           a.pendingCrashPenalty -= 8.0;
           logAccumulator.violatorCrashPairs += 1;
@@ -2815,11 +3369,19 @@ function updateCar(car) {
       }
     }
 
-    if (DEBUG_LOG && frameCrashPairs > 0) {
+    if (frameCrashPairs > 0) {
       const now = performance.now();
-      if (now - lastCrashEventLogMs > 900) {
+      if (DEBUG_LOG && now - lastCrashEventLogMs > 900) {
         logEvent('behavior', `crash event detected this frame-window: pairs=${frameCrashPairs}, verticalRearEnd=${frameVerticalRearEndPairs}, grassCars=${frameGrassCount}, recovery=${rlRecoveryStepsRemaining}`);
         lastCrashEventLogMs = now;
+      }
+      // Build full forensic report and pause (same as Stop Simulation button).
+      if (crashPauseArmed && PAUSE_ON_CRASH) {
+        const report = buildCrashReport(frameCrashDetails);
+        // Draw the crashed frame once more so the user sees the collision pose.
+        draw();
+        pauseSimulationForCrash(report);
+        return;
       }
     }
 
@@ -2851,16 +3413,12 @@ function updateCar(car) {
   }
 
   function toggleSimulation() {
-    const button = document.getElementById('toggleSimulationButton');
-    isSimulationRunning = !isSimulationRunning;
     if (isSimulationRunning) {
-      button.textContent = 'Stop Simulation';
-      logEvent('lifecycle', 'simulation resumed');
-      gameLoop();
+      lastCrashPauseReason = null;
+      setSimulationRunning(false, 'user stop');
     } else {
-      button.textContent = 'Resume Simulation';
-      logEvent('lifecycle', 'simulation paused');
-      cancelAnimationFrame(animationFrameId);
+      // Resume re-arms crash pause so the next new crash will stop again.
+      setSimulationRunning(true, lastCrashPauseReason ? 'after crash pause' : 'user resume');
     }
   }
 
