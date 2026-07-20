@@ -369,8 +369,7 @@
 </head>
 <body>
   <header>
-    <h1>CityTraffic2D</h1>
-    <p>Autonomous Agent Multi-Lane Traffic Control Simulator</p>
+    <h1>Traffic Simulator</h1>
   </header>
 
   <div class="dashboard-container">
@@ -2763,11 +2762,33 @@ function getEllipseLookaheadPoint(car) {
       ctx.fillRect(-259, -91.5, frameWidth, frameHeight);
     }
 
-    ctx.fillStyle = 'red';
+
+    const drawX = -259;
+    const drawY = -91.5;
+
+    // Exact center of the drawn sprite rectangle
+    const spriteCenterX = drawX + frameWidth / 2;   // = 0
+    const spriteCenterY = drawY + frameHeight / 2;  // = 141
+
+    // Visual car body is roughly in the upper part of the frame
+    // Move the number up from geometric center toward the roof
+    const visualCenterY = spriteCenterY - 85;   // This is the calculated sweet spot for your sprite
+
+    ctx.save();
     ctx.font = 'bold 160px sans-serif';
+    ctx.fillStyle = 'red';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 14;
+    ctx.lineJoin = 'round';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(carNumber, 0, 0);
+
+    ctx.strokeText(carNumber, spriteCenterX, visualCenterY);
+    ctx.fillText(carNumber, spriteCenterX, visualCenterY);
+    ctx.restore();
+
+
+
     let blinkerFrame = null;
     const isTurningOrRejoining = car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining';
 
@@ -4053,15 +4074,7 @@ function updateCar(car) {
   }
 
   // Function to draw crossroad areas for debugging
-  function drawCrossroadAreas() {
-    ctx.save();
-    ctx.globalAlpha = 0.2;
-    ctx.fillStyle = 'purple';
-    ctx.fillRect(topCrossroadArea.x, topCrossroadArea.y, topCrossroadArea.width, topCrossroadArea.height);
-    ctx.fillRect(bottomCrossroadArea.x, bottomCrossroadArea.y, bottomCrossroadArea.height, bottomCrossroadArea.height);
-    ctx.restore();
-  }
-
+  
   function gameLoop() {
     if (!isSimulationRunning) return;
 
@@ -4083,7 +4096,6 @@ function updateCar(car) {
     drawCar(car4);
     drawCar(car5);
     drawCar(car6);
-    drawCrossroadAreas();
   }
 
   function update() {
