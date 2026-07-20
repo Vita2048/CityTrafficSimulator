@@ -1,96 +1,445 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Traffic Simulation</title>
+  <title>Traffic Simulation Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
+    :root {
+      --bg-gradient: radial-gradient(circle at 50% 50%, #0f172a, #020617);
+      --card-bg: rgba(30, 41, 59, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #6366f1; /* Indigo */
+      --primary-hover: #4f46e5;
+      --success: #10b981; /* Emerald */
+      --success-hover: #059669;
+      --danger: #ef4444; /* Red */
+      --danger-hover: #dc2626;
+      --warning: #f59e0b; /* Amber */
+      --warning-hover: #d97706;
+      --info: #06b6d4; /* Cyan */
+      --info-hover: #0891b2;
+      --accent: #8b5cf6; /* Violet */
+    }
+
     body {
-      background-color: #f0f0f0;
+      background: var(--bg-gradient);
+      color: var(--text-main);
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
+      justify-content: flex-start;
+      min-height: 100vh;
       margin: 0;
-      padding: 20px;
-      font-family: sans-serif;
+      padding: 30px 20px;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      overflow-x: hidden;
     }
-    canvas {
-      border: 1px solid black;
-      display: block;
-      margin: 0 auto;
-      background-color: white;
-      box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+
+    header {
+      text-align: center;
+      margin-bottom: 24px;
+      animation: fadeIn 0.8s ease-out;
     }
-    button {
-      display: block;
-      margin: 10px auto;
-      padding: 10px 20px;
-      font-size: 16px;
-      cursor: pointer;
-      border: none;
-      background-color: #4CAF50;
-      color: white;
-      border-radius: 5px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-      transition: background-color: 0.3s;
+    
+    header h1 {
+      font-size: 2.2rem;
+      font-weight: 800;
+      margin: 0 0 8px 0;
+      background: linear-gradient(135deg, #a5b4fc, #6366f1, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.025em;
     }
-    button:hover {
-        background-color: #45a049;
+
+    header p {
+      color: var(--text-muted);
+      margin: 0;
+      font-size: 0.95rem;
     }
-    .controls {
+
+    .dashboard-container {
       display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      justify-content: center;
-      margin: 10px 0;
-    }
-    .controls button {
-      margin: 0;
-    }
-    #statusPanel {
+      flex-direction: column;
+      gap: 20px;
       width: min(1300px, 96vw);
-      background: #ffffff;
-      border: 1px solid #cccccc;
-      border-radius: 6px;
-      padding: 10px 12px;
-      margin-bottom: 10px;
+      margin-bottom: 20px;
+      animation: fadeIn 1s ease-out;
+    }
+
+    #statusPanel {
+      width: 100%;
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 16px 24px;
       box-sizing: border-box;
       font-size: 14px;
-      line-height: 1.45;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
     }
-    .statusRow {
+
+    .statusCard {
+      background: rgba(15, 23, 42, 0.4);
+      border: 1px solid rgba(255, 255, 255, 0.03);
+      border-radius: 10px;
+      padding: 12px 16px;
       display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
+      flex-direction: column;
+      gap: 6px;
+      position: relative;
+      overflow: hidden;
     }
+
+    .statusCard::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 0;
+      height: 100%;
+      width: 4px;
+      background: var(--primary);
+      border-radius: 4px 0 0 4px;
+    }
+
+    .statusCard.sim::before { background: var(--success); }
+    .statusCard.pretrain::before { background: var(--warning); }
+    .statusCard.rl::before { background: var(--info); }
+
     .statusLabel {
-      font-weight: 700;
-      color: #1f2937;
+      font-weight: 600;
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
     }
+
     .statusValue {
-      color: #111827;
+      color: var(--text-main);
+      font-weight: 600;
+      font-size: 1.05rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
+
     .statusValue.crash {
-      color: #b91c1c;
-      font-weight: 700;
+      color: #f43f5e;
+      text-shadow: 0 0 10px rgba(244, 63, 94, 0.3);
+      animation: pulseAlert 1.5s infinite;
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--text-muted);
+    }
+    
+    .status-dot.active {
+      background-color: var(--success);
+      box-shadow: 0 0 8px var(--success);
+      animation: pulseGreen 2s infinite;
+    }
+
+    .status-dot.idle {
+      background-color: var(--warning);
+      box-shadow: 0 0 8px var(--warning);
+    }
+
+    .status-dot.crash {
+      background-color: var(--danger);
+      box-shadow: 0 0 10px var(--danger);
+      animation: pulseRed 1s infinite;
+    }
+
+    .status-dot.info {
+      background-color: var(--info);
+      box-shadow: 0 0 8px var(--info);
+      animation: pulseBlue 2s infinite;
+    }
+
+    .canvas-wrapper {
+      position: relative;
+      border-radius: 16px;
+      padding: 6px;
+      background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(56, 189, 248, 0.15));
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      margin-bottom: 24px;
+      animation: fadeIn 1.2s ease-out;
+    }
+
+    canvas {
+      border: none;
+      display: block;
+      margin: 0 auto;
+      background-color: #111;
+      border-radius: 12px;
+    }
+
+    .controls-panel {
+      width: min(1300px, 96vw);
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      animation: fadeIn 1.4s ease-out;
+      box-sizing: border-box;
+    }
+
+    .controls-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .controls-divider {
+      height: 24px;
+      width: 1px;
+      background: rgba(255, 255, 255, 0.1);
+      margin: 0 10px;
+    }
+
+    button {
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      color: white;
+      border-radius: 8px;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background-color: rgba(255, 255, 255, 0.05);
+    }
+
+    button:hover {
+      background-color: rgba(255, 255, 255, 0.15);
+      transform: translateY(-1px);
+    }
+
+    .btn-reset {
+      background-color: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.1);
+    }
+    .btn-reset:hover {
+      background-color: rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-sim {
+      background-color: var(--primary);
+    }
+    .btn-sim:hover {
+      background-color: var(--primary-hover);
+      box-shadow: 0 0 12px rgba(99, 102, 241, 0.4);
+    }
+
+    .btn-train {
+      background-color: var(--warning);
+      color: #0f172a;
+    }
+    .btn-train:hover {
+      background-color: var(--warning-hover);
+      box-shadow: 0 0 12px rgba(245, 158, 11, 0.4);
+    }
+
+    .btn-rl {
+      background-color: var(--info);
+      color: #0f172a;
+    }
+    .btn-rl:hover {
+      background-color: var(--info-hover);
+      box-shadow: 0 0 12px rgba(6, 182, 212, 0.4);
+    }
+
+    .btn-mode {
+      background-color: rgba(255, 255, 255, 0.05);
+      border-color: rgba(255, 255, 255, 0.1);
+    }
+    .btn-mode:hover {
+      background-color: rgba(255, 255, 255, 0.15);
+    }
+    .btn-mode.active {
+      background-color: var(--accent);
+      border-color: var(--accent);
+      box-shadow: 0 0 10px rgba(139, 92, 246, 0.4);
+    }
+
+    /* Switch styling for Checkbox */
+    .switch-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-main);
+      cursor: pointer;
+      user-select: none;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      transition: all 0.2s;
+    }
+
+    .switch-container:hover {
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    .switch-input {
+      display: none;
+    }
+
+    .switch-slider {
+      position: relative;
+      display: inline-block;
+      width: 44px;
+      height: 22px;
+      background-color: rgba(255, 255, 255, 0.15);
+      border-radius: 34px;
+      transition: background-color 0.25s;
+    }
+
+    .switch-slider:before {
+      position: absolute;
+      content: "";
+      height: 16px;
+      width: 16px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      border-radius: 50%;
+      transition: transform 0.25s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    }
+
+    .switch-input:checked + .switch-slider {
+      background-color: var(--success);
+    }
+
+    .switch-input:checked + .switch-slider:before {
+      transform: translateX(22px);
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes pulseAlert {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    @keyframes pulseGreen {
+      0%, 100% { box-shadow: 0 0 4px var(--success); }
+      50% { box-shadow: 0 0 12px var(--success); }
+    }
+
+    @keyframes pulseRed {
+      0%, 100% { box-shadow: 0 0 4px var(--danger); }
+      50% { box-shadow: 0 0 14px var(--danger); }
+    }
+
+    @keyframes pulseBlue {
+      0%, 100% { box-shadow: 0 0 4px var(--info); }
+      50% { box-shadow: 0 0 12px var(--info); }
     }
   </style>
 </head>
 <body>
-  <div id="statusPanel">
-    <div class="statusRow"><span class="statusLabel">Controller:</span><span id="driverStatus" class="statusValue">Heuristics</span></div>
-    <div class="statusRow"><span class="statusLabel">Simulation:</span><span id="simStatus" class="statusValue">Running</span></div>
-    <div class="statusRow"><span class="statusLabel">Pre-Training:</span><span id="pretrainStatus" class="statusValue">Idle</span></div>
-    <div class="statusRow"><span class="statusLabel">RL:</span><span id="rlStatus" class="statusValue">Idle</span></div>
+  <header>
+    <h1>CityTraffic2D</h1>
+    <p>Autonomous Agent Multi-Lane Traffic Control Simulator</p>
+  </header>
+
+  <div class="dashboard-container">
+    <div id="statusPanel">
+      <div class="statusCard controller">
+        <span class="statusLabel">Controller</span>
+        <span class="statusValue">
+          <span id="driverStatusDot" class="status-dot info"></span>
+          <span id="driverStatus">Heuristics</span>
+        </span>
+      </div>
+      <div class="statusCard sim">
+        <span class="statusLabel">Simulation</span>
+        <span class="statusValue">
+          <span id="simStatusDot" class="status-dot active"></span>
+          <span id="simStatus">Running</span>
+        </span>
+      </div>
+      <div class="statusCard pretrain">
+        <span class="statusLabel">Pre-Training</span>
+        <span class="statusValue">
+          <span id="pretrainStatusDot" class="status-dot"></span>
+          <span id="pretrainStatus">Idle</span>
+        </span>
+      </div>
+      <div class="statusCard rl">
+        <span class="statusLabel">RL State</span>
+        <span class="statusValue">
+          <span id="rlStatusDot" class="status-dot"></span>
+          <span id="rlStatus">Idle</span>
+        </span>
+      </div>
+    </div>
   </div>
-  <canvas id="trafficCanvas" width="1300" height="900"></canvas>
-  <div class="controls">
-    <button onclick="resetSimulation()">Reset Simulation</button>
-    <button id="toggleSimulationButton" onclick="toggleSimulation()">Stop Simulation</button>
-    <button id="pretrainButton" onclick="togglePreTrain()">Pre-Train NN</button>
-    <button id="rlButton" onclick="toggleRL()">Start RL</button>
-    <button id="useNNButton" onclick="useNN()">Use NN</button>
-    <button id="useHeuristicsButton" onclick="useHeuristics()">Use Heuristics</button>
+
+  <div class="canvas-wrapper">
+    <canvas id="trafficCanvas" width="1300" height="900"></canvas>
+  </div>
+
+  <div class="controls-panel">
+    <div class="controls-group">
+      <!-- Sim Controls -->
+      <button class="btn-reset" onclick="resetSimulation()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+        Reset Simulation
+      </button>
+      <button id="toggleSimulationButton" class="btn-sim" onclick="toggleSimulation()">Stop Simulation</button>
+      
+      <div class="controls-divider"></div>
+      
+      <!-- Training controls -->
+      <button id="pretrainButton" class="btn-train" onclick="togglePreTrain()">Pre-Train NN</button>
+      <button id="rlButton" class="btn-rl" onclick="toggleRL()">Start RL</button>
+      
+      <div class="controls-divider"></div>
+      
+      <!-- Mode Selection -->
+      <button id="useNNButton" class="btn-mode" onclick="useNN()">Use NN</button>
+      <button id="useHeuristicsButton" class="btn-mode active" onclick="useHeuristics()">Use Heuristics</button>
+      
+      <div class="controls-divider"></div>
+
+      <!-- Stop on Crash Toggle -->
+      <label class="switch-container">
+        <input type="checkbox" id="stopOnCrashCheckbox" class="switch-input" checked onchange="PAUSE_ON_CRASH = this.checked">
+        <span class="switch-slider"></span>
+        <span>Stop on crash</span>
+      </label>
+    </div>
   </div>
 
 <script>
@@ -119,7 +468,7 @@
   const TARGET_COMMAND_SMOOTH_DOWN = 0.32;// blend rate when lowering speed target (still rate-capped)
   const STEERING_SMOOTHING_FACTOR = 0.1;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
-  const DEBUG_LOG = true; // Enabled for debugging
+  const DEBUG_LOG = false; // Enabled for debugging
   const LOG_CONFIG = {
     training: true,
     rl: true,
@@ -136,7 +485,7 @@
   // How many prior decision frames to keep per car for crash forensics.
   const CRASH_HISTORY_FRAMES = 45;
   // Automatically pause (same as Stop Simulation) when a crash is detected.
-  const PAUSE_ON_CRASH = true;
+  let PAUSE_ON_CRASH = true;
   const USE_INTUITIVE_TURN_SIGNAL = true;
   const BLINKER_CYCLE_MS = 500;
   const BLINKER_ON_MS = BLINKER_CYCLE_MS / 2;
@@ -153,7 +502,7 @@
   const INPUT_DIM = 48;
   const HIDDEN_DIM = 16;
   const OUTPUT_DIM = 2;
-  const PRETRAIN_TARGET_STEPS = 12000;
+  const PRETRAIN_TARGET_STEPS = 24000;
   const PRETRAIN_BATCH_SIZE = 24;
   const PRETRAIN_BATCHES_PER_FRAME = 8;
   const PRETRAIN_LR = 0.0025;
@@ -956,21 +1305,52 @@
     const simEl = document.getElementById('simStatus');
     const preEl = document.getElementById('pretrainStatus');
     const rlEl = document.getElementById('rlStatus');
+    
+    // Dot elements for status badges
+    const driverDot = document.getElementById('driverStatusDot');
+    const simDot = document.getElementById('simStatusDot');
+    const preDot = document.getElementById('pretrainStatusDot');
+    const rlDot = document.getElementById('rlStatusDot');
+
+    // Controller Mode buttons active styling
+    const useNNBtn = document.getElementById('useNNButton');
+    const useHeuristicsBtn = document.getElementById('useHeuristicsButton');
+    if (useNNBtn && useHeuristicsBtn) {
+      if (controllerMode === 'nn') {
+        useNNBtn.classList.add('active');
+        useHeuristicsBtn.classList.remove('active');
+      } else {
+        useNNBtn.classList.remove('active');
+        useHeuristicsBtn.classList.add('active');
+      }
+    }
+
     if (preBtn) preBtn.textContent = isPreTraining ? 'Stop Pre-Train' : 'Pre-Train NN';
     if (rlBtn) rlBtn.textContent = isRLRunning ? 'Stop RL' : 'Start RL';
-    if (driverEl) driverEl.textContent = controllerMode === 'nn' ? 'Neural Network' : 'Heuristics';
+    
+    if (driverEl) {
+      driverEl.textContent = controllerMode === 'nn' ? 'Neural Network' : 'Heuristics';
+      if (driverDot) {
+        driverDot.className = controllerMode === 'nn' ? 'status-dot active' : 'status-dot info';
+      }
+    }
+    
     if (simEl) {
       if (!isSimulationRunning && lastCrashPauseReason) {
         simEl.textContent = `PAUSED on crash (frame ${simFrame}) — Resume or Reset`;
         simEl.classList.add('crash');
+        if (simDot) simDot.className = 'status-dot crash';
       } else if (!isSimulationRunning) {
         simEl.textContent = 'Paused';
         simEl.classList.remove('crash');
+        if (simDot) simDot.className = 'status-dot idle';
       } else {
         simEl.textContent = `Running (frame ${simFrame})`;
         simEl.classList.remove('crash');
+        if (simDot) simDot.className = 'status-dot active';
       }
     }
+    
     if (preEl) {
       const pct = clamp((pretrainSteps / PRETRAIN_TARGET_STEPS) * 100, 0, 100);
       preEl.textContent = isPreTraining
@@ -978,14 +1358,30 @@
         : pretrainSteps >= PRETRAIN_TARGET_STEPS
           ? `Completed (${PRETRAIN_TARGET_STEPS} steps)`
           : `Idle (${pretrainSteps}/${PRETRAIN_TARGET_STEPS} prepared)`;
+      
+      if (preDot) {
+        if (isPreTraining) {
+          preDot.className = 'status-dot info';
+        } else if (pretrainSteps >= PRETRAIN_TARGET_STEPS) {
+          preDot.className = 'status-dot active';
+        } else {
+          preDot.className = 'status-dot';
+        }
+      }
     }
+    
     if (rlEl) {
       if (isRLRunning && controllerMode !== 'nn') {
         rlEl.textContent = `Running, waiting for NN control (${rlStepCount} updates)`;
+        if (rlDot) rlDot.className = 'status-dot idle';
       } else {
         rlEl.textContent = isRLRunning
           ? `Running (${rlStepCount} updates, reward EMA ${rlRewardEMA.toFixed(3)})`
           : `Idle (${rlStepCount} updates)`;
+        
+        if (rlDot) {
+          rlDot.className = isRLRunning ? 'status-dot active' : 'status-dot';
+        }
       }
     }
   }
@@ -1317,7 +1713,7 @@
 
   // Default properties for a car
   const CAR_DEFAULTS = {
-    maximumSpeed: 0.08,
+    maximumSpeed: 0.09,
     speed: 0.05,
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
