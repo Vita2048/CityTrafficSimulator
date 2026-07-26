@@ -444,7 +444,7 @@
 <script>
   const canvas = document.getElementById('trafficCanvas');
   const ctx = canvas.getContext('2d');
-  const ROAD_WIDTH = 80 * 1.5;
+  const ROAD_WIDTH = 90 * 1.5;
   const CAR_SCALE = 0.1 * 1.5;
   const CAR_LENGTH = 518 * CAR_SCALE;
   const WHEELBASE = (409 - 94) * CAR_SCALE;
@@ -467,7 +467,7 @@
   const TARGET_COMMAND_SMOOTH_DOWN = 0.32;// blend rate when lowering speed target (still rate-capped)
   const STEERING_SMOOTHING_FACTOR = 0.1;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
-  const DEBUG_LOG = false; // Enabled for debugging
+  const DEBUG_LOG = true; // Enabled for debugging
   const LOG_CONFIG = {
     training: true,
     rl: true,
@@ -493,6 +493,7 @@
   const GRIDLOCK_MIN_CARS = 2;    // Pair freezes at a junction count (was 3 — missed 2-car deadlocks)
   const GRIDLOCK_FORCE_FRAMES = 70; // Frames a chosen car may creep to break the standoff
   const TRAJECTORY_LOOKAHEAD_DISTANCE = 300; // Increased distance (in pixels) to check for future overlaps
+  const TRAJECTORY_OCCUPANCY_SAMPLES = 8; // Spatial samples used for Rule 2 swept-trajectory checks
   const AGGRESSIVE_DECELERATION_FACTOR = 1.55; // Mild boost when conflict is near (emergency path uses EMERGENCY_DECEL_FACTOR)
 
   // New tunable parameter for trajectory prediction
@@ -2020,21 +2021,36 @@ function checkTrajectoryIntersection(car, otherCar) {
     const myBox = getCarBoundingBox(car);
     const otherBox = getCarBoundingBox(otherCar);
 
-    // New: Full future-vs-future check
+    // Compare the swept occupancy of both trajectories, not just matching time
+    // samples.  Rule 2 is about two cars claiming the same future road space;
+    // cars with different speeds can arrive at that space in different samples.
+    // The old lock-step-only test missed that case, allowing a turning car to
+    // commit and discover the conflict only after it was already in the junction.
     if (myTrajectory.length > 0 && otherTrajectory.length > 0) {
-        const stepsToCompare = Math.min(myTrajectory.length, otherTrajectory.length);
-        for (let i = 0; i < stepsToCompare; i++) {
-            const myFutureState = myTrajectory[i];
-            const otherFutureState = otherTrajectory[i];
-
-            const myGhost = { x: myFutureState.x, y: myFutureState.y, heading: myFutureState.heading };
-            const otherGhost = { x: otherFutureState.x, y: otherFutureState.y, heading: otherFutureState.heading };
-
-            const myFutureBox = getCarBoundingBox(myGhost);
-            const otherFutureBox = getCarBoundingBox(otherGhost);
-
-            if (checkPolygonIntersection(myFutureBox, otherFutureBox)) {
-                return true; // Predicted future collision
+        // Eight well-spaced sprite boxes cover the 4-car-length look-ahead
+        // without turning the six-car simulation into a 40 x 40 SAT check for
+        // every ordered pair every frame.  Include the final state as well.
+        const sampleTrajectory = trajectory => {
+            const stride = Math.max(1, Math.ceil(trajectory.length / TRAJECTORY_OCCUPANCY_SAMPLES));
+            const samples = [];
+            for (let i = 0; i < trajectory.length; i += stride) samples.push(trajectory[i]);
+            const finalState = trajectory[trajectory.length - 1];
+            if (samples[samples.length - 1] !== finalState) samples.push(finalState);
+            return samples;
+        };
+        const otherFutureBoxes = sampleTrajectory(otherTrajectory).map(state =>
+            getCarBoundingBox({ x: state.x, y: state.y, heading: state.heading })
+        );
+        for (const myFutureState of sampleTrajectory(myTrajectory)) {
+            const myFutureBox = getCarBoundingBox({
+                x: myFutureState.x,
+                y: myFutureState.y,
+                heading: myFutureState.heading
+            });
+            for (const otherFutureBox of otherFutureBoxes) {
+                if (checkPolygonIntersection(myFutureBox, otherFutureBox)) {
+                    return true; // Both planned occupancies claim the same road space.
+                }
             }
         }
     }
@@ -2230,6 +2246,9 @@ function tryForceUnstick(cars, alreadyForced, label) {
     for (const c of ranked) {
       if (forced >= 2) break;
       if (c.forceUnstickFrames > 0) continue;
+      // A vertical car waiting to enter the ellipse is not a gridlock candidate:
+      // forcing it forward bypasses its Rule 2 stop line and can send it onto grass.
+      if (!c.isCommittedToTurn && hasPlannedVerticalExit(c)) continue;
       // Prefer cars that still have a small open gap; never force into near body/path occupancy.
       let minHit = Infinity;
       let nearest = null;
@@ -2398,6 +2417,14 @@ function getEllipseLookaheadPoint(car) {
       const atTop = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y < centerY;
       const atBottom = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y > centerY;
       if (atTop) {
+        // Yield decisions are made before path guidance.  Do not let guidance
+        // cross the stop line and silently commit a car that has been told to
+        // wait for Rule 2 traffic; it must remain on its ellipse approach until
+        // the conflicting trajectory has cleared.
+        if (!car.isCommittedToTurn && car.isYielding) {
+          const look = getEllipseLookaheadPoint(car);
+          return { targetX: look.targetX, targetY: look.targetY };
+        }
         car.path = 'vertical';
         car.verticalDirection = 'down';
         car.turnState = 'turning';
@@ -2405,6 +2432,10 @@ function getEllipseLookaheadPoint(car) {
         targetX = DOWNWARD_LANE_X;
         targetY = car.y + LOOK_AHEAD_DISTANCE;
       } else if (atBottom) {
+        if (!car.isCommittedToTurn && car.isYielding) {
+          const look = getEllipseLookaheadPoint(car);
+          return { targetX: look.targetX, targetY: look.targetY };
+        }
         car.path = 'vertical';
         car.verticalDirection = 'up';
         car.turnState = 'turning';
@@ -2423,7 +2454,7 @@ function getEllipseLookaheadPoint(car) {
 
       const laneCenter = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
       const headingErr = Math.abs(car.heading - (car.verticalDirection === 'up' ? -Math.PI / 2 : Math.PI / 2));
-      if (!car.isYielding && headingErr < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
+      if (headingErr < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
         car.turnState = null;
         car.isMakingTurn = false;
         car.canDecide = true;
@@ -2439,20 +2470,28 @@ function getEllipseLookaheadPoint(car) {
         car.y > centerY + ELLIPSE_B0 - rejoinWindow;
       const nearTopRejoin = car.verticalDirection === 'up' &&
         car.y < centerY - ELLIPSE_B0 + rejoinWindow;
-      if (nearBottomRejoin || nearTopRejoin) {
+      if ((nearBottomRejoin || nearTopRejoin) && car.isCommittedToTurn) {
+        if (!car.turnDirection || car.turnDirection === 'straight') {
+          car.turnDirection = car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left');
+        }
+        if (car.turnDirection === 'left') {
+          car.direction = -1;
+          car.a = ELLIPSE_A0 + ROAD_WIDTH / 4;
+          car.b = ELLIPSE_B0 + ROAD_WIDTH / 4;
+        } else if (car.turnDirection === 'right') {
+          car.direction = 1;
+          car.a = ELLIPSE_A0 - ROAD_WIDTH / 4;
+          car.b = ELLIPSE_B0 - ROAD_WIDTH / 4;
+        }
         // Always mark rejoining in the junction. If turnState were left as
         // 'approaching' after path flips to ellipse, the ellipse→vertical branch
         // above would fire and reverse the car 180° back down the vertical road.
         car.turnState = 'rejoining';
-        // Follow ellipse geometry once committed, or when prediction forces commitment
-        // for an already-planned left/right exit (see predictTrajectory).
-        if (car.isCommittedToTurn) {
-          car.path = 'ellipse';
-          car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-          const look = getEllipseLookaheadPoint(car);
-          targetX = look.targetX;
-          targetY = look.targetY;
-        }
+        car.path = 'ellipse';
+        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
+        const look = getEllipseLookaheadPoint(car);
+        targetX = look.targetX;
+        targetY = look.targetY;
       }
     } else {
       car.path = 'ellipse';
@@ -2598,6 +2637,7 @@ function getEllipseLookaheadPoint(car) {
     // planned path through the junction even if the live car has not yet crossed the
     // yield line (isCommittedToTurn). Commitment only gates live yield behavior.
     const plannedVerticalExit = hasPlannedVerticalExit(car);
+    const isVerticalCar = car.path === 'vertical';
 
     // Clone only kinematic + path state (avoid cloning arrays / policy history).
     const ghost = {
@@ -2617,10 +2657,10 @@ function getEllipseLookaheadPoint(car) {
       b: car.b,
       angle: car.angle,
       speed: car.speed,
-      isMakingTurn: car.isMakingTurn || plannedVerticalExit,
-      turnDirection: car.turnDirection,
-      turnState: car.turnState || (plannedVerticalExit ? 'approaching' : null),
-      isCommittedToTurn: car.isCommittedToTurn || plannedVerticalExit,
+      isMakingTurn: car.isMakingTurn || plannedVerticalExit || isVerticalCar,
+      turnDirection: car.turnDirection || (isVerticalCar ? (car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left')) : null),
+      turnState: car.turnState || (plannedVerticalExit || isVerticalCar ? 'approaching' : null),
+      isCommittedToTurn: car.isCommittedToTurn || plannedVerticalExit || isVerticalCar,
       canDecide: false,
       rejoinBuffer: car.rejoinBuffer,
       // Prediction follows planned path geometry; do not freeze for yield stops.
@@ -2848,10 +2888,11 @@ function getEllipseLookaheadPoint(car) {
         }
     }
     else if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical') ||
-             hasPlannedVerticalExit(car)) {
-        if (car.turnDirection === 'left') {
+             hasPlannedVerticalExit(car) || car.path === 'vertical') {
+        const effectiveTurnDir = car.turnDirection || (car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left'));
+        if (effectiveTurnDir === 'left') {
             turnType = 'vertical-to-ellipse-left';
-        } else if (car.turnDirection === 'right') {
+        } else if (effectiveTurnDir === 'right') {
             turnType = 'vertical-to-ellipse-right';
         }
     }
@@ -3209,7 +3250,8 @@ function updateCar(car) {
 
     // Don't wait forever for a partner that is itself fully stuck and not on our body.
     // (Following/queue still respects a stopped lead ahead — that is real traffic.)
-    if (mustYield && reason !== 'following' && otherCar.currentSpeedFactor < 0.05) {
+    if (mustYield && reason !== 'following' && reason !== 'rejoin-yield-to-main-road' &&
+        otherCar.currentSpeedFactor < 0.05) {
       const otherStuckMs = otherCar.stoppedSince ? (performance.now() - otherCar.stoppedSince) : 0;
       const hitToOther = getStaticOccupancyHitDistance(car, otherCar);
       if (otherStuckMs > GRIDLOCK_STUCK_MS * 0.6 &&
@@ -3502,7 +3544,10 @@ function updateCar(car) {
   if (car.forceUnstickFrames > 0) {
     const bodyBlocked = Number.isFinite(defensiveHitDist) && defensiveHitDist <= CAR_LENGTH * 0.75;
     const leadBlocked = hasFollowingConflict && Number.isFinite(leadGapPx) && leadGapPx < CAR_LENGTH * 0.55;
-    if (bodyBlocked || leadBlocked) {
+    const protectedYield =
+      (!car.isCommittedToTurn && hasPlannedVerticalExit(car)) ||
+      (car.turnState === 'rejoining' && hadPriorityConflict);
+    if (bodyBlocked || leadBlocked || protectedYield) {
       // Abort unstick: we are about to hit something real.
       car.forceUnstickFrames = 0;
       shouldStop = true;
@@ -3588,9 +3633,6 @@ function updateCar(car) {
   } else if (isOnVerticalSegment) {
     if (isApproachingVerticalCrossroad || (car.turnState === 'approaching' || car.turnState === 'rejoining')) {
       turnRadius = car.b;
-      if (!car.isCommittedToTurn && hasPlannedVerticalExit(car) && distToVerticalJunction <= ROAD_WIDTH) {
-        car.turnState = 'rejoining';
-      }
     } else {
       turnRadius = Number.MAX_VALUE;
     }
