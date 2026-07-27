@@ -2101,6 +2101,14 @@ function hasMainRoadPriorityOver(car, other) {
     // Free ellipse traffic outranks vertical / rejoin (Rules 2.1 vs 2.2).
     if (carOnMain && !otherOnMain) return true;
     if (!carOnMain && otherOnMain) return false;
+    // Free through traffic on the ellipse outranks uncommitted ellipse→vertical exits
+    // (Rule 2.2: the exiting car yields; the through car keeps ROW — Car6 vs Car1 bug).
+    const carFreeThrough = carOnMain && !isEllipseToVerticalManeuver(car);
+    const otherFreeThrough = otherOnMain && !isEllipseToVerticalManeuver(other);
+    const carUncommittedExit = isEllipseToVerticalManeuver(car) && !car.isCommittedToTurn;
+    const otherUncommittedExit = isEllipseToVerticalManeuver(other) && !other.isCommittedToTurn;
+    if (carFreeThrough && otherUncommittedExit) return true;
+    if (otherFreeThrough && carUncommittedExit) return false;
     // Car already committed into the junction outranks cars still waiting to enter.
     if (car.isCommittedToTurn && !other.isCommittedToTurn) return true;
     if (!car.isCommittedToTurn && other.isCommittedToTurn) return false;
@@ -2109,6 +2117,33 @@ function hasMainRoadPriorityOver(car, other) {
     // Rejoin always yields to established ellipse traffic.
     if (!carIsRejoining && otherIsRejoining) return true;
     if (carIsRejoining && !otherIsRejoining) return false;
+    return false;
+}
+
+/**
+ * True when an uncommitted ellipse→vertical LEFT turn must yield to `other`
+ * under Rule 2.2.1 (opposite-direction elliptical traffic).
+ * Right turns do not use this helper (they only yield to vertical crossroad traffic).
+ */
+function isHigherPriorityEllipseCrossTraffic(car, other) {
+    if (!other) return false;
+    // Free through traffic on the ellipse always outranks an uncommitted exit.
+    const otherIsRejoining = other.turnState === 'rejoining' ||
+      (other.path === 'ellipse' && other.verticalDirection !== null);
+    const otherFreeThrough =
+      other.path === 'ellipse' &&
+      !otherIsRejoining &&
+      !isEllipseToVerticalManeuver(other);
+    if (otherFreeThrough) return true;
+    // Rule 2.2.1: left exit yields to opposite direction on the elliptical road
+    // (free through, right-turn waiters, and cars already mid-turn / rejoining).
+    const opposite =
+      (car.direction === 1 && other.direction === -1) ||
+      (car.direction === -1 && other.direction === 1);
+    if (!opposite) return false;
+    if (other.path === 'ellipse') return true;
+    if (other.path === 'vertical' && other.turnState === 'turning') return true;
+    if (otherIsRejoining) return true;
     return false;
 }
 
@@ -3211,17 +3246,12 @@ function updateCar(car) {
         /* 2.2.1 ellipse → vertical left yields to opposite on ellipse.
            Only fires BEFORE commitment — once committed and mid-turn on the
            vertical road the car must complete its turn; keeping it yielded
-           blocks the junction and creates deadlocks (Car1-vs-Car6 crash). */
+           blocks the junction and creates deadlocks (Car1-vs-Car6 crash).
+           Skip peer uncommitted opposite exits to avoid mutual freezes. */
         const isEllipseToVerticalLeft = car.turnDirection === 'left' && carEllipseToVertical;
 
         if (isEllipseToVerticalLeft && !car.isCommittedToTurn) {
-            const isOppositeDirection = (car.direction === 1 && otherCar.direction === -1) ||
-                                        (car.direction === -1 && otherCar.direction === 1);
-            const isOtherOnEllipse = otherCar.path === 'ellipse' ||
-                                     (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
-                                     otherCar.turnState === 'rejoining';
-
-            if (isOppositeDirection && isOtherOnEllipse) {
+            if (isHigherPriorityEllipseCrossTraffic(car, otherCar)) {
                 mustYield = true;
                 reason = 'ellipse-left-yield-to-opposite';
                 yieldRule_2_2_1 = true;
@@ -3233,20 +3263,25 @@ function updateCar(car) {
         /* 2.2.2 ellipse → vertical right yields to cars navigating vertical crossroad
            (and left turns: yield to anyone still exchanging vertical↔ellipse with overlap). */
         const isEllipseToVerticalRight = car.turnDirection === 'right' && carEllipseToVertical;
-        if (carEllipseToVertical) {
+        if (carEllipseToVertical && !car.isCommittedToTurn) {
           const otherExchanging = isNavigatingVerticalEllipseExchange(otherCar);
+          // Peer uncommitted ellipse→vertical is NOT "navigating the vertical crossroad" yet.
+          const otherPeerUncommittedExit =
+            isEllipseToVerticalManeuver(otherCar) && !otherCar.isCommittedToTurn;
           const hitEx = getStaticOccupancyHitDistance(car, otherCar);
           const exchangeNear = Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 2.5;
           // Right turn (2.2.2): yield to cars on the vertical that are actually in the
-          // crossroad box or actively exchanging — not every distant vertical car.
-          // Include stopped cars when our path hits them or they occupy the box:
-          // requiring speed>0.03 made us ignore a stopped mid-turn car and rear-end it.
+          // crossroad box or actively exchanging — not every distant vertical car,
+          // and not a peer still waiting on the ellipse (Car6 must not wait for Car1).
           const rightConflict = isEllipseToVerticalRight && otherCar.path === 'vertical' &&
+            !otherPeerUncommittedExit &&
             (isCarInCrossroadArea(otherCar) || otherExchanging) &&
             (otherCar.currentSpeedFactor > 0.03 || exchangeNear ||
               (Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 1.5));
           // Left / either: wait for active vertical↔ellipse exchange with real motion or near body.
+          // Do not treat peer uncommitted ellipse exits as exchange traffic.
           const exchangeConflict = otherExchanging &&
+            !otherPeerUncommittedExit &&
             !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
             (otherCar.currentSpeedFactor > 0.04 || exchangeNear);
 
@@ -3267,22 +3302,24 @@ function updateCar(car) {
           }
         }
 
-        /* Catch-all: ellipse→vertical turn with trajectory overlap that no specific
-           Rule 2.2.x sub-rule matched. Only before commitment so we don't block
-           the junction mid-turn. Handles same-direction conflicts (e.g. CCW left
-           turn vs CCW straight traffic) not covered by Rule 2.2.1's opposite-
-           direction check. */
+        /* Catch-all: ellipse→vertical vs SAME-DIRECTION free through traffic only.
+           Previous broad catch-all yielded to every overlapping ellipse car, so a
+           right-turn with ROW (Car6) froze for an opposite left-turn (Car1). */
         if (carEllipseToVertical && !car.isCommittedToTurn && !mustYield) {
-          const isOtherOnEllipseGeneral = otherCar.path === 'ellipse' ||
-                                          (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
-                                          otherCar.turnState === 'rejoining';
-          if (isOtherOnEllipseGeneral && !shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+          const otherIsRejoining = otherCar.turnState === 'rejoining' ||
+            (otherCar.path === 'ellipse' && otherCar.verticalDirection !== null);
+          const otherFreeSameDir =
+            otherCar.path === 'ellipse' &&
+            !otherIsRejoining &&
+            otherCar.direction === car.direction &&
+            !isEllipseToVerticalManeuver(otherCar);
+          if (otherFreeSameDir) {
             mustYield = true;
-            reason = 'ellipse-to-vertical-trajectory-overlap';
+            reason = 'ellipse-to-vertical-same-dir-through';
             yieldRule_2_2_1 = true;
             yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
-              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical catch-all trajectory overlap`);
+              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical vs same-dir through traffic`);
             }
           }
         }
@@ -3302,6 +3339,17 @@ function updateCar(car) {
         mustYield = false;
         reason = null;
       }
+    }
+
+    // ROW safety net: never priority-yield to an uncommitted ellipse→vertical peer when
+    // we outrank them (free through or higher-priority main-road actor). Prevents Car6
+    // with right-of-way from freezing while Car1 waits/turns at the opposite approach.
+    if (mustYield && reason !== 'following' &&
+        isEllipseToVerticalManeuver(otherCar) && !otherCar.isCommittedToTurn &&
+        hasMainRoadPriorityOver(car, otherCar) &&
+        !checkPolygonIntersection(getCarBoundingBox(car), getCarBoundingBox(otherCar))) {
+      mustYield = false;
+      reason = null;
     }
 
     // Don't wait forever for a partner that is itself fully stuck and not on our body.
@@ -3436,6 +3484,12 @@ function updateCar(car) {
     defensiveBrake = true;
     const otherStopped = defensiveOther.currentSpeedFactor < 0.06;
     const iHavePriority = hasMainRoadPriorityOver(car, defensiveOther);
+    const otherUncommittedExit =
+      isEllipseToVerticalManeuver(defensiveOther) && !defensiveOther.isCommittedToTurn;
+    // ROW car facing an uncommitted ellipse exit that must yield to us: only hard-brake
+    // on near body contact. Otherwise we "wait for a bit" despite having right of way
+    // (Car6 free/right-turn vs Car1 left-turn at bottom junction).
+    const softPriorityVsYielder = iHavePriority && otherUncommittedExit;
     const buffer = CAR_LENGTH * 0.55;
     const stopDist = Math.max(0.001, defensiveHitDist - buffer);
     const maxDefVel = Math.sqrt(2 * MAX_ACCELERATION * stopDist);
@@ -3443,7 +3497,16 @@ function updateCar(car) {
 
     // NEVER allow a speed floor when close — Car6 creeps at 0.15 into stopped Car1 was a crash.
     // Priority only permits a gentle creep when the obstacle is still well ahead.
-    if (defensiveHitDist <= CAR_LENGTH * 1.25) {
+    if (defensiveHitDist <= CAR_LENGTH * 0.65) {
+      // True near-miss / body-path conflict: always hard stop.
+      collisionSlowdown = 0;
+      needsAggressive = 1;
+      shouldStop = true;
+    } else if (softPriorityVsYielder) {
+      // Keep moving with a kinematic cap; do not freeze for a yielder still on the ellipse.
+      collisionSlowdown = Math.min(collisionSlowdown, Math.max(0.35, maxDefFactor));
+      needsAggressive = Math.max(needsAggressive, 0.35);
+    } else if (defensiveHitDist <= CAR_LENGTH * 1.25) {
       collisionSlowdown = 0;
       needsAggressive = 1;
       shouldStop = true;
