@@ -2249,6 +2249,24 @@ function tryForceUnstick(cars, alreadyForced, label) {
       // A vertical car waiting to enter the ellipse is not a gridlock candidate:
       // forcing it forward bypasses its Rule 2 stop line and can send it onto grass.
       if (!c.isCommittedToTurn && hasPlannedVerticalExit(c)) continue;
+      // Side-road / rejoin still claiming crossroad space against live main-road trajectories
+      // must not be force-crept through the stop line (Car6 vs Car5 yield violation).
+      if (hasPlannedVerticalExit(c) || c.turnState === 'rejoining') {
+        let hasMainRoadTrajectoryConflict = false;
+        for (const o of [car1, car2, car3, car4, car5, car6]) {
+          if (o === c) continue;
+          const oRejoining = o.turnState === 'rejoining' ||
+            (o.path === 'ellipse' && o.verticalDirection !== null);
+          const oMain = (o.path === 'ellipse' && !oRejoining) || isEllipseToVerticalManeuver(o);
+          if (!oMain) continue;
+          if (shouldSkipYieldForDivergingManeuver(c, o)) continue;
+          if (checkTrajectoryIntersection(c, o)) {
+            hasMainRoadTrajectoryConflict = true;
+            break;
+          }
+        }
+        if (hasMainRoadTrajectoryConflict) continue;
+      }
       // Prefer cars that still have a small open gap; never force into near body/path occupancy.
       let minHit = Infinity;
       let nearest = null;
@@ -3104,7 +3122,13 @@ function updateCar(car) {
 
           // Rule 2.1.1: yield to CW ellipse traffic. Do not wait for an ellipse car that is
           // turning left onto the vertical (complementary, non-conflicting with a right exit).
-          if (otherCar.path === 'ellipse' && otherCar.direction === 1) {
+          // Also treat mid ellipse→vertical cars (path already flipped) as elliptical traffic —
+          // they still occupy the crossroad the side road must not enter.
+          const otherIsEllipseTraffic =
+            otherCar.path === 'ellipse' ||
+            (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
+            isEllipseToVerticalManeuver(otherCar);
+          if (otherIsEllipseTraffic && otherCar.direction === 1) {
             if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
               mustYield = true;
               reason    = 'intersection-vertical-right';
@@ -3116,10 +3140,20 @@ function updateCar(car) {
             }
           }
         }
-        /* 2.1.2  vertical → ellipse left  */
-        else if (car.turnDirection === 'left' && car.turnState !== 'turning' && !car.isCommittedToTurn) {
-          if (otherCar.path === 'ellipse') {
-            // Yield to through traffic either way; skip only complementary ellipse→vertical exits.
+        /* 2.1.2  vertical → ellipse left
+           Side-road left exit yields to elliptical traffic in either direction (Rules.txt 2.1.2).
+           Require path===vertical so main-road left turns do not accidentally enter this branch. */
+        else if (car.path === 'vertical' &&
+                 car.turnDirection === 'left' &&
+                 car.turnState !== 'turning' &&
+                 !car.isCommittedToTurn) {
+          // Ellipse cars, mid ellipse→vertical entries, and same-junction exchange traffic.
+          const otherIsEllipseOrExchange =
+            otherCar.path === 'ellipse' ||
+            (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
+            isEllipseToVerticalManeuver(otherCar);
+          if (otherIsEllipseOrExchange) {
+            // Yield to through / exchange traffic either way; skip only complementary exits.
             if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
               mustYield = true;
               reason    = 'intersection-vertical-left';
@@ -3174,11 +3208,13 @@ function updateCar(car) {
             }
         }
 
-        /* 2.2.1 ellipse → vertical left yields to opposite on ellipse
-           (also while committed/mid-turn — do not cut off opposing stream). */
+        /* 2.2.1 ellipse → vertical left yields to opposite on ellipse.
+           Only fires BEFORE commitment — once committed and mid-turn on the
+           vertical road the car must complete its turn; keeping it yielded
+           blocks the junction and creates deadlocks (Car1-vs-Car6 crash). */
         const isEllipseToVerticalLeft = car.turnDirection === 'left' && carEllipseToVertical;
 
-        if (isEllipseToVerticalLeft) {
+        if (isEllipseToVerticalLeft && !car.isCommittedToTurn) {
             const isOppositeDirection = (car.direction === 1 && otherCar.direction === -1) ||
                                         (car.direction === -1 && otherCar.direction === 1);
             const isOtherOnEllipse = otherCar.path === 'ellipse' ||
@@ -3230,6 +3266,26 @@ function updateCar(car) {
             }
           }
         }
+
+        /* Catch-all: ellipse→vertical turn with trajectory overlap that no specific
+           Rule 2.2.x sub-rule matched. Only before commitment so we don't block
+           the junction mid-turn. Handles same-direction conflicts (e.g. CCW left
+           turn vs CCW straight traffic) not covered by Rule 2.2.1's opposite-
+           direction check. */
+        if (carEllipseToVertical && !car.isCommittedToTurn && !mustYield) {
+          const isOtherOnEllipseGeneral = otherCar.path === 'ellipse' ||
+                                          (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
+                                          otherCar.turnState === 'rejoining';
+          if (isOtherOnEllipseGeneral && !shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+            mustYield = true;
+            reason = 'ellipse-to-vertical-trajectory-overlap';
+            yieldRule_2_2_1 = true;
+            yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
+            if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
+              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical catch-all trajectory overlap`);
+            }
+          }
+        }
       }
     }
 
@@ -3250,12 +3306,22 @@ function updateCar(car) {
 
     // Don't wait forever for a partner that is itself fully stuck and not on our body.
     // (Following/queue still respects a stopped lead ahead — that is real traffic.)
+    // NEVER drop a side-road / rejoin yield while future trajectories still claim the same
+    // crossroad space — that is exactly the Car6-at-stop-line vs Car5 failure mode:
+    // car5 may be nearly stopped for its own yield while its planned path still crosses ours.
     if (mustYield && reason !== 'following' && reason !== 'rejoin-yield-to-main-road' &&
         otherCar.currentSpeedFactor < 0.05) {
       const otherStuckMs = otherCar.stoppedSince ? (performance.now() - otherCar.stoppedSince) : 0;
       const hitToOther = getStaticOccupancyHitDistance(car, otherCar);
+      const stillTrajectoryConflict = checkTrajectoryIntersection(car, otherCar);
+      const isSideRoadPriorityYield =
+        reason === 'intersection-vertical-left' ||
+        reason === 'intersection-vertical-right' ||
+        reason === 'rejoin-yield-to-main-road';
       if (otherStuckMs > GRIDLOCK_STUCK_MS * 0.6 &&
-          (!Number.isFinite(hitToOther) || hitToOther > CAR_LENGTH * 1.05)) {
+          (!Number.isFinite(hitToOther) || hitToOther > CAR_LENGTH * 1.05) &&
+          !stillTrajectoryConflict &&
+          !isSideRoadPriorityYield) {
         mustYield = false;
         reason = null;
       }
@@ -3425,6 +3491,20 @@ function updateCar(car) {
     }
   }
 
+  // When a priority (Rule 2) yield is active before the stop line, cap speed by distance
+  // to the stop line — not only by Euclidean distance to the conflicting car. Otherwise a
+  // far-but-conflicting ellipse car lets the side-road car roll through the stop line.
+  if (shouldStop && hadPriorityConflict && !car.isCommittedToTurn &&
+      Number.isFinite(signedDistToYieldLine) && signedDistToYieldLine > 0) {
+    const maxLineVel = Math.sqrt(2 * MAX_ACCELERATION * signedDistToYieldLine);
+    const maxLineFactor = maxLineVel / Math.max(0.001, car.maximumSpeed * 50);
+    collisionSlowdown = Math.min(collisionSlowdown, maxLineFactor);
+    if (signedDistToYieldLine <= RULE6_STOP_LINE_TOLERANCE) {
+      collisionSlowdown = 0;
+      needsAggressive = 1;
+    }
+  }
+
   car.isYielding = shouldStop;
   if (car.isYielding) {
     if (!car.yieldStartTime) car.yieldStartTime = performance.now();
@@ -3466,20 +3546,33 @@ function updateCar(car) {
              (car.verticalDirection === 'down' && frontBumperY > yieldLineBottom);
     }
     if (past && !shouldStop && car.currentSpeedFactor > 0.01) {
-      // Gap acceptance: block commit only on real trajectory conflict with active main-road cars.
-      // (Removed the blanket opposite-direction distance gate that permanently stuck left rejoins.)
+      // Gap acceptance: block commit on real trajectory conflict with main-road cars.
+      // Side-road (vertical→ellipse) must also respect nearly-stopped ellipse traffic whose
+      // planned path still crosses the junction — ignoring speed<0.04 let Car6 commit past
+      // the stop line while Car5 was slow/yielding with an overlapping trajectory.
       let entryBlocked = false;
       const needsGapCheck =
         car.isMakingTurn &&
         (car.path === 'vertical' || car.path === 'ellipse') &&
         (car.turnDirection === 'left' || car.turnDirection === 'right');
+      const isSideRoadEntry = car.path === 'vertical' &&
+        (car.turnDirection === 'left' || car.turnDirection === 'right') &&
+        car.turnState !== 'turning';
       if (needsGapCheck) {
         for (const otherCar of allCars) {
           if (otherCar === car) continue;
           const otherIsRejoining = otherCar.turnState === 'rejoining' ||
             (otherCar.path === 'ellipse' && otherCar.verticalDirection !== null);
-          if (otherCar.path !== 'ellipse' || otherIsRejoining) continue;
-          if (otherCar.currentSpeedFactor < 0.04) continue; // ignore fully stopped traffic for gap
+          // Main-road / exchange actors the side road must not cut off.
+          const otherIsMainOrExchange =
+            (otherCar.path === 'ellipse' && !otherIsRejoining) ||
+            isEllipseToVerticalManeuver(otherCar) ||
+            (otherCar.path === 'vertical' && otherCar.turnState === 'turning');
+          if (!otherIsMainOrExchange) continue;
+          // Ellipse→vertical entries may ignore a fully frozen distant yielder to avoid
+          // permanent main-road freezes; side-road entries must always honor trajectory overlap.
+          if (!isSideRoadEntry && otherCar.currentSpeedFactor < 0.04) continue;
+          if (shouldSkipYieldForDivergingManeuver(car, otherCar)) continue;
           if (checkTrajectoryIntersection(car, otherCar)) {
             entryBlocked = true;
             break;
@@ -3780,7 +3873,17 @@ function updateCar(car) {
   const decelStep = (MAX_ACCELERATION * decelFactor) / maxSpeedPx;
 
   let desiredFactor = targetFactor;
-  if (controllerMode !== 'nn' && ((isAtYieldLine && shouldStop) || collisionSlowdown <= 0.001)) {
+  // Hard-hold stop: at/past the yield line while yielding, or already commanded full stop.
+  // Also hold when a priority yield is active and the front bumper is within stop-line
+  // tolerance — prevents a single overshoot frame from committing through a Rule 2 conflict.
+  const nearStopLineForHold =
+    shouldStop &&
+    hadPriorityConflict &&
+    !car.isCommittedToTurn &&
+    Number.isFinite(signedDistToYieldLine) &&
+    signedDistToYieldLine <= RULE6_STOP_LINE_TOLERANCE;
+  if (controllerMode !== 'nn' &&
+      ((isAtYieldLine && shouldStop) || nearStopLineForHold || collisionSlowdown <= 0.001)) {
     desiredFactor = 0;
   }
   desiredFactor = clamp(desiredFactor, 0, 1);
