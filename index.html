@@ -169,6 +169,7 @@
 
     .canvas-wrapper {
       position: relative;
+      width: min(1300px, 96vw);
       border-radius: 16px;
       padding: 6px;
       background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(56, 189, 248, 0.15));
@@ -184,6 +185,9 @@
       margin: 0 auto;
       background-color: #111;
       border-radius: 12px;
+      width: min(1300px, 96vw, calc((100vh - 48px) * 13 / 9));
+      height: auto;
+      aspect-ratio: 13 / 9;
     }
 
     .controls-panel {
@@ -441,9 +445,13 @@
     </div>
   </div>
 
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>
   const canvas = document.getElementById('trafficCanvas');
-  const ctx = canvas.getContext('2d');
+  // The simulation continues to use its original pixel coordinate system.  The
+  // renderer maps that plane directly into an orthographic Three.js scene.
+  let ctx = null;
   const ROAD_WIDTH = 90 * 1.5;
   const CAR_SCALE = 0.1 * 1.5;
   const CAR_LENGTH = 518 * CAR_SCALE;
@@ -1877,49 +1885,296 @@ function resetSimulation() {
     refreshStatusPanel();
     gameLoop();
   }
-  const spriteSheet = new Image();
-  spriteSheet.src = 'https://vita2048.github.io/CityTrafficSimulator/CarSpritesheetLights.png';
-
   let animationFrameId = null;
   let isSimulationRunning = true;
 
-  function drawBackground() {
-    ctx.fillStyle = 'rgb(20, 140, 20)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // --- Three.js rendering -------------------------------------------------
+  // One world unit is one original canvas pixel.  This lets the simulation,
+  // collision geometry and controller remain entirely unchanged.
+  let threeRenderer, threeScene, threeCamera, carTemplate;
+  const threeCars = new Map();
+  const trajectoryMeshes = new Map();
+  const TRAJECTORY_VISUAL_SAMPLES = 40;
+  const SIMULATION_VIEW_HEIGHT = 900;
+  const CAMERA_TILT_RADIANS = THREE.MathUtils.degToRad(20);
+  // The GLB is 4.1055 units long; match it to the existing collision/render length.
+  const CAR_MODEL_SCALE = CAR_LENGTH / 4.1055;
+  // Inferred from the GLB's named front/rear indicators once it is loaded.
+  let modelForwardYaw = -Math.PI / 2;
+
+  function worldX(x) { return x - centerX; }
+  function worldZ(y) { return y - centerY; }
+
+  function makeRoadRing() {
+    const outerA = 560 + ROAD_WIDTH / 2;
+    const outerB = 360 + ROAD_WIDTH / 2;
+    const innerA = 560 - ROAD_WIDTH / 2;
+    const innerB = 360 - ROAD_WIDTH / 2;
+    const shape = new THREE.Shape();
+    shape.absellipse(0, 0, outerA, outerB, 0, Math.PI * 2, false, 0);
+    const hole = new THREE.Path();
+    hole.absellipse(0, 0, innerA, innerB, 0, Math.PI * 2, true, 0);
+    shape.holes.push(hole);
+    const roadMat = new THREE.MeshStandardMaterial({
+    color: 0x050608,
+    roughness: 0.96,
+    metalness: 0.01,
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -1
+  });
+    const road = new THREE.Mesh(
+      new THREE.ShapeGeometry(shape, 96),
+      roadMat
+    );
+    road.rotation.x = -Math.PI / 2;
+    // Keep every visible surface on a distinct height.  The old overlap with
+    // the trajectory planes caused the asphalt to cover them (and flicker at
+    // the ring/vertical-road joins).
+    road.position.y = 0.01;
+    road.receiveShadow = true;
+    threeScene.add(road);
+
+    const verticalRoad = new THREE.Mesh(
+      new THREE.BoxGeometry(ROAD_WIDTH, 0.012, 720),
+      roadMat.clone()
+    );
+    verticalRoad.position.set(0, 0.006, -50);
+    verticalRoad.receiveShadow = true;
+    threeScene.add(verticalRoad);
   }
 
-  function drawRoad() {
-    ctx.strokeStyle = '#666';
-    ctx.fillStyle = '#666';
-    ctx.lineWidth = ROAD_WIDTH;
-    ctx.beginPath();
-    ctx.ellipse(centerX, centerY, 560, 360, 0, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(centerX, 40);
-    ctx.lineTo(centerX, 760);
-    ctx.stroke();
+  function addRoadMarkings() {
+    const dashMaterial = new THREE.MeshBasicMaterial({ color: 0xf8fafc, depthTest: false });
+    const dashGeometry = new THREE.BoxGeometry(16, 0.008, 2.5);
+    for (let i = 0; i < 96; i++) {
+      const t = (i / 96) * Math.PI * 2;
+      const dash = new THREE.Mesh(dashGeometry, dashMaterial);
+      dash.position.set(560 * Math.cos(t), 0.035, 360 * Math.sin(t));
+      dash.rotation.y = -Math.atan2(360 * Math.cos(t), -560 * Math.sin(t));
+      dash.renderOrder = 2;
+      threeScene.add(dash);
+    }
+    // The vertical centerline belongs only to the side road.  Stop it at the
+    // inner edge of the ellipse so it never appears on the upper/lower ring.
+    const verticalRoadConnectionZ = 360 - ROAD_WIDTH / 2;
+    const verticalDashInset = 22.5;
+    for (let z = -verticalRoadConnectionZ + verticalDashInset;
+         z <= verticalRoadConnectionZ - verticalDashInset;
+         z += 30) {
+      const dash = new THREE.Mesh(dashGeometry, dashMaterial);
+      dash.position.set(0, 0.035, z);
+      dash.rotation.y = Math.PI / 2;
+      dash.renderOrder = 2;
+      threeScene.add(dash);
+    }
   }
 
-  function drawDashedEllipse(x, y, a, b) {
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([15, 15]);
-    ctx.beginPath();
-    ctx.ellipse(x, y, a, b, 0, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.setLineDash([]);
+  function configureLightMesh(object) {
+    const materials = [];
+    object.traverse(child => {
+      if (!child.isMesh) return;
+      child.material = Array.isArray(child.material)
+        ? child.material.map(material => material.clone())
+        : child.material.clone();
+      const meshMaterials = Array.isArray(child.material) ? child.material : [child.material];
+      materials.push(...meshMaterials);
+    });
+    return materials;
   }
 
-  function drawDashedLine(x1, y1, x2, y2) {
-    ctx.strokeStyle = 'white';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([15, 15]);
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x2, y2);
-    ctx.stroke();
-    ctx.setLineDash([]);
+  function inferModelForwardYaw(root) {
+    const frontLeft = root.getObjectByName('TurnSignal_FL');
+    const frontRight = root.getObjectByName('TurnSignal_FR');
+    const rearLeft = root.getObjectByName('TurnSignal_RL');
+    const rearRight = root.getObjectByName('TurnSignal_RR');
+    if (!frontLeft || !frontRight || !rearLeft || !rearRight) return modelForwardYaw;
+    root.updateMatrixWorld(true);
+    const front = new THREE.Vector3()
+      .add(frontLeft.getWorldPosition(new THREE.Vector3()))
+      .add(frontRight.getWorldPosition(new THREE.Vector3()))
+      .multiplyScalar(0.5);
+    const rear = new THREE.Vector3()
+      .add(rearLeft.getWorldPosition(new THREE.Vector3()))
+      .add(rearRight.getWorldPosition(new THREE.Vector3()))
+      .multiplyScalar(0.5);
+    return Math.atan2(front.z - rear.z, front.x - rear.x);
+  }
+
+  function buildCarVisual(car) {
+    if (!carTemplate) return null;
+    // Rotate a clean wrapper, not the GLB root: the GLB root already contains
+    // import rotations and cannot be safely yawed by editing its Euler values.
+    const visual = new THREE.Group();
+    const model = carTemplate.clone(true);
+    model.scale.setScalar(CAR_MODEL_SCALE);
+    visual.add(model);
+    model.traverse(child => { if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; } });
+    const lights = { brake: [], left: [], right: [] };
+    const namedLights = {
+      brake: ['BrakeLight_L', 'BrakeLight_R'],
+      left: ['TurnSignal_FL', 'TurnSignal_RL'],
+      right: ['TurnSignal_FR', 'TurnSignal_RR']
+    };
+    for (const [kind, names] of Object.entries(namedLights)) {
+      for (const name of names) {
+        const object = visual.getObjectByName(name);
+        if (object) lights[kind].push(...configureLightMesh(object));
+        else console.warn(`Car model light mesh not found: ${name}`);
+      }
+    }
+    visual.userData.lights = lights;
+    visual.userData.lastSpeedFactor = car.currentSpeedFactor;
+    threeScene.add(visual);
+    threeCars.set(car, visual);
+    return visual;
+  }
+
+  function setLampState(materials, active, color) {
+    for (const material of materials) {
+      if (!material.emissive) continue;
+      material.emissive.setHex(active ? color : 0x000000);
+      material.emissiveIntensity = active ? 2.8 : 0;
+    }
+  }
+
+  function turnTypeFor(car) {
+    if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
+      return car.turnDirection === 'left' ? 'ellipse-to-vertical-left' : car.turnDirection === 'right' ? 'ellipse-to-vertical-right' : 'straight';
+    }
+    if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical') || hasPlannedVerticalExit(car) || car.path === 'vertical') {
+      const direction = car.turnDirection || (car.direction === -1 ? 'left' : 'right');
+      return direction === 'left' ? 'vertical-to-ellipse-left' : 'vertical-to-ellipse-right';
+    }
+    return 'straight';
+  }
+
+  function trajectoryColor(turnType) {
+    return {
+      'ellipse-to-vertical-left': 0x2563eb,
+      'ellipse-to-vertical-right': 0x06b6d4,
+      'vertical-to-ellipse-left': 0xef4444,
+      'vertical-to-ellipse-right': 0xeab308
+    }[turnType] || 0x22c55e;
+  }
+
+  function updateTrajectoryVisual(car) {
+    const states = predictTrajectory(car);
+    let meshes = trajectoryMeshes.get(car);
+    if (!meshes) {
+      meshes = Array.from({ length: TRAJECTORY_VISUAL_SAMPLES }, () => {
+        const mesh = new THREE.Group();
+        const fill = new THREE.Mesh(
+          new THREE.PlaneGeometry(CAR_LENGTH, 230 * CAR_SCALE),
+          new THREE.MeshBasicMaterial({
+            transparent: true,
+            opacity: 0.12,
+            depthWrite: false,
+            polygonOffset: true,
+            polygonOffsetFactor: -1,
+            polygonOffsetUnits: -1
+          })
+        );
+        fill.rotation.x = -Math.PI / 2;
+        mesh.add(fill);
+        mesh.userData.material = fill.material;
+        mesh.position.y = 0.025;
+        mesh.renderOrder = 1;
+        threeScene.add(mesh);
+        return mesh;
+      });
+      trajectoryMeshes.set(car, meshes);
+    }
+    const color = trajectoryColor(turnTypeFor(car));
+    meshes.forEach((mesh, index) => {
+      const state = states[index];
+      mesh.visible = !!state;
+      if (!state) return;
+      mesh.userData.material.color.setHex(color);
+      mesh.position.set(worldX(state.x), 0.025, worldZ(state.y));
+      mesh.rotation.y = -state.heading;
+    });
+  }
+
+  function renderThreeScene() {
+    if (!threeRenderer) return;
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    const blinkOn = performance.now() % BLINKER_CYCLE_MS < BLINKER_ON_MS;
+    for (const car of allCars) {
+      const visual = threeCars.get(car) || buildCarVisual(car);
+      if (!visual) continue;
+      visual.position.set(worldX(car.x), 0.12, worldZ(car.y));
+      visual.rotation.y = modelForwardYaw - car.heading + Math.PI / 2;;
+      const isTurning = (car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining') && car.turnDirection;
+      setLampState(visual.userData.lights.left, !!isTurning && car.turnDirection === 'left' && blinkOn, 0xffa000);
+      setLampState(visual.userData.lights.right, !!isTurning && car.turnDirection === 'right' && blinkOn, 0xffa000);
+      const braking = car.currentSpeedFactor < visual.userData.lastSpeedFactor || car.isYielding;
+      setLampState(visual.userData.lights.brake, braking, 0xff0808);
+      visual.userData.lastSpeedFactor = car.currentSpeedFactor;
+      updateTrajectoryVisual(car);
+    }
+    threeRenderer.render(threeScene, threeCamera);
+  }
+
+  function resizeThreeRenderer() {
+    if (!threeRenderer || !threeCamera) return;
+    const width = canvas.clientWidth || canvas.width;
+    const height = canvas.clientHeight || canvas.height;
+    const aspect = width / height;
+    // Compensate for the camera pitch so the road keeps its full canvas fit.
+    const halfHeight = SIMULATION_VIEW_HEIGHT * Math.cos(CAMERA_TILT_RADIANS) / 2;
+    const halfWidth = halfHeight * aspect;
+    threeCamera.left = -halfWidth;
+    threeCamera.right = halfWidth;
+    threeCamera.top = halfHeight;
+    threeCamera.bottom = -halfHeight;
+    threeCamera.updateProjectionMatrix();
+    threeRenderer.setSize(width, height, false);
+  }
+
+  function initThreeRenderer() {
+    threeRenderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    threeRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    threeRenderer.shadowMap.enabled = true;
+    threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    threeRenderer.outputEncoding = THREE.sRGBEncoding;
+    threeScene = new THREE.Scene();
+    threeScene.background = new THREE.Color(0x4f943d);
+    // Preserve the full-road canvas framing while allowing a modest 3D pitch.
+    threeCamera = new THREE.OrthographicCamera(-650, 650, 450, -450, 1, 5000);
+    threeCamera.position.set(0, 1200, 440);
+    threeCamera.lookAt(0, 0, 0);
+
+    const grass = new THREE.Mesh(
+      new THREE.PlaneGeometry(3600, 3600),
+      new THREE.MeshStandardMaterial({ color: 0x438c35, roughness: 1 })
+    );
+    grass.rotation.x = -Math.PI / 2;
+    grass.receiveShadow = true;
+    grass.position.y = -0.05;
+    threeScene.add(grass);
+    makeRoadRing();
+    addRoadMarkings();
+    threeScene.add(new THREE.HemisphereLight(0xd7ecff, 0x345d2c, 1.4));
+    const sun = new THREE.DirectionalLight(0xfff4dc, 2.4);
+    sun.position.set(-450, 700, 300);
+    sun.intensity = 1.6;
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(2048, 2048);
+    sun.shadow.camera.left = -800;
+    sun.shadow.camera.right = 800;
+    sun.shadow.camera.top = 600;
+    sun.shadow.camera.bottom = -600;
+    threeScene.add(sun);
+
+    resizeThreeRenderer();
+    window.addEventListener('resize', resizeThreeRenderer);
+
+    new THREE.GLTFLoader().load('peugeot205.glb', gltf => {
+      carTemplate = gltf.scene;
+      carTemplate.traverse(child => { if (child.isMesh) child.frustumCulled = false; });
+      modelForwardYaw = inferModelForwardYaw(carTemplate);
+    }, undefined, error => console.error('Unable to load peugeot205.glb', error));
   }
   function getDistance(carA, carB) {
     return Math.hypot(carA.x - carB.x, carA.y - carB.y);
@@ -4293,17 +4548,7 @@ function updateCar(car) {
   }
 
   function draw() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    drawBackground();
-    drawRoad();
-    drawDashedEllipse(centerX, centerY, 560, 360);
-    drawDashedLine(centerX, 90, centerX, 810);
-    drawCar(car1);
-    drawCar(car2);
-    drawCar(car3);
-    drawCar(car4);
-    drawCar(car5);
-    drawCar(car6);
+    renderThreeScene();
   }
 
   function update() {
@@ -4471,13 +4716,8 @@ function updateCar(car) {
     }
   }
 
-  spriteSheet.onload = () => {
-    resetSimulation();
-  };
-  spriteSheet.onerror = () => {
-    console.error('Sprite failed to load, using fallback fallback rectangles.');
-    resetSimulation();
-  };
+  initThreeRenderer();
+  resetSimulation();
 </script>
 </body>
 </html>
