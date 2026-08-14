@@ -1898,7 +1898,6 @@ function resetSimulation() {
   const SIMULATION_VIEW_HEIGHT = 900;
   // Match CitySim: ~45° elevation (equal height and ground offset).
   const CAMERA_ELEVATION_RADIANS = THREE.MathUtils.degToRad(45);
-  const CAMERA_DISTANCE = 2100;
   let lampGlowTexture = null;
   // The GLB is 4.1055 units long; match it to the existing collision/render length.
   const CAR_MODEL_SCALE = CAR_LENGTH / 4.1055;
@@ -1921,10 +1920,7 @@ function resetSimulation() {
     const roadMat = new THREE.MeshStandardMaterial({
     color: 0x050608,
     roughness: 0.96,
-    metalness: 0.01,
-    polygonOffset: true,
-    polygonOffsetFactor: -1,
-    polygonOffsetUnits: -1
+    metalness: 0.01
   });
     const road = new THREE.Mesh(
       new THREE.ShapeGeometry(shape, 96),
@@ -2143,18 +2139,20 @@ function resetSimulation() {
           new THREE.PlaneGeometry(CAR_LENGTH, 230 * CAR_SCALE),
           new THREE.MeshBasicMaterial({
             transparent: true,
-            opacity: 0.12,
+            opacity: 0.16,
+            depthTest: true,
             depthWrite: false,
             polygonOffset: true,
-            polygonOffsetFactor: -1,
-            polygonOffsetUnits: -1
+            polygonOffsetFactor: -8,
+            polygonOffsetUnits: -8
           })
         );
         fill.rotation.x = -Math.PI / 2;
+        fill.renderOrder = 3;
         mesh.add(fill);
         mesh.userData.material = fill.material;
-        mesh.position.y = 0.025;
-        mesh.renderOrder = 1;
+        mesh.position.y = 0.18;
+        mesh.renderOrder = 3;
         threeScene.add(mesh);
         return mesh;
       });
@@ -2166,7 +2164,7 @@ function resetSimulation() {
       mesh.visible = !!state;
       if (!state) return;
       mesh.userData.material.color.setHex(color);
-      mesh.position.set(worldX(state.x), 0.025, worldZ(state.y));
+      mesh.position.set(worldX(state.x), 0.18, worldZ(state.y));
       mesh.rotation.y = -state.heading;
     });
   }
@@ -2191,12 +2189,51 @@ function resetSimulation() {
     threeRenderer.render(threeScene, threeCamera);
   }
 
+  function frameTrackInView() {
+    if (!threeCamera) return;
+    const outerA = 560 + ROAD_WIDTH / 2;
+    const outerB = 360 + ROAD_WIDTH / 2;
+    const ringPoints = [];
+    for (let i = 0; i < 64; i++) {
+      const t = (i / 64) * Math.PI * 2;
+      ringPoints.push(new THREE.Vector3(outerA * Math.cos(t), 0, outerB * Math.sin(t)));
+    }
+    const dir = new THREE.Vector3(
+      0,
+      Math.sin(CAMERA_ELEVATION_RADIANS),
+      Math.cos(CAMERA_ELEVATION_RADIANS)
+    ).normalize();
+    // Fit width only: zoom until the ring's leftmost/rightmost screen edges
+    // reach the canvas sides. Vertical grass margin is allowed.
+    let lo = 200;
+    let hi = 5000;
+    const targetX = 0.995;
+    for (let i = 0; i < 28; i++) {
+      const dist = (lo + hi) * 0.5;
+      threeCamera.position.copy(dir).multiplyScalar(dist);
+      threeCamera.lookAt(0, 0, 0);
+      threeCamera.updateMatrixWorld(true);
+      threeCamera.updateProjectionMatrix();
+      let maxAbsX = 0;
+      for (const point of ringPoints) {
+        const ndc = point.clone().project(threeCamera);
+        maxAbsX = Math.max(maxAbsX, Math.abs(ndc.x));
+      }
+      if (maxAbsX > targetX) lo = dist;
+      else hi = dist;
+    }
+    threeCamera.position.copy(dir).multiplyScalar(hi);
+    threeCamera.lookAt(0, 0, 0);
+    threeCamera.updateProjectionMatrix();
+  }
+
   function resizeThreeRenderer() {
     if (!threeRenderer || !threeCamera) return;
     const width = canvas.clientWidth || canvas.width;
     const height = canvas.clientHeight || canvas.height;
     threeCamera.aspect = width / Math.max(1, height);
     threeCamera.updateProjectionMatrix();
+    frameTrackInView();
     threeRenderer.setSize(width, height, false);
   }
 
@@ -2208,14 +2245,8 @@ function resetSimulation() {
     threeRenderer.outputEncoding = THREE.sRGBEncoding;
     threeScene = new THREE.Scene();
     threeScene.background = new THREE.Color(0x4f943d);
-    // Same 45° look as CitySim (PerspectiveCamera at equal height/ground offset).
-    threeCamera = new THREE.PerspectiveCamera(50, 1300 / 900, 2, 16000);
-    threeCamera.position.set(
-      0,
-      CAMERA_DISTANCE * Math.sin(CAMERA_ELEVATION_RADIANS),
-      CAMERA_DISTANCE * Math.cos(CAMERA_ELEVATION_RADIANS)
-    );
-    threeCamera.lookAt(0, 0, 0);
+    // 45° CitySim tilt; distance is chosen so the ring fills the canvas.
+    threeCamera = new THREE.PerspectiveCamera(42, 1300 / 900, 20, 8000);
 
     const grass = new THREE.Mesh(
       new THREE.PlaneGeometry(14000, 14000),
