@@ -2615,11 +2615,15 @@ function gridlockPriorityScore(c) {
     const midEllToVert = isEllipseToVerticalManeuver(c);
     if (freeEllipse) s += 100;
     if (midEllToVert && c.isCommittedToTurn) s += 85;
+    // Uncommitted main-road exits still outrank side-road waiters (Rules 2.1 vs 2.2).
+    if (midEllToVert && !c.isCommittedToTurn) s += 55;
     if (c.path === 'ellipse' && c.isMakingTurn && !midEllToVert) s += 70;
     if (c.isCommittedToTurn) s += 35;
     if (c.path === 'vertical' && c.turnState === 'turning') s += 30;
     if (rejoining) s += 15;
     if (c.path === 'vertical') s += 10;
+    // Never prefer a car that force-unstick will immediately abort (stop-line waiter).
+    if (!c.isCommittedToTurn && hasPlannedVerticalExit(c)) s -= 80;
     // Prefer cars that have been stuck longest.
     if (c.stoppedSince) s += Math.min(40, (performance.now() - c.stoppedSince) / 200);
     return s;
@@ -2748,9 +2752,20 @@ function resolveGridlock(allCars) {
           const aStuck = a.stoppedSince && (now - a.stoppedSince) > 900;
           const bStuck = b.stoppedSince && (now - b.stoppedSince) > 900;
           if (!aStuck && !bStuck) continue;
-          const pick = gridlockPriorityScore(a) >= gridlockPriorityScore(b) ? a : b;
+          // Prefer the actor that can actually leave (main-road / committed). Never pick
+          // an uncommitted side-road waiter: control immediately aborts that unstick
+          // (protectedYield) and the pair logs/re-freezes every frame.
+          const aProtected = (!a.isCommittedToTurn && hasPlannedVerticalExit(a)) ||
+            (a.turnState === 'rejoining' && a.currentSpeedFactor < 0.05);
+          const bProtected = (!b.isCommittedToTurn && hasPlannedVerticalExit(b)) ||
+            (b.turnState === 'rejoining' && b.currentSpeedFactor < 0.05);
+          let pick = gridlockPriorityScore(a) >= gridlockPriorityScore(b) ? a : b;
+          if (pick === a && aProtected && !bProtected) pick = b;
+          else if (pick === b && bProtected && !aProtected) pick = a;
+          else if (aProtected && bProtected) continue;
           const other = pick === a ? b : a;
           if (pick.forceUnstickFrames > 0) continue;
+          if (!pick.isCommittedToTurn && hasPlannedVerticalExit(pick)) continue;
           if (checkPolygonIntersection(getCarBoundingBox(a), getCarBoundingBox(b))) continue;
           // Do not force creep if the picker's path already hits the other car closely.
           const hitPick = getStaticOccupancyHitDistance(pick, other);
@@ -3592,7 +3607,7 @@ function updateCar(car) {
             } else if (iAmMidFromEllipse && otherMidFromEllipse && othDist < myDist) {
                 verticalOppositeReason = 'vertical-turn-opposite';
             }
-            if (verticalOppositeReason) {
+            if (verticalOppositeReason && !shouldSkipYieldForDivergingManeuver(car, otherCar)) {
                 mustYield = true;
                 reason = verticalOppositeReason;
                 if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
@@ -3633,6 +3648,7 @@ function updateCar(car) {
           // and not a peer still waiting on the ellipse (Car6 must not wait for Car1).
           const rightConflict = isEllipseToVerticalRight && otherCar.path === 'vertical' &&
             !otherPeerUncommittedExit &&
+            !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
             (isCarInCrossroadArea(otherCar) || otherExchanging) &&
             (otherCar.currentSpeedFactor > 0.03 || exchangeNear ||
               (Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 1.5));
