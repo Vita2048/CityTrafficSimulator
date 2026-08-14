@@ -1896,7 +1896,10 @@ function resetSimulation() {
   const trajectoryMeshes = new Map();
   const TRAJECTORY_VISUAL_SAMPLES = 40;
   const SIMULATION_VIEW_HEIGHT = 900;
-  const CAMERA_TILT_RADIANS = THREE.MathUtils.degToRad(20);
+  // Match CitySim: ~45° elevation (equal height and ground offset).
+  const CAMERA_ELEVATION_RADIANS = THREE.MathUtils.degToRad(45);
+  const CAMERA_DISTANCE = 2100;
+  let lampGlowTexture = null;
   // The GLB is 4.1055 units long; match it to the existing collision/render length.
   const CAR_MODEL_SCALE = CAR_LENGTH / 4.1055;
   // Inferred from the GLB's named front/rear indicators once it is loaded.
@@ -1970,7 +1973,69 @@ function resetSimulation() {
     }
   }
 
-  function configureLightMesh(object) {
+  function getLampGlowTexture() {
+    if (lampGlowTexture) return lampGlowTexture;
+    const size = 128;
+    const canvas2d = document.createElement('canvas');
+    canvas2d.width = size;
+    canvas2d.height = size;
+    const ctx = canvas2d.getContext('2d');
+    const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    gradient.addColorStop(0, 'rgba(255,255,255,1)');
+    gradient.addColorStop(0.22, 'rgba(255,255,255,0.7)');
+    gradient.addColorStop(0.55, 'rgba(255,255,255,0.22)');
+    gradient.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, size, size);
+    lampGlowTexture = new THREE.CanvasTexture(canvas2d);
+    return lampGlowTexture;
+  }
+
+  function lampMeshBounds(object) {
+    const box = new THREE.Box3();
+    let found = false;
+    object.updateWorldMatrix(true, true);
+    object.traverse(child => {
+      if (!child.isMesh || !child.geometry) return;
+      if (!child.geometry.boundingBox) child.geometry.computeBoundingBox();
+      const childBox = child.geometry.boundingBox.clone().applyMatrix4(child.matrixWorld);
+      if (!found) {
+        box.copy(childBox);
+        found = true;
+      } else {
+        box.union(childBox);
+      }
+    });
+    if (!found) box.setFromObject(object);
+    return box;
+  }
+
+  function attachLampGlow(object, color, glowSpread) {
+    const box = lampMeshBounds(object);
+    const centerWorld = box.getCenter(new THREE.Vector3());
+    const sizeWorld = box.getSize(new THREE.Vector3());
+    const parentScale = object.getWorldScale(new THREE.Vector3());
+    const centerLocal = object.worldToLocal(centerWorld.clone());
+    const worldSpan = Math.max(sizeWorld.x, sizeWorld.y, sizeWorld.z, 6);
+    const localScale = (worldSpan * glowSpread) / Math.max(0.001, (parentScale.x + parentScale.y) * 0.5);
+
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: getLampGlowTexture(),
+      color,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      opacity: 0
+    }));
+    glow.position.copy(centerLocal);
+    glow.scale.set(localScale, localScale, 1);
+    glow.renderOrder = 12;
+    glow.visible = false;
+    object.add(glow);
+    return { glow };
+  }
+
+  function configureLightMesh(object, kind) {
     const materials = [];
     object.traverse(child => {
       if (!child.isMesh) return;
@@ -1980,7 +2045,9 @@ function resetSimulation() {
       const meshMaterials = Array.isArray(child.material) ? child.material : [child.material];
       materials.push(...meshMaterials);
     });
-    return materials;
+    const color = kind === 'brake' ? 0xff2211 : 0xffb020;
+    const fx = attachLampGlow(object, color, kind === 'brake' ? 4.2 : 3.6);
+    return { materials, glow: fx.glow };
   }
 
   function inferModelForwardYaw(root) {
@@ -2008,6 +2075,7 @@ function resetSimulation() {
     const visual = new THREE.Group();
     const model = carTemplate.clone(true);
     model.scale.setScalar(CAR_MODEL_SCALE);
+    model.rotation.y = Math.PI / 2;   // counterclockwise 90°
     visual.add(model);
     model.traverse(child => { if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; } });
     const lights = { brake: [], left: [], right: [] };
@@ -2019,7 +2087,7 @@ function resetSimulation() {
     for (const [kind, names] of Object.entries(namedLights)) {
       for (const name of names) {
         const object = visual.getObjectByName(name);
-        if (object) lights[kind].push(...configureLightMesh(object));
+        if (object) lights[kind].push(configureLightMesh(object, kind));
         else console.warn(`Car model light mesh not found: ${name}`);
       }
     }
@@ -2030,11 +2098,18 @@ function resetSimulation() {
     return visual;
   }
 
-  function setLampState(materials, active, color) {
-    for (const material of materials) {
-      if (!material.emissive) continue;
-      material.emissive.setHex(active ? color : 0x000000);
-      material.emissiveIntensity = active ? 2.8 : 0;
+  function setLampState(lamps, active, color) {
+    for (const lamp of lamps) {
+      for (const material of lamp.materials) {
+        if (!material.emissive) continue;
+        material.emissive.setHex(active ? color : 0x000000);
+        material.emissiveIntensity = active ? 6.5 : 0;
+      }
+      if (lamp.glow) {
+        lamp.glow.visible = active;
+        lamp.glow.material.color.setHex(color);
+        lamp.glow.material.opacity = active ? 0.95 : 0;
+      }
     }
   }
 
@@ -2120,14 +2195,7 @@ function resetSimulation() {
     if (!threeRenderer || !threeCamera) return;
     const width = canvas.clientWidth || canvas.width;
     const height = canvas.clientHeight || canvas.height;
-    const aspect = width / height;
-    // Compensate for the camera pitch so the road keeps its full canvas fit.
-    const halfHeight = SIMULATION_VIEW_HEIGHT * Math.cos(CAMERA_TILT_RADIANS) / 2;
-    const halfWidth = halfHeight * aspect;
-    threeCamera.left = -halfWidth;
-    threeCamera.right = halfWidth;
-    threeCamera.top = halfHeight;
-    threeCamera.bottom = -halfHeight;
+    threeCamera.aspect = width / Math.max(1, height);
     threeCamera.updateProjectionMatrix();
     threeRenderer.setSize(width, height, false);
   }
@@ -2140,13 +2208,17 @@ function resetSimulation() {
     threeRenderer.outputEncoding = THREE.sRGBEncoding;
     threeScene = new THREE.Scene();
     threeScene.background = new THREE.Color(0x4f943d);
-    // Preserve the full-road canvas framing while allowing a modest 3D pitch.
-    threeCamera = new THREE.OrthographicCamera(-650, 650, 450, -450, 1, 5000);
-    threeCamera.position.set(0, 1200, 440);
+    // Same 45° look as CitySim (PerspectiveCamera at equal height/ground offset).
+    threeCamera = new THREE.PerspectiveCamera(50, 1300 / 900, 2, 16000);
+    threeCamera.position.set(
+      0,
+      CAMERA_DISTANCE * Math.sin(CAMERA_ELEVATION_RADIANS),
+      CAMERA_DISTANCE * Math.cos(CAMERA_ELEVATION_RADIANS)
+    );
     threeCamera.lookAt(0, 0, 0);
 
     const grass = new THREE.Mesh(
-      new THREE.PlaneGeometry(3600, 3600),
+      new THREE.PlaneGeometry(14000, 14000),
       new THREE.MeshStandardMaterial({ color: 0x438c35, roughness: 1 })
     );
     grass.rotation.x = -Math.PI / 2;
@@ -2170,7 +2242,7 @@ function resetSimulation() {
     resizeThreeRenderer();
     window.addEventListener('resize', resizeThreeRenderer);
 
-    new THREE.GLTFLoader().load('peugeot205.glb', gltf => {
+    new THREE.GLTFLoader().load('Milano95_Labeled.glb', gltf => {
       carTemplate = gltf.scene;
       carTemplate.traverse(child => { if (child.isMesh) child.frustumCulled = false; });
       modelForwardYaw = inferModelForwardYaw(carTemplate);
