@@ -508,23 +508,26 @@
   const BASE_TRAJECTORY_LENGTH = 4.0;
   const RECOVERY_TRAJECTORY_LENGTH = 5.5;
   const INPUT_DIM = 48;
-  const HIDDEN_DIM = 16;
+  const HIDDEN_DIM = 32;
   const OUTPUT_DIM = 2;
   const PRETRAIN_TARGET_STEPS = 24000;
   const PRETRAIN_BATCH_SIZE = 24;
   const PRETRAIN_BATCHES_PER_FRAME = 8;
   const PRETRAIN_LR = 0.0025;
+  const PRETRAIN_CRITICAL_FRACTION = 0.55;
   const RL_LR = 0.00015;
   const RL_SIGMA = 0.06;
   const RL_SIGMA_MIN = 0.035;
   const RL_BASELINE_DECAY = 0.995;
   const RL_BEHAVIOR_CLONE_LR = 0.0007;
-  const NN_BLEND_INFERENCE = 1.0;
-  const NN_BLEND_WHILE_RL = 1.0;
-  const NN_SAFETY_MAX_LANE_ERR = ROAD_WIDTH * 0.45;
+  // Base mix of NN vs heuristic. 1.0 previously meant full NN with unused safety caps,
+  // so a half-trained clone immediately left the road after Pre-Train.
+  const NN_BLEND_INFERENCE = 0.62;
+  const NN_BLEND_WHILE_RL = 0.78;
+  const NN_SAFETY_MAX_LANE_ERR = ROAD_WIDTH * 0.28;
   const RL_BAD_REWARD_THRESHOLD = -0.45;
-  const RL_MAX_SPEED_DEV_FROM_HEURISTIC = 0.42;
-  const RL_MAX_STEER_DEV_FROM_HEURISTIC = 0.55;
+  const RL_MAX_SPEED_DEV_FROM_HEURISTIC = 0.22;
+  const RL_MAX_STEER_DEV_FROM_HEURISTIC = 0.32;
   const RL_REPLAY_MAX = 50000;
   const RL_REPLAY_UPDATES_PER_FRAME = 14;
   const RL_REPLAY_BAD_REWARD_CUTOFF = -0.18;
@@ -543,8 +546,8 @@
   const RL_RECOVERY_CRASH_SEQUENCE_PASSES = 2;
   const RL_RECOVERY_CRASH_SEQUENCE_LR = 0.001;
   const RL_GRASS_TRIGGER_COUNT = 2;
-  const GRASS_CORRECTION_UPDATES = 4;
-  const GRASS_CORRECTION_LR = 0.0009;
+  const GRASS_CORRECTION_UPDATES = 8;
+  const GRASS_CORRECTION_LR = 0.0014;
   const RULE1_STOP_GAP_MIN = 0.5 * CAR_LENGTH;
   const RULE1_STOP_GAP_MAX = 1.0 * CAR_LENGTH;
   const RULE6_STOP_LINE_TOLERANCE = 0.2 * CAR_LENGTH;
@@ -600,7 +603,9 @@
   let lastCrashPauseReason = null;
   let crashPauseArmed = true; // re-armed after resume / reset so each crash pauses once
   let trainingBuffer = [];
+  let criticalTrainingBuffer = [];
   const TRAINING_BUFFER_MAX = 25000;
+  const CRITICAL_BUFFER_MAX = 8000;
   let simFrame = 0;
   let lastPretrainState = false;
   let lastRLState = false;
@@ -1173,6 +1178,34 @@
     }
   }
 
+  function isCriticalImitationSample(sample) {
+    if (!sample) return false;
+    if (sample.shouldStop || sample.isYielding || sample.onGrass) return true;
+    if (Number.isFinite(sample.target?.[0]) && sample.target[0] < 0.18) return true;
+    if (Number.isFinite(sample.target?.[1]) && Math.abs(sample.target[1]) > 0.32) return true;
+    if (Number.isFinite(sample.laneErr) && sample.laneErr > ROAD_WIDTH * 0.12) return true;
+    if (sample.turning) return true;
+    return false;
+  }
+
+  function pushImitationSample(sample) {
+    if (!sample || !isFiniteArray(sample.input) || !isFiniteArray(sample.target)) return;
+    trainingBuffer.push(sample);
+    if (trainingBuffer.length > TRAINING_BUFFER_MAX) trainingBuffer.shift();
+    if (isCriticalImitationSample(sample)) {
+      criticalTrainingBuffer.push(sample);
+      if (criticalTrainingBuffer.length > CRITICAL_BUFFER_MAX) criticalTrainingBuffer.shift();
+    }
+  }
+
+  function pickPretrainSample() {
+    const useCritical = criticalTrainingBuffer.length >= 24 &&
+      Math.random() < PRETRAIN_CRITICAL_FRACTION;
+    const buf = useCritical ? criticalTrainingBuffer : trainingBuffer;
+    if (!buf.length) return null;
+    return buf[Math.floor(Math.random() * buf.length)];
+  }
+
   function trainNetworkSupervised(sample, lr) {
     const { input, target } = sample;
     if (!isFiniteArray(input) || !isFiniteArray(target)) return 0;
@@ -1193,9 +1226,18 @@
     }
     const speedErr = predSpeed - target[0];
     const steerErr = predSteer - target[1];
+    // Rare stop / turn / grass frames must outweigh the cruise majority.
+    let speedW = 1;
+    let steerW = 2.0;
+    if (target[0] < 0.2) speedW += 2.4;
+    if (sample.shouldStop || sample.isYielding) speedW += 2.0;
+    if (sample.onGrass || (Number.isFinite(sample.laneErr) && sample.laneErr > ROAD_WIDTH * 0.12)) {
+      steerW += 2.4;
+    }
+    if (sample.turning) steerW += 1.2;
 
-    const gradOut0 = 2 * speedErr * predSpeed * (1 - predSpeed);
-    const gradOut1 = 2 * steerErr * (1 - predSteer * predSteer);
+    const gradOut0 = 2 * speedW * speedErr * predSpeed * (1 - predSpeed);
+    const gradOut1 = 2 * steerW * steerErr * (1 - predSteer * predSteer);
     networkBackward(nn, input, hidden, [gradOut0, gradOut1], lr);
     if (!isNetworkFinite(nn)) {
       recoverModel('invalid-weights-after-supervised');
@@ -1248,8 +1290,9 @@
     for (let b = 0; b < PRETRAIN_BATCHES_PER_FRAME; b++) {
       let batchLoss = 0;
       for (let i = 0; i < PRETRAIN_BATCH_SIZE; i++) {
-        const idx = Math.floor(Math.random() * trainingBuffer.length);
-        batchLoss += trainNetworkSupervised(trainingBuffer[idx], PRETRAIN_LR);
+        const sample = pickPretrainSample();
+        if (!sample) continue;
+        batchLoss += trainNetworkSupervised(sample, PRETRAIN_LR);
       }
       batchLoss /= PRETRAIN_BATCH_SIZE;
       pretrainLossEMA = pretrainLossEMA === 0 ? batchLoss : pretrainLossEMA * 0.95 + batchLoss * 0.05;
@@ -1400,7 +1443,7 @@
 
     if (isPreTraining && LOG_CONFIG.training && now - lastPretrainLogMs >= LOG_CONFIG.trainingIntervalMs) {
       const pct = clamp((pretrainSteps / PRETRAIN_TARGET_STEPS) * 100, 0, 100);
-      logEvent('training', `pretrain step=${pretrainSteps}/${PRETRAIN_TARGET_STEPS} (${pct.toFixed(1)}%) lossEMA=${pretrainLossEMA.toFixed(5)} buffer=${trainingBuffer.length}`);
+      logEvent('training', `pretrain step=${pretrainSteps}/${PRETRAIN_TARGET_STEPS} (${pct.toFixed(1)}%) lossEMA=${pretrainLossEMA.toFixed(5)} buffer=${trainingBuffer.length} critical=${criticalTrainingBuffer.length}`);
       lastPretrainLogMs = now;
     }
 
@@ -1849,6 +1892,8 @@ function resetSimulation() {
         car.smoothedCollisionSlowdown = null;
         car.forceUnstickFrames = 0;
     });
+    trainingBuffer = [];
+    criticalTrainingBuffer = [];
 
     simFrame = 0;
     logWindowStartMs = performance.now();
@@ -4236,13 +4281,14 @@ function updateCar(car) {
     overlapType,
     priorityStatus
   };
+  const decisionInput = buildStateVector(car, contextBeforeMove);
   const heuristicTargetFactor = clamp(targetFactor, 0, 1);
   if (controllerMode === 'nn') {
     if (!isNetworkFinite(nn)) {
       recoverModel('invalid-weights-before-control');
       car.lastHeuristicLead = true;
     }
-    policyInput = buildStateVector(car, contextBeforeMove);
+    policyInput = decisionInput;
     const { out } = networkForward(nn, policyInput);
     if (isFiniteArray(out) && Number.isFinite(out[0]) && Number.isFinite(out[1])) {
       policyMeanSpeed = 1 / (1 + Math.exp(-out[0]));
@@ -4256,6 +4302,33 @@ function updateCar(car) {
         policySampleSteer = clamp(sampledSteer, -1, 1);
         targetFactor = clamp(policySampleSpeed, 0, 1);
         car.lastHeuristicLead = false;
+        // Blend / clamp toward the heuristic so a half-trained clone cannot ignore
+        // a yield or steer off the pavement (these caps existed but were never applied).
+        const minEdge = Math.min(...roadEdgeSensorsBeforeMove);
+        const edgeDanger = clamp(1 - minEdge, 0, 1);
+        const laneDanger = clamp(laneErrBeforeMove / Math.max(1e-3, NN_SAFETY_MAX_LANE_ERR), 0, 1);
+        const mustHonorStop =
+          shouldStop ||
+          (hadPriorityConflict && car.isYielding && !car.isCommittedToTurn) ||
+          collisionSlowdown <= 0.001;
+        const unsafe = onGrassBeforeMove || laneDanger > 0.55 || edgeDanger > 0.55;
+        let blend = isRLRunning ? NN_BLEND_WHILE_RL : NN_BLEND_INFERENCE;
+        if (rlRecoveryStepsRemaining > 0) blend = Math.min(blend, RL_RECOVERY_BLEND + 0.25);
+        if (unsafe) blend *= 0.25;
+        if (mustHonorStop) blend = 0;
+        targetFactor = heuristicTargetFactor * (1 - blend) + targetFactor * blend;
+        if (mustHonorStop) {
+          targetFactor = Math.min(targetFactor, heuristicTargetFactor);
+        } else {
+          const maxDev = isRLRunning ? RL_MAX_SPEED_DEV_FROM_HEURISTIC : RL_MAX_SPEED_DEV_FROM_HEURISTIC * 0.75;
+          targetFactor = clamp(
+            targetFactor,
+            heuristicTargetFactor - maxDev,
+            heuristicTargetFactor + maxDev
+          );
+        }
+        targetFactor = clamp(targetFactor, 0, 1);
+        policySampleSpeed = targetFactor;
       } else {
         recoverModel('invalid-sampled-action');
         policyInput = null;
@@ -4319,8 +4392,7 @@ function updateCar(car) {
     !car.isCommittedToTurn &&
     Number.isFinite(signedDistToYieldLine) &&
     signedDistToYieldLine <= RULE6_STOP_LINE_TOLERANCE;
-  if (controllerMode !== 'nn' &&
-      ((isAtYieldLine && shouldStop) || nearStopLineForHold || collisionSlowdown <= 0.001)) {
+  if ((isAtYieldLine && shouldStop) || nearStopLineForHold || collisionSlowdown <= 0.001) {
     desiredFactor = 0;
   }
   desiredFactor = clamp(desiredFactor, 0, 1);
@@ -4329,7 +4401,7 @@ function updateCar(car) {
     car.cmdSpeedFactor = car.currentSpeedFactor;
   }
 
-  if (controllerMode !== 'nn') {
+  if (controllerMode !== 'nn' || shouldStop || hadPriorityConflict) {
     // Primary smoothness: at most one comfort/emergency physical step per frame.
     if (desiredFactor < car.cmdSpeedFactor) {
       car.cmdSpeedFactor = Math.max(desiredFactor, car.cmdSpeedFactor - decelStep);
@@ -4374,8 +4446,46 @@ function updateCar(car) {
   car.targetSteerAngle = heuristicTargetSteer;
   if (controllerMode === 'nn' && policyMeanSteer !== null) {
     const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
-    car.targetSteerAngle = clamp(nnSteerAngle, -SYMMETRIC_MAX_TURN_STEER_ANGLE, SYMMETRIC_MAX_TURN_STEER_ANGLE);
+    const minEdge = Math.min(...roadEdgeSensorsBeforeMove);
+    const edgeDanger = clamp(1 - minEdge, 0, 1);
+    const laneDanger = clamp(laneErrBeforeMove / Math.max(1e-3, NN_SAFETY_MAX_LANE_ERR), 0, 1);
+    let blend = isRLRunning ? NN_BLEND_WHILE_RL : NN_BLEND_INFERENCE;
+    if (rlRecoveryStepsRemaining > 0) blend = Math.min(blend, RL_RECOVERY_BLEND + 0.2);
+    if (onGrassBeforeMove) blend = 0;
+    else if (laneDanger > 0.7 || edgeDanger > 0.6) blend *= 0.15;
+    else if (laneDanger > 0.4 || edgeDanger > 0.4) blend *= 0.4;
+    let mixedSteer = heuristicTargetSteer * (1 - blend) + nnSteerAngle * blend;
+    const maxSteerDev = SYMMETRIC_MAX_TURN_STEER_ANGLE * RL_MAX_STEER_DEV_FROM_HEURISTIC;
+    mixedSteer = clamp(mixedSteer, heuristicTargetSteer - maxSteerDev, heuristicTargetSteer + maxSteerDev);
+    car.targetSteerAngle = clamp(mixedSteer, -SYMMETRIC_MAX_TURN_STEER_ANGLE, SYMMETRIC_MAX_TURN_STEER_ANGLE);
   }
+
+  const targetSpeed = heuristicTargetFactor;
+  const targetSteer = clamp(heuristicTargetSteer / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
+  const imitationSample = {
+    input: decisionInput,
+    target: [targetSpeed, targetSteer],
+    shouldStop: !!shouldStop,
+    isYielding: !!car.isYielding,
+    onGrass: !!onGrassBeforeMove,
+    laneErr: laneErrBeforeMove,
+    turning: !!(car.isMakingTurn || car.turnState === 'approaching' || car.turnState === 'rejoining')
+  };
+  car.lastHeuristicSample = imitationSample;
+  if (!Array.isArray(car.recentHeuristicSamples)) car.recentHeuristicSamples = [];
+  car.recentHeuristicSamples.push({
+    input: decisionInput.slice(),
+    target: [targetSpeed, targetSteer],
+    shouldStop: imitationSample.shouldStop,
+    isYielding: imitationSample.isYielding,
+    onGrass: imitationSample.onGrass,
+    laneErr: imitationSample.laneErr,
+    turning: imitationSample.turning
+  });
+  if (car.recentHeuristicSamples.length > RL_RECOVERY_CRASH_SEQUENCE_FRAMES) {
+    car.recentHeuristicSamples.shift();
+  }
+  pushImitationSample(imitationSample);
 
   updateCarPhysics(car, car.maximumSpeed * 50 * car.currentSpeedFactor);
   const clampedX = Math.max(0, Math.min(canvas.width, car.x));
@@ -4401,7 +4511,10 @@ function updateCar(car) {
   let reward = 0;
   const currentVelAfterMove = car.maximumSpeed * 50 * car.currentSpeedFactor;
   reward += car.currentSpeedFactor * 0.02;
-  reward -= onGrass ? 1.6 : 0.0;
+  reward -= onGrass ? 3.2 : 0.0;
+  if (onGrass) {
+    reward -= clamp(laneErr / (ROAD_WIDTH / 4), 0, 3) * 0.4;
+  }
   reward -= clamp(laneErr / (ROAD_WIDTH / 3), 0, 2.5) * 0.35;
   reward -= clamp(accelJerk / 0.10, 0, 3.0) * JERK_PENALTY_BASE;
   reward -= followRisk * 0.9;
@@ -4498,51 +4611,9 @@ function updateCar(car) {
     frameRuleViolationCount += 1;
   }
 
-  const roadEdgeSensorsAfterMove = getRoadEdgeDistanceSensors(car);
-  const headingLookahead50AfterMove = getTargetHeadingLookaheadNorm(car, 50);
-  const headingLookahead100AfterMove = getTargetHeadingLookaheadNorm(car, 100);
-  const isAtStopPointAfterMove = car.isYielding &&
-                                 hadPriorityConflict &&
-                                 !car.isCommittedToTurn &&
-                                 Number.isFinite(signedDistToYieldLine) &&
-                                 Math.abs(signedDistToYieldLine) <= RULE6_STOP_LINE_TOLERANCE;
-  const trainingInput = buildStateVector(car, {
-    shouldStop,
-    needsAggressive,
-    laneErr,
-    onGrass,
-    roadEdgeSensors: roadEdgeSensorsAfterMove,
-    headingLookahead50Norm: headingLookahead50AfterMove,
-    headingLookahead100Norm: headingLookahead100AfterMove,
-    currentAcceleration: speedDelta,
-    neighborContext: neighborContextAfterMove,
-    isAtStopPoint: isAtStopPointAfterMove,
-    signedDistToYieldLineNorm,
-    onMainRoad,
-    isEllipseToVerticalLeft,
-    isEllipseToVerticalRight,
-    isVerticalToEllipseRight,
-    isVerticalToEllipseLeft,
-    isSameLaneAhead,
-    overlapType,
-    priorityStatus
-  });
-  const targetSpeed = heuristicTargetFactor;
-  const targetSteer = clamp(heuristicTargetSteer / SYMMETRIC_MAX_TURN_STEER_ANGLE, -1, 1);
-  car.lastHeuristicSample = { input: trainingInput, target: [targetSpeed, targetSteer] };
-  if (!Array.isArray(car.recentHeuristicSamples)) car.recentHeuristicSamples = [];
-  car.recentHeuristicSamples.push({ input: trainingInput.slice(), target: [targetSpeed, targetSteer] });
-  if (car.recentHeuristicSamples.length > RL_RECOVERY_CRASH_SEQUENCE_FRAMES) {
-    car.recentHeuristicSamples.shift();
-  }
-  trainingBuffer.push({ input: trainingInput, target: [targetSpeed, targetSteer] });
-  if (trainingBuffer.length > TRAINING_BUFFER_MAX) {
-    trainingBuffer.shift();
-  }
-
   if (controllerMode === 'nn') {
     car.lastPolicyTransition = {
-      input: policyInput || trainingInput,
+      input: policyInput || decisionInput,
       meanSpeed: policyMeanSpeed !== null ? policyMeanSpeed : targetSpeed,
       meanSteer: policyMeanSteer !== null ? policyMeanSteer : targetSteer,
       sampleSpeed: policySampleSpeed !== null ? policySampleSpeed : targetSpeed,
