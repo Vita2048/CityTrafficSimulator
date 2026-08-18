@@ -1952,66 +1952,27 @@ function resetSimulation() {
   function worldX(x) { return x - centerX; }
   function worldZ(y) { return y - centerY; }
 
-  function makeRoadRing() {
-    const outerA = 560 + ROAD_WIDTH / 2;
-    const outerB = 360 + ROAD_WIDTH / 2;
-    const innerA = 560 - ROAD_WIDTH / 2;
-    const innerB = 360 - ROAD_WIDTH / 2;
-    const shape = new THREE.Shape();
-    shape.absellipse(0, 0, outerA, outerB, 0, Math.PI * 2, false, 0);
-    const hole = new THREE.Path();
-    hole.absellipse(0, 0, innerA, innerB, 0, Math.PI * 2, true, 0);
-    shape.holes.push(hole);
-    const roadMat = new THREE.MeshStandardMaterial({
-    color: 0x050608,
-    roughness: 0.96,
-    metalness: 0.01
-  });
-    const road = new THREE.Mesh(
-      new THREE.ShapeGeometry(shape, 96),
-      roadMat
-    );
-    road.rotation.x = -Math.PI / 2;
-    // Keep every visible surface on a distinct height.  The old overlap with
-    // the trajectory planes caused the asphalt to cover them (and flicker at
-    // the ring/vertical-road joins).
-    road.position.y = 0.01;
-    road.receiveShadow = true;
-    threeScene.add(road);
-
-    const verticalRoad = new THREE.Mesh(
-      new THREE.BoxGeometry(ROAD_WIDTH, 0.012, 720),
-      roadMat.clone()
-    );
-    verticalRoad.position.set(0, 0.006, -50);
-    verticalRoad.receiveShadow = true;
-    threeScene.add(verticalRoad);
-  }
-
-  function addRoadMarkings() {
-    const dashMaterial = new THREE.MeshBasicMaterial({ color: 0xf8fafc, depthTest: false });
-    const dashGeometry = new THREE.BoxGeometry(16, 0.008, 2.5);
-    for (let i = 0; i < 96; i++) {
-      const t = (i / 96) * Math.PI * 2;
-      const dash = new THREE.Mesh(dashGeometry, dashMaterial);
-      dash.position.set(560 * Math.cos(t), 0.035, 360 * Math.sin(t));
-      dash.rotation.y = -Math.atan2(360 * Math.cos(t), -560 * Math.sin(t));
-      dash.renderOrder = 2;
-      threeScene.add(dash);
-    }
-    // The vertical centerline belongs only to the side road.  Stop it at the
-    // inner edge of the ellipse so it never appears on the upper/lower ring.
-    const verticalRoadConnectionZ = 360 - ROAD_WIDTH / 2;
-    const verticalDashInset = 22.5;
-    for (let z = -verticalRoadConnectionZ + verticalDashInset;
-         z <= verticalRoadConnectionZ - verticalDashInset;
-         z += 30) {
-      const dash = new THREE.Mesh(dashGeometry, dashMaterial);
-      dash.position.set(0, 0.035, z);
-      dash.rotation.y = Math.PI / 2;
-      dash.renderOrder = 2;
-      threeScene.add(dash);
-    }
+  function loadTrackModel() {
+    new THREE.GLTFLoader().load('GeminiTrack.glb', gltf => {
+      const track = gltf.scene;
+      const scaleX = 560 / 46;
+      const scaleZ = 360 / 28;
+      const scaleY = (scaleX + scaleZ) / 2;
+      track.scale.set(scaleX, scaleY, scaleZ);
+      track.position.set(0, 0, 0);
+      track.traverse(child => {
+        if (child.isMesh) {
+          child.frustumCulled = false;
+          child.receiveShadow = true;
+          if (child.name.includes('Tree') || child.name.includes('Trunk') || child.name.includes('Foliage') ||
+              child.name.includes('Pole') || child.name.includes('Signal') || child.name.includes('Pedestrian') ||
+              child.name.includes('Lamp')) {
+            child.castShadow = true;
+          }
+        }
+      });
+      threeScene.add(track);
+    }, undefined, error => console.error('Unable to load GeminiTrack.glb', error));
   }
 
   function getLampGlowTexture() {
@@ -2301,8 +2262,7 @@ function resetSimulation() {
     grass.receiveShadow = true;
     grass.position.y = -0.05;
     threeScene.add(grass);
-    makeRoadRing();
-    addRoadMarkings();
+    loadTrackModel();
     threeScene.add(new THREE.HemisphereLight(0xd7ecff, 0x345d2c, 1.4));
     const sun = new THREE.DirectionalLight(0xfff4dc, 2.4);
     sun.position.set(-450, 700, 300);
