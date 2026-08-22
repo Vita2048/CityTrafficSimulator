@@ -550,6 +550,9 @@
   // renderer maps that plane directly into an orthographic Three.js scene.
   let ctx = null;
   const ROAD_WIDTH = 90 * 1.5;
+  // Lane-center offset from the road midline. /4 put cars too far to the
+  // driver's right of Road_Asphalt; a bit under 1/4 recenters them.
+  const LANE_CENTER_OFFSET = ROAD_WIDTH * 0.175;
   const CAR_SCALE = 0.1 * 1.5;
   const CAR_LENGTH = 518 * CAR_SCALE;
   const WHEELBASE = (409 - 94) * CAR_SCALE;
@@ -560,8 +563,8 @@
   const SYMMETRIC_MAX_TURN_STEER_ANGLE = Math.PI / 5;
   const LOG_HEADING_THRESHOLD_DEG = 5;
   const LOG_DISTANCE_THRESHOLD_PX = 25;
-  const UPWARD_LANE_X = centerX + ROAD_WIDTH / 4;
-  const DOWNWARD_LANE_X = centerX - ROAD_WIDTH / 4;
+  const UPWARD_LANE_X = centerX + LANE_CENTER_OFFSET;
+  const DOWNWARD_LANE_X = centerX - LANE_CENTER_OFFSET;
   const MAX_CENTRIFUGAL_FORCE = 0.02;
   const MAX_ACCELERATION = 0.08;
   const SPEED_SMOOTHING_FACTOR = 0.12;
@@ -1023,8 +1026,8 @@
 
   function snapCarBackToTrack(car, carName = 'Car') {
     const laneSign = car.direction === -1 ? 1 : -1;
-    const fallbackA = 560 + laneSign * (ROAD_WIDTH / 4);
-    const fallbackB = 360 + laneSign * (ROAD_WIDTH / 4);
+    const fallbackA = 560 + laneSign * LANE_CENTER_OFFSET;
+    const fallbackB = 360 + laneSign * LANE_CENTER_OFFSET;
     car.a = Number.isFinite(car.a) && car.a > 0 ? car.a : fallbackA;
     car.b = Number.isFinite(car.b) && car.b > 0 ? car.b : fallbackB;
 
@@ -1096,10 +1099,10 @@
   // Nominal ellipse semi-axes (lane center is ± ROAD_WIDTH/4 from these).
   const ELLIPSE_A0 = 560;
   const ELLIPSE_B0 = 360;
-  const INNER_A = ELLIPSE_A0 - ROAD_WIDTH / 4;
-  const INNER_B = ELLIPSE_B0 - ROAD_WIDTH / 4;
-  const OUTER_A = ELLIPSE_A0 + ROAD_WIDTH / 4;
-  const OUTER_B = ELLIPSE_B0 + ROAD_WIDTH / 4;
+  const INNER_A = ELLIPSE_A0 - LANE_CENTER_OFFSET;
+  const INNER_B = ELLIPSE_B0 - LANE_CENTER_OFFSET;
+  const OUTER_A = ELLIPSE_A0 + LANE_CENTER_OFFSET;
+  const OUTER_B = ELLIPSE_B0 + LANE_CENTER_OFFSET;
   const TURN_RADIUS_PREF = Math.max(WHEELBASE / Math.tan(Math.PI / 7), ROAD_WIDTH * 0.48);
 
   function ellipsePoint(a, b, th) {
@@ -2289,8 +2292,8 @@
       const laneX = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
       return Math.abs(car.x - laneX);
     }
-    const aTarget = car.direction === 1 ? 560 - ROAD_WIDTH / 4 : 560 + ROAD_WIDTH / 4;
-    const bTarget = car.direction === 1 ? 360 - ROAD_WIDTH / 4 : 360 + ROAD_WIDTH / 4;
+    const aTarget = car.direction === 1 ? 560 - LANE_CENTER_OFFSET : 560 + LANE_CENTER_OFFSET;
+    const bTarget = car.direction === 1 ? 360 - LANE_CENTER_OFFSET : 360 + LANE_CENTER_OFFSET;
     const nx = (car.x - centerX) / aTarget;
     const ny = (car.y - centerY) / bTarget;
     const radialNorm = Math.sqrt(nx * nx + ny * ny);
@@ -2552,7 +2555,7 @@
 
   // Default properties for a car
   const CAR_DEFAULTS = {
-    maximumSpeed: 0.09,
+    maximumSpeed: 0.15,
     speed: 0.05,
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
@@ -2606,8 +2609,8 @@ function resetSimulation() {
     Object.assign(car1, createCar({
         angle: 0, // Right side
         heading: Math.PI / 2, // Pointing up
-        a: 560 - ROAD_WIDTH / 4,
-        b: 360 - ROAD_WIDTH / 4,
+        a: 560 - LANE_CENTER_OFFSET,
+        b: 360 - LANE_CENTER_OFFSET,
         direction: 1
     }));
 
@@ -2615,8 +2618,8 @@ function resetSimulation() {
     Object.assign(car2, createCar({
         angle: Math.PI * 5 / 4,
         heading: Math.PI * 5 / 4 - Math.PI / 2, // Calculated based on angle for ellipse
-        a: 560 + ROAD_WIDTH / 4,
-        b: 360 + ROAD_WIDTH / 4,
+        a: 560 + LANE_CENTER_OFFSET,
+        b: 360 + LANE_CENTER_OFFSET,
         direction: -1
     }));
 
@@ -2624,8 +2627,8 @@ function resetSimulation() {
     Object.assign(car3, createCar({
         angle: Math.PI,
         heading: Math.PI - Math.PI / 2, // Calculated based on angle for ellipse
-        a: 560 + ROAD_WIDTH / 4,
-        b: 360 + ROAD_WIDTH / 4,
+        a: 560 + LANE_CENTER_OFFSET,
+        b: 360 + LANE_CENTER_OFFSET,
         direction: -1
     }));
 
@@ -2633,8 +2636,8 @@ function resetSimulation() {
     Object.assign(car4, createCar({
         angle: Math.PI / 3,
         heading: Math.PI / 1.3, // Example fixed heading, consider dynamic calculation
-        a: 560 - ROAD_WIDTH / 4,
-        b: 360 - ROAD_WIDTH / 4,
+        a: 560 - LANE_CENTER_OFFSET,
+        b: 360 - LANE_CENTER_OFFSET,
         direction: 1
     }));
 
@@ -2642,8 +2645,8 @@ function resetSimulation() {
     Object.assign(car5, createCar({
         angle: -Math.PI / 2, // Top
         heading: Math.PI, // Pointing right
-        a: 560 + ROAD_WIDTH / 4,
-        b: 360 + ROAD_WIDTH / 4,
+        a: 560 + LANE_CENTER_OFFSET,
+        b: 360 + LANE_CENTER_OFFSET,
         direction: -1
     }));
 
@@ -2651,8 +2654,8 @@ function resetSimulation() {
     Object.assign(car6, createCar({
         angle: Math.PI / 2, // Bottom
         heading: Math.PI, // Pointing left
-        a: 560 - ROAD_WIDTH / 4,
-        b: 360 - ROAD_WIDTH / 4,
+        a: 560 - LANE_CENTER_OFFSET,
+        b: 360 - LANE_CENTER_OFFSET,
         direction: 1
     }));
 
@@ -4276,12 +4279,12 @@ function updateCar(car) {
 
         if (car.turnDirection === 'left') {
           car.direction = -1;
-          car.a = ELLIPSE_A0 + ROAD_WIDTH / 4;
-          car.b = ELLIPSE_B0 + ROAD_WIDTH / 4;
+          car.a = ELLIPSE_A0 + LANE_CENTER_OFFSET;
+          car.b = ELLIPSE_B0 + LANE_CENTER_OFFSET;
         } else {
           car.direction = 1;
-          car.a = ELLIPSE_A0 - ROAD_WIDTH / 4;
-          car.b = ELLIPSE_B0 - ROAD_WIDTH / 4;
+          car.a = ELLIPSE_A0 - LANE_CENTER_OFFSET;
+          car.b = ELLIPSE_B0 - LANE_CENTER_OFFSET;
         }
         car.canDecide = false;
     }
@@ -5329,7 +5332,7 @@ function updateCar(car) {
   reward += car.currentSpeedFactor * 0.02;
   reward -= onGrass ? 3.2 : 0.0;
   if (onGrass) {
-    reward -= clamp(laneErr / (ROAD_WIDTH / 4), 0, 3) * 0.4;
+    reward -= clamp(laneErr / (LANE_CENTER_OFFSET), 0, 3) * 0.4;
   }
   reward -= clamp(laneErr / (ROAD_WIDTH / 3), 0, 2.5) * 0.35;
   reward -= clamp(accelJerk / 0.10, 0, 3.0) * JERK_PENALTY_BASE;
