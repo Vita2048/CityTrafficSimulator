@@ -345,6 +345,73 @@
       transform: translateX(22px);
     }
 
+    /* Scene Setup side panel */
+    #sceneSetupPanel {
+      position: fixed;
+      left: 16px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 235px;
+      z-index: 50;
+      background: var(--card-bg);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 18px;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+      animation: fadeIn 1s ease-out;
+    }
+
+    #sceneSetupPanel h2 {
+      margin: 0 0 2px 0;
+      font-size: 1rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      background: linear-gradient(135deg, #a5b4fc, #6366f1, #38bdf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    #sceneSetupPanel .switch-container {
+      justify-content: space-between;
+      width: 100%;
+      box-sizing: border-box;
+    }
+
+    .slider-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .slider-row .slider-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .slider-row .slider-label span {
+      color: var(--text-main);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .slider-row input[type="range"] {
+      width: 100%;
+      margin: 0;
+      accent-color: var(--primary);
+      cursor: pointer;
+      height: 18px;
+    }
+
     @keyframes fadeIn {
       from { opacity: 0; transform: translateY(10px); }
       to { opacity: 1; transform: translateY(0); }
@@ -408,6 +475,36 @@
       </div>
     </div>
   </div>
+
+  <aside id="sceneSetupPanel">
+    <h2>Scene Setup</h2>
+    <label class="switch-container" title="Toggle day/night lighting">
+      <input type="checkbox" id="dayNightSwitch" class="switch-input" checked>
+      <span class="switch-slider"></span>
+      <span id="dayNightLabel">Night</span>
+    </label>
+    <label class="switch-container" title="Toggle future trajectory rendering">
+      <input type="checkbox" id="trajectoriesSwitch" class="switch-input" checked>
+      <span class="switch-slider"></span>
+      <span>Trajectories</span>
+    </label>
+    <div class="slider-row">
+      <div class="slider-label"><span>Lampposts</span><span id="lamppostsBrightnessValue">100%</span></div>
+      <input type="range" id="lamppostsBrightness" min="0" max="200" step="5" value="100">
+    </div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Car front lights</span><span id="headlightsBrightnessValue">100%</span></div>
+      <input type="range" id="headlightsBrightness" min="0" max="200" step="5" value="100">
+    </div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Blinkers</span><span id="blinkersBrightnessValue">100%</span></div>
+      <input type="range" id="blinkersBrightness" min="0" max="200" step="5" value="100">
+    </div>
+    <div class="slider-row">
+      <div class="slider-label"><span>Brake lights</span><span id="brakeLightsBrightnessValue">100%</span></div>
+      <input type="range" id="brakeLightsBrightness" min="0" max="200" step="5" value="100">
+    </div>
+  </aside>
 
   <div class="canvas-wrapper">
     <canvas id="trafficCanvas" width="1300" height="900"></canvas>
@@ -1949,6 +2046,29 @@ function resetSimulation() {
   // Inferred from the GLB's named front/rear indicators once it is loaded.
   let modelForwardYaw = -Math.PI / 2;
 
+  // --- Scene Setup (left panel) state ---
+  const sceneSetup = {
+    night: true,
+    showTrajectories: true,
+    brightness: { lampposts: 1, headlights: 1, blinkers: 1, brake: 1 }
+  };
+  const DAY_SCENE = {
+    background: 0x4f943d,
+    grass: 0x438c35,
+    hemiSky: 0xd7ecff, hemiGround: 0x345d2c, hemiIntensity: 1.4,
+    sunColor: 0xfff4dc, sunIntensity: 1.6
+  };
+  const NIGHT_SCENE = {
+    background: 0x0b1026,
+    grass: 0x16321b,
+    hemiSky: 0x2e3f66, hemiGround: 0x0a1420, hemiIntensity: 0.45,
+    sunColor: 0xa8c0ff, sunIntensity: 0.28
+  };
+  let trackLamps = null; // { materials, glows, lights } collected by switchOnTrackLamps
+  let grassMesh = null;
+  let hemiLight = null;
+  let sunLight = null;
+
   function worldX(x) { return x - centerX; }
   function worldZ(y) { return y - centerY; }
 
@@ -1972,7 +2092,83 @@ function resetSimulation() {
         }
       });
       threeScene.add(track);
+      switchOnTrackLamps(track);
     }, undefined, error => console.error('Unable to load GeminiTrack.glb', error));
+  }
+
+  function switchOnTrackLamps(track) {
+    track.updateMatrixWorld(true);
+    trackLamps = { materials: [], glows: [], lights: [] };
+    // Bulb/housing primitives of the lamp heads (pole and base stay dark).
+    const bulbMaterialNames = new Set(['Материал.022', 'Материал.023']);
+    let litCount = 0;
+    const posts = [];
+    // GLTFLoader strips dots from node names ('Street_Lamp.001' -> 'Street_Lamp001').
+    track.traverse(child => {
+      if (/^Street_Lamp[.]?\d*$/.test(child.name)) posts.push(child);
+    });
+    for (const post of posts) {
+      let firstBulb = null;
+      post.traverse(child => {
+        if (!child.isMesh) return;
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        if (!mats.some(m => bulbMaterialNames.has(m.name))) return;
+        child.material = Array.isArray(child.material)
+          ? child.material.map(material => material.clone())
+          : child.material.clone();
+        const clonedMats = Array.isArray(child.material) ? child.material : [child.material];
+        for (const material of clonedMats) {
+          if (!material.emissive) continue;
+          material.emissive.setHex(0xffd9a0);
+          trackLamps.materials.push(material);
+        }
+        if (!firstBulb) firstBulb = child;
+      });
+      if (!firstBulb) continue;
+      const glow = attachLampGlow(firstBulb, 0xffd9a0, 3.2).glow;
+      trackLamps.glows.push(glow);
+      const centerWorld = lampMeshBounds(firstBulb).getCenter(new THREE.Vector3());
+      const light = new THREE.PointLight(0xffc987, 1.8, 320, 2);
+      light.position.copy(track.worldToLocal(centerWorld.clone()));
+      track.add(light);
+      trackLamps.lights.push(light);
+      litCount++;
+    }
+    logEvent('lifecycle', `${litCount} street lamps registered`);
+    applyLampposts();
+  }
+
+  function applyLampposts() {
+    if (!trackLamps) return;
+    const on = sceneSetup.night;
+    const b = Math.max(0, sceneSetup.brightness.lampposts);
+    for (const material of trackLamps.materials) {
+      material.emissiveIntensity = on ? 2.2 * b : 0;
+    }
+    for (const glow of trackLamps.glows) {
+      glow.visible = on && b > 0;
+      glow.material.opacity = Math.min(1, 0.85 * b);
+    }
+    for (const light of trackLamps.lights) {
+      light.intensity = on ? 1.8 * b : 0;
+    }
+  }
+
+  function applyDayNight() {
+    if (!threeScene) return;
+    const cfg = sceneSetup.night ? NIGHT_SCENE : DAY_SCENE;
+    threeScene.background.setHex(cfg.background);
+    if (grassMesh) grassMesh.material.color.setHex(cfg.grass);
+    if (hemiLight) {
+      hemiLight.color.setHex(cfg.hemiSky);
+      hemiLight.groundColor.setHex(cfg.hemiGround);
+      hemiLight.intensity = cfg.hemiIntensity;
+    }
+    if (sunLight) {
+      sunLight.color.setHex(cfg.sunColor);
+      sunLight.intensity = cfg.sunIntensity;
+    }
+    applyLampposts();
   }
 
   function getLampGlowTexture() {
@@ -1991,6 +2187,25 @@ function resetSimulation() {
     ctx.fillRect(0, 0, size, size);
     lampGlowTexture = new THREE.CanvasTexture(canvas2d);
     return lampGlowTexture;
+  }
+
+  let beamFadeTexture = null;
+  function getBeamFadeTexture() {
+    if (beamFadeTexture) return beamFadeTexture;
+    const size = 128;
+    const canvas2d = document.createElement('canvas');
+    canvas2d.width = size;
+    canvas2d.height = size;
+    const ctx = canvas2d.getContext('2d');
+    // Bright at the cone apex (texture v=1 / canvas top), fading to the far end.
+    const fade = ctx.createLinearGradient(0, 0, 0, size);
+    fade.addColorStop(0, 'rgba(255,255,255,0.85)');
+    fade.addColorStop(0.3, 'rgba(255,255,255,0.38)');
+    fade.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = fade;
+    ctx.fillRect(0, 0, size, size);
+    beamFadeTexture = new THREE.CanvasTexture(canvas2d);
+    return beamFadeTexture;
   }
 
   function lampMeshBounds(object) {
@@ -2037,7 +2252,14 @@ function resetSimulation() {
     return { glow };
   }
 
-  function configureLightMesh(object, kind) {
+  const LIGHT_KIND_STYLE = {
+    brake: { color: 0xff2211, glowSpread: 4.2 },
+    blinker: { color: 0xffa000, glowSpread: 3.6 },
+    head: { color: 0xe8f2ff, glowSpread: 1.3 }
+  };
+
+  function configureLightMesh(object, kind, withGlow = true) {
+    const style = LIGHT_KIND_STYLE[kind] || LIGHT_KIND_STYLE.blinker;
     const materials = [];
     object.traverse(child => {
       if (!child.isMesh) return;
@@ -2047,8 +2269,7 @@ function resetSimulation() {
       const meshMaterials = Array.isArray(child.material) ? child.material : [child.material];
       materials.push(...meshMaterials);
     });
-    const color = kind === 'brake' ? 0xff2211 : 0xffb020;
-    const fx = attachLampGlow(object, color, kind === 'brake' ? 4.2 : 3.6);
+    const fx = withGlow ? attachLampGlow(object, style.color, style.glowSpread) : { glow: null };
     return { materials, glow: fx.glow };
   }
 
@@ -2080,37 +2301,110 @@ function resetSimulation() {
     model.rotation.y = Math.PI / 2;   // counterclockwise 90°
     visual.add(model);
     model.traverse(child => { if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; } });
-    const lights = { brake: [], left: [], right: [] };
+    const lights = { brake: [], left: [], right: [], head: [] };
     const namedLights = {
       brake: ['BrakeLight_L', 'BrakeLight_R'],
       left: ['TurnSignal_FL', 'TurnSignal_RL'],
-      right: ['TurnSignal_FR', 'TurnSignal_RR']
+      right: ['TurnSignal_FR', 'TurnSignal_RR'],
+      head: ['FrontLights']
     };
     for (const [kind, names] of Object.entries(namedLights)) {
       for (const name of names) {
         const object = visual.getObjectByName(name);
-        if (object) lights[kind].push(configureLightMesh(object, kind));
+        if (object) lights[kind].push(configureLightMesh(object, kind, kind !== 'head'));
         else console.warn(`Car model light mesh not found: ${name}`);
       }
     }
     visual.userData.lights = lights;
     visual.userData.lastSpeedFactor = car.currentSpeedFactor;
+    // Headlight beams + halos originate at the two lamp positions of the
+    // FrontLights glass strip (the model faces -Z locally after the PI/2
+    // import rotation, so the strip's wide axis is the car's lateral axis).
+    visual.updateMatrixWorld(true);
+    const beamSpots = [];
+    const headHalos = [];
+    const beamCones = [];
+    const headObj = visual.getObjectByName('FrontLights');
+    if (headObj) {
+      const box = lampMeshBounds(headObj);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const forwardLocal = new THREE.Vector3(0, 0, -1);
+      for (const sign of [-1, 1]) {
+        const srcLocal = center.clone();
+        if (size.x >= size.z) srcLocal.x += sign * size.x * 0.25;
+        else srcLocal.z += sign * size.z * 0.25;
+        const spot = new THREE.SpotLight(0xfff3d6, 0, 240, 0.35, 0.5, 1.15);
+        spot.visible = false;
+        threeScene.add(spot);
+        threeScene.add(spot.target);
+        beamSpots.push({ spot, srcLocal });
+        const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+          map: getLampGlowTexture(),
+          color: 0xe8f2ff,
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          opacity: 0
+        }));
+        halo.position.copy(srcLocal).addScaledVector(forwardLocal, CAR_LENGTH * 0.04);
+        halo.scale.setScalar(CAR_LENGTH * 0.38);
+        halo.renderOrder = 12;
+        halo.visible = false;
+        visual.add(halo);
+        headHalos.push(halo);
+        // Volumetric-looking beam cone: apex at the lamp, opening forward and
+        // slightly down, fading out along its length.
+        const coneLen = CAR_LENGTH * 1.7;
+        const coneGeo = new THREE.ConeGeometry(CAR_LENGTH * 0.55, coneLen, 24, 1, true);
+        coneGeo.translate(0, -coneLen / 2, 0);
+        const coneMat = new THREE.MeshBasicMaterial({
+          map: getBeamFadeTexture(),
+          color: 0xfff3d6,
+          transparent: true,
+          opacity: 0,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          side: THREE.DoubleSide
+        });
+        const cone = new THREE.Mesh(coneGeo, coneMat);
+        cone.rotation.x = Math.PI * 0.42;
+        cone.renderOrder = 11;
+        const coneGroup = new THREE.Group();
+        coneGroup.position.copy(srcLocal).addScaledVector(forwardLocal, CAR_LENGTH * 0.06);
+        coneGroup.add(cone);
+        coneGroup.visible = false;
+        visual.add(coneGroup);
+        beamCones.push({ group: coneGroup, material: coneMat });
+      }
+    }
+    visual.userData.beamSpots = beamSpots;
+    visual.userData.headHalos = headHalos;
+    visual.userData.beamCones = beamCones;
     threeScene.add(visual);
     threeCars.set(car, visual);
     return visual;
   }
 
-  function setLampState(lamps, active, color) {
+  function brightnessForKind(kind) {
+    if (kind === 'head') return sceneSetup.brightness.headlights;
+    if (kind === 'brake') return sceneSetup.brightness.brake;
+    if (kind === 'left' || kind === 'right') return sceneSetup.brightness.blinkers;
+    return 1;
+  }
+
+  function setLampState(lamps, active, color, kind) {
+    const b = Math.max(0, brightnessForKind(kind));
     for (const lamp of lamps) {
       for (const material of lamp.materials) {
         if (!material.emissive) continue;
         material.emissive.setHex(active ? color : 0x000000);
-        material.emissiveIntensity = active ? 6.5 : 0;
+        material.emissiveIntensity = active ? 6.5 * b : 0;
       }
       if (lamp.glow) {
-        lamp.glow.visible = active;
+        lamp.glow.visible = active && b > 0;
         lamp.glow.material.color.setHex(color);
-        lamp.glow.material.opacity = active ? 0.95 : 0;
+        lamp.glow.material.opacity = active ? Math.min(1, 0.95 * b) : 0;
       }
     }
   }
@@ -2136,8 +2430,11 @@ function resetSimulation() {
   }
 
   function updateTrajectoryVisual(car) {
-    const states = predictTrajectory(car);
     let meshes = trajectoryMeshes.get(car);
+    if (!sceneSetup.showTrajectories) {
+      if (meshes) meshes.forEach(mesh => { mesh.visible = false; });
+      return;
+    }
     if (!meshes) {
       meshes = Array.from({ length: TRAJECTORY_VISUAL_SAMPLES }, () => {
         const mesh = new THREE.Group();
@@ -2164,6 +2461,7 @@ function resetSimulation() {
       });
       trajectoryMeshes.set(car, meshes);
     }
+    const states = predictTrajectory(car);
     const color = trajectoryColor(turnTypeFor(car));
     meshes.forEach((mesh, index) => {
       const state = states[index];
@@ -2185,14 +2483,53 @@ function resetSimulation() {
       visual.position.set(worldX(car.x), 0.12, worldZ(car.y));
       visual.rotation.y = modelForwardYaw - car.heading + Math.PI / 2;;
       const isTurning = (car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining') && car.turnDirection;
-      setLampState(visual.userData.lights.left, !!isTurning && car.turnDirection === 'left' && blinkOn, 0xffa000);
-      setLampState(visual.userData.lights.right, !!isTurning && car.turnDirection === 'right' && blinkOn, 0xffa000);
+      setLampState(visual.userData.lights.left, !!isTurning && car.turnDirection === 'left' && blinkOn, 0xffa000, 'left');
+      setLampState(visual.userData.lights.right, !!isTurning && car.turnDirection === 'right' && blinkOn, 0xffa000, 'right');
       const braking = car.currentSpeedFactor < visual.userData.lastSpeedFactor || car.isYielding;
-      setLampState(visual.userData.lights.brake, braking, 0xff0808);
+      setLampState(visual.userData.lights.brake, braking, 0xff0808, 'brake');
+      setLampState(visual.userData.lights.head, sceneSetup.night, 0xe8f2ff, 'head');
+      const headBrightness = sceneSetup.night ? Math.max(0, sceneSetup.brightness.headlights) : 0;
+      updateHeadlightBeam(visual, car, headBrightness);
       visual.userData.lastSpeedFactor = car.currentSpeedFactor;
       updateTrajectoryVisual(car);
     }
     threeRenderer.render(threeScene, threeCamera);
+  }
+
+  function updateHeadlightBeam(visual, car, brightness) {
+    const beamSpots = visual.userData.beamSpots;
+    const headHalos = visual.userData.headHalos;
+    if (!beamSpots || !Number.isFinite(car.frontX) || !Number.isFinite(car.frontY)) return;
+    const on = brightness > 0;
+    visual.updateMatrixWorld(true);
+    const dirX = Math.cos(car.heading);
+    const dirZ = Math.sin(car.heading);
+    const latX = dirZ;
+    const latZ = -dirX;
+    let sideSign = 1;
+    for (const entry of beamSpots) {
+      const spot = entry.spot;
+      spot.visible = on;
+      spot.intensity = 1.8 * brightness;
+      if (!on) continue;
+      const pos = visual.localToWorld(entry.srcLocal.clone());
+      spot.position.copy(pos);
+      spot.target.position.set(
+        pos.x + dirX * 85 + latX * 8 * sideSign,
+        0,
+        pos.z + dirZ * 85 + latZ * 8 * sideSign
+      );
+      spot.target.updateMatrixWorld();
+      sideSign = -sideSign;
+    }
+    for (const halo of headHalos) {
+      halo.visible = on;
+      halo.material.opacity = Math.min(1, 0.9 * brightness);
+    }
+    for (const beamCone of visual.userData.beamCones || []) {
+      beamCone.group.visible = on;
+      beamCone.material.opacity = 0.13 * brightness;
+    }
   }
 
   function frameTrackInView() {
@@ -2250,30 +2587,32 @@ function resetSimulation() {
     threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
     threeRenderer.outputEncoding = THREE.sRGBEncoding;
     threeScene = new THREE.Scene();
-    threeScene.background = new THREE.Color(0x4f943d);
+    threeScene.background = new THREE.Color(0x0b1026);
     // 45° CitySim tilt; distance is chosen so the ring fills the canvas.
     threeCamera = new THREE.PerspectiveCamera(42, 1300 / 900, 20, 8000);
 
     const grass = new THREE.Mesh(
       new THREE.PlaneGeometry(14000, 14000),
-      new THREE.MeshStandardMaterial({ color: 0x438c35, roughness: 1 })
+      new THREE.MeshStandardMaterial({ color: 0x16321b, roughness: 1 })
     );
     grass.rotation.x = -Math.PI / 2;
     grass.receiveShadow = true;
     grass.position.y = -0.05;
     threeScene.add(grass);
+    grassMesh = grass;
     loadTrackModel();
-    threeScene.add(new THREE.HemisphereLight(0xd7ecff, 0x345d2c, 1.4));
-    const sun = new THREE.DirectionalLight(0xfff4dc, 2.4);
-    sun.position.set(-450, 700, 300);
-    sun.intensity = 1.6;
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    sun.shadow.camera.left = -800;
-    sun.shadow.camera.right = 800;
-    sun.shadow.camera.top = 600;
-    sun.shadow.camera.bottom = -600;
-    threeScene.add(sun);
+    hemiLight = new THREE.HemisphereLight(0x2e3f66, 0x0a1420, 0.45);
+    threeScene.add(hemiLight);
+    sunLight = new THREE.DirectionalLight(0xa8c0ff, 0.28);
+    sunLight.position.set(-450, 700, 300);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.set(2048, 2048);
+    sunLight.shadow.camera.left = -800;
+    sunLight.shadow.camera.right = 800;
+    sunLight.shadow.camera.top = 600;
+    sunLight.shadow.camera.bottom = -600;
+    threeScene.add(sunLight);
+    applyDayNight();
 
     resizeThreeRenderer();
     window.addEventListener('resize', resizeThreeRenderer);
@@ -4865,6 +5204,31 @@ function updateCar(car) {
       setSimulationRunning(true, lastCrashPauseReason ? 'after crash pause' : 'user resume');
     }
   }
+
+  // --- Scene Setup panel wiring ---
+  document.getElementById('dayNightSwitch').addEventListener('change', e => {
+    sceneSetup.night = e.target.checked;
+    document.getElementById('dayNightLabel').textContent = sceneSetup.night ? 'Night' : 'Day';
+    applyDayNight();
+  });
+  document.getElementById('trajectoriesSwitch').addEventListener('change', e => {
+    sceneSetup.showTrajectories = e.target.checked;
+  });
+  [
+    ['lamppostsBrightness', 'lampposts'],
+    ['headlightsBrightness', 'headlights'],
+    ['blinkersBrightness', 'blinkers'],
+    ['brakeLightsBrightness', 'brake']
+  ].forEach(([inputId, key]) => {
+    const input = document.getElementById(inputId);
+    const valueLabel = document.getElementById(`${inputId}Value`);
+    const apply = () => {
+      sceneSetup.brightness[key] = input.value / 100;
+      valueLabel.textContent = `${input.value}%`;
+      if (key === 'lampposts') applyLampposts();
+    };
+    input.addEventListener('input', apply);
+  });
 
   initThreeRenderer();
   resetSimulation();
