@@ -572,6 +572,8 @@
   const TARGET_COMMAND_SMOOTH_DOWN = 0.32;// blend rate when lowering speed target (still rate-capped)
   const STEERING_SMOOTHING_FACTOR = 0.1;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
+  const DEBUG_SHOW_RAILS_ONLY = false;
+  const DEBUG_SHOW_RAILS = true; // Keep lane-center (front-axle) rails visible
   const DEBUG_LOG = true; // Enabled for debugging
   const LOG_CONFIG = {
     training: true,
@@ -1049,7 +1051,8 @@
     car.currentSpeedFactor = Number.isFinite(car.currentSpeedFactor) ? clamp(car.currentSpeedFactor, 0, 1) : 0.3;
     car.targetSteerAngle = 0;
     car.steerAngle = 0;
-    rebuildCarGeometryFromCenter(car);
+    car.turnJunction = null;
+    attachCarToRail(car);
     logEvent('behavior', `${carName} recovered to track after invalid state`, true);
   }
 
@@ -1093,6 +1096,694 @@
   // Nominal ellipse semi-axes (lane center is ± ROAD_WIDTH/4 from these).
   const ELLIPSE_A0 = 560;
   const ELLIPSE_B0 = 360;
+  const INNER_A = ELLIPSE_A0 - ROAD_WIDTH / 4;
+  const INNER_B = ELLIPSE_B0 - ROAD_WIDTH / 4;
+  const OUTER_A = ELLIPSE_A0 + ROAD_WIDTH / 4;
+  const OUTER_B = ELLIPSE_B0 + ROAD_WIDTH / 4;
+  const TURN_RADIUS_PREF = Math.max(WHEELBASE / Math.tan(Math.PI / 7), ROAD_WIDTH * 0.48);
+
+  function ellipsePoint(a, b, th) {
+    return { x: centerX + a * Math.cos(th), y: centerY + b * Math.sin(th) };
+  }
+
+  function ellipseTangent(a, b, th, dir) {
+    let tx = -a * Math.sin(th);
+    let ty = b * Math.cos(th);
+    if (dir < 0) { tx = -tx; ty = -ty; }
+    const len = Math.hypot(tx, ty) || 1;
+    return { x: tx / len, y: ty / len };
+  }
+
+  function ellipseThetaAtX(a, x, side) {
+    const c = clamp((x - centerX) / a, -1, 1);
+    const ac = Math.acos(c);
+    return side === 'top' ? -ac : ac;
+  }
+
+  function leftNormal(tx, ty) {
+    return { x: ty, y: -tx };
+  }
+
+  function assignVertexTangents(points, loop) {
+    const n = points.length;
+    for (let i = 0; i < n; i++) {
+      if (Number.isFinite(points[i].tx) && Number.isFinite(points[i].ty)) continue;
+      const prev = points[loop ? (i + n - 1) % n : Math.max(0, i - 1)];
+      const next = points[loop ? (i + 1) % n : Math.min(n - 1, i + 1)];
+      let tx = next.x - prev.x;
+      let ty = next.y - prev.y;
+      const len = Math.hypot(tx, ty) || 1;
+      points[i].tx = tx / len;
+      points[i].ty = ty / len;
+    }
+  }
+
+  function buildPolyline(points, loop) {
+    assignVertexTangents(points, loop);
+    const cum = [0];
+    for (let i = 1; i < points.length; i++) {
+      cum.push(cum[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y));
+    }
+    if (loop && points.length > 1) {
+      const close = Math.hypot(points[0].x - points[points.length - 1].x, points[0].y - points[points.length - 1].y);
+      cum.push(cum[cum.length - 1] + close);
+      points = points.concat([{ x: points[0].x, y: points[0].y, tx: points[0].tx, ty: points[0].ty }]);
+    }
+    return { points, cum, length: cum[cum.length - 1], loop: !!loop };
+  }
+
+  function samplePolyline(poly, s) {
+    const L = poly.length || 1;
+    if (poly.loop) {
+      s = ((s % L) + L) % L;
+    } else {
+      s = clamp(s, 0, L);
+    }
+    const cum = poly.cum;
+    let lo = 0;
+    let hi = cum.length - 1;
+    while (lo < hi - 1) {
+      const mid = (lo + hi) >> 1;
+      if (cum[mid] <= s) lo = mid;
+      else hi = mid;
+    }
+    const p0 = poly.points[lo];
+    const p1 = poly.points[Math.min(lo + 1, poly.points.length - 1)];
+    const span = Math.max(1e-6, cum[Math.min(lo + 1, cum.length - 1)] - cum[lo]);
+    const t = clamp((s - cum[lo]) / span, 0, 1);
+    const x = p0.x + (p1.x - p0.x) * t;
+    const y = p0.y + (p1.y - p0.y) * t;
+    let tx = (p0.tx || 0) * (1 - t) + (p1.tx || 0) * t;
+    let ty = (p0.ty || 0) * (1 - t) + (p1.ty || 0) * t;
+    const tl = Math.hypot(tx, ty);
+    if (tl < 1e-6) {
+      tx = p1.x - p0.x;
+      ty = p1.y - p0.y;
+    }
+    const tl2 = Math.hypot(tx, ty) || 1;
+    return { x, y, tx: tx / tl2, ty: ty / tl2 };
+  }
+
+  function projectToPolyline(poly, x, y) {
+    let bestS = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < poly.points.length - 1; i++) {
+      const a = poly.points[i];
+      const b = poly.points[i + 1];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const seg = Math.hypot(dx, dy) || 1e-6;
+      let t = ((x - a.x) * dx + (y - a.y) * dy) / (seg * seg);
+      t = clamp(t, 0, 1);
+      const px = a.x + dx * t;
+      const py = a.y + dy * t;
+      const d = Math.hypot(x - px, y - py);
+      if (d < bestD) {
+        bestD = d;
+        bestS = poly.cum[i] + t * (poly.cum[i + 1] - poly.cum[i]);
+      }
+    }
+    return bestS;
+  }
+
+  function sampleEllipseRail(a, b, dir, n) {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const th = dir === 1 ? (i / n) * Math.PI * 2 : -(i / n) * Math.PI * 2;
+      const p = ellipsePoint(a, b, th);
+      const t = ellipseTangent(a, b, th, dir);
+      pts.push({ x: p.x, y: p.y, tx: t.x, ty: t.y });
+    }
+    return buildPolyline(pts, true);
+  }
+
+  function sampleVerticalRail(x, y0, y1) {
+    const n = Math.max(16, Math.ceil(Math.abs(y1 - y0) / 3));
+    const pts = [];
+    const ty = Math.sign(y1 - y0) || 1;
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      pts.push({ x, y: y0 + (y1 - y0) * t, tx: 0, ty });
+    }
+    return buildPolyline(pts, false);
+  }
+
+  function unit(x, y) {
+    const len = Math.hypot(x, y) || 1;
+    return { x: x / len, y: y / len };
+  }
+
+  function sampleHermite(p0, t0, p1, t1, n) {
+    const d = Math.max(40, Math.hypot(p1.x - p0.x, p1.y - p0.y));
+    const k = Math.min(d * 0.38, ROAD_WIDTH * 0.5);
+    const t0u = unit(t0.x, t0.y);
+    const t1u = unit(t1.x, t1.y);
+    const c1 = { x: p0.x + t0u.x * k, y: p0.y + t0u.y * k };
+    const c2 = { x: p1.x - t1u.x * k, y: p1.y - t1u.y * k };
+    const pts = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const u = 1 - t;
+      const x = u * u * u * p0.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * p1.x;
+      const y = u * u * u * p0.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * p1.y;
+      const dx = 3 * u * u * (c1.x - p0.x) + 6 * u * t * (c2.x - c1.x) + 3 * t * t * (p1.x - c2.x);
+      const dy = 3 * u * u * (c1.y - p0.y) + 6 * u * t * (c2.y - c1.y) + 3 * t * t * (p1.y - c2.y);
+      const tn = unit(dx, dy);
+      pts.push({ x, y, tx: tn.x, ty: tn.y });
+    }
+    return buildPolyline(pts, false);
+  }
+
+  function sampleCircularArc(C, P0, T0, P1) {
+    const r0x = P0.x - C.x;
+    const r0y = P0.y - C.y;
+    const R = Math.max(8, Math.hypot(r0x, r0y));
+    const ccw = { x: -r0y, y: r0x };
+    const travelCcw = ccw.x * T0.x + ccw.y * T0.y >= 0;
+    let a0 = Math.atan2(P0.y - C.y, P0.x - C.x);
+    let a1 = Math.atan2(P1.y - C.y, P1.x - C.x);
+    let da = a1 - a0;
+    if (travelCcw) {
+      if (da <= 1e-4) da += Math.PI * 2;
+    } else if (da >= -1e-4) {
+      da -= Math.PI * 2;
+    }
+    if (Math.abs(da) > Math.PI) {
+      da += da > 0 ? -Math.PI * 2 : Math.PI * 2;
+    }
+    const n = Math.max(20, Math.ceil(Math.abs(da) * R / 3));
+    const pts = [];
+    const sgn = da >= 0 ? 1 : -1;
+    for (let i = 0; i <= n; i++) {
+      const a = a0 + da * (i / n);
+      pts.push({
+        x: C.x + R * Math.cos(a),
+        y: C.y + R * Math.sin(a),
+        tx: -Math.sin(a) * sgn,
+        ty: Math.cos(a) * sgn
+      });
+    }
+    return buildPolyline(pts, false);
+  }
+
+  function turnNormal(tx, ty, turnLeft) {
+    const n = leftNormal(tx, ty);
+    return turnLeft ? n : { x: -n.x, y: -n.y };
+  }
+
+  function headingDelta(t0, t1) {
+    let d = Math.atan2(t1.y, t1.x) - Math.atan2(t0.y, t0.x);
+    while (d > Math.PI) d -= 2 * Math.PI;
+    while (d < -Math.PI) d += 2 * Math.PI;
+    return d;
+  }
+
+  function fitEllipseToVerticalFillet(a, b, dir, laneX, vTy, turnLeft, thetaLo, thetaHi, rMin, rMax) {
+    const n1 = turnNormal(0, vTy, turnLeft);
+    const T1 = { x: 0, y: vTy };
+    let best = null;
+    let bestScore = Infinity;
+    const steps = 400;
+    for (let i = 0; i <= steps; i++) {
+      const th = thetaLo + (thetaHi - thetaLo) * (i / steps);
+      const P0 = ellipsePoint(a, b, th);
+      const T0 = ellipseTangent(a, b, th, dir);
+      const n0 = turnNormal(T0.x, T0.y, turnLeft);
+      const denom = n0.x - n1.x;
+      if (Math.abs(denom) < 1e-4) continue;
+      const R = (laneX - P0.x) / denom;
+      if (!(R > rMin && R < rMax)) continue;
+      const C = { x: P0.x + R * n0.x, y: P0.y + R * n0.y };
+      const P1 = { x: laneX, y: C.y - R * n1.y };
+      if (vTy > 0 && !(P1.y > P0.y + 12 && P1.y < centerY - 20)) continue;
+      if (vTy < 0 && !(P1.y < P0.y - 12 && P1.y > centerY + 20)) continue;
+      const dh = headingDelta(T0, T1);
+      if (turnLeft && dh > -0.35) continue;
+      if (!turnLeft && dh < 0.35) continue;
+      const absDh = Math.abs(dh);
+      if (absDh < 0.5 || absDh > 2.4) continue;
+      const score = Math.abs(R - (turnLeft ? ROAD_WIDTH * 0.85 : ROAD_WIDTH * 0.42)) +
+        Math.abs(absDh - Math.PI / 2) * 35;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { P0, T0, P1, T1, C, R, th };
+      }
+    }
+    return best;
+  }
+
+  function fitVerticalToEllipseFillet(a, b, dir, laneX, vTy, turnLeft, thetaLo, thetaHi, rMin, rMax) {
+    const n0 = turnNormal(0, vTy, turnLeft);
+    const T0 = { x: 0, y: vTy };
+    let best = null;
+    let bestScore = Infinity;
+    const steps = 400;
+    for (let i = 0; i <= steps; i++) {
+      const th = thetaLo + (thetaHi - thetaLo) * (i / steps);
+      const P1 = ellipsePoint(a, b, th);
+      const T1 = ellipseTangent(a, b, th, dir);
+      const n1 = turnNormal(T1.x, T1.y, turnLeft);
+      const denom = n0.x - n1.x;
+      if (Math.abs(denom) < 1e-4) continue;
+      const R = (P1.x - laneX) / denom;
+      if (!(R > rMin && R < rMax)) continue;
+      const C = { x: laneX + R * n0.x, y: P1.y + R * n1.y };
+      const P0 = { x: laneX, y: C.y - R * n0.y };
+      if (vTy > 0 && !(P0.y < P1.y - 12 && P0.y > centerY + 20)) continue;
+      if (vTy < 0 && !(P0.y > P1.y + 12 && P0.y < centerY - 20)) continue;
+      const dh = headingDelta(T0, T1);
+      if (turnLeft && dh > -0.35) continue;
+      if (!turnLeft && dh < 0.35) continue;
+      const absDh = Math.abs(dh);
+      if (absDh < 0.5 || absDh > 2.4) continue;
+      const score = Math.abs(R - (turnLeft ? ROAD_WIDTH * 0.85 : ROAD_WIDTH * 0.42)) +
+        Math.abs(absDh - Math.PI / 2) * 35;
+      if (score < bestScore) {
+        bestScore = score;
+        best = { P0, T0, P1, T1, C, R, th };
+      }
+    }
+    return best;
+  }
+
+  function polyFromFit(fit, fallback) {
+    if (fit && fit.C) return sampleCircularArc(fit.C, fit.P0, fit.T0, fit.P1);
+    return sampleHermite(fallback.p0, fallback.t0, fallback.p1, fallback.t1, 40);
+  }
+
+  const rails = {};
+
+  function registerRail(id, poly, extra) {
+    rails[id] = Object.assign({ id, branches: [] }, poly, extra || {});
+  }
+
+  registerRail('ellipse-cw', sampleEllipseRail(INNER_A, INNER_B, 1, 720), {
+    kind: 'ellipse', dir: 1, a: INNER_A, b: INNER_B, loop: true
+  });
+  registerRail('ellipse-ccw', sampleEllipseRail(OUTER_A, OUTER_B, -1, 720), {
+    kind: 'ellipse', dir: -1, a: OUTER_A, b: OUTER_B, loop: true
+  });
+
+  const R_RIGHT = { min: 38, max: 95 };
+  const R_LEFT = { min: 70, max: 190 };
+
+  const F_TOP_CW_DOWN = fitEllipseToVerticalFillet(INNER_A, INNER_B, 1, DOWNWARD_LANE_X, 1, false, -2.15, -1.35, R_RIGHT.min, R_RIGHT.max);
+  const F_TOP_CCW_DOWN = fitEllipseToVerticalFillet(OUTER_A, OUTER_B, -1, DOWNWARD_LANE_X, 1, true, -1.55, -0.25, R_LEFT.min, R_LEFT.max);
+  const F_BOT_CW_UP = fitEllipseToVerticalFillet(INNER_A, INNER_B, 1, UPWARD_LANE_X, -1, false, 1.35, 2.15, R_RIGHT.min, R_RIGHT.max);
+  const F_BOT_CCW_UP = fitEllipseToVerticalFillet(OUTER_A, OUTER_B, -1, UPWARD_LANE_X, -1, true, 1.55, 2.9, R_LEFT.min, R_LEFT.max);
+  const F_TOP_UP_CW = fitVerticalToEllipseFillet(INNER_A, INNER_B, 1, UPWARD_LANE_X, -1, false, -1.55, -0.25, R_RIGHT.min, R_RIGHT.max);
+  const F_TOP_UP_CCW = fitVerticalToEllipseFillet(OUTER_A, OUTER_B, -1, UPWARD_LANE_X, -1, true, -2.9, -1.55, R_LEFT.min, R_LEFT.max);
+  const F_BOT_DOWN_CW = fitVerticalToEllipseFillet(INNER_A, INNER_B, 1, DOWNWARD_LANE_X, 1, false, 1.55, 2.9, R_RIGHT.min, R_RIGHT.max);
+  const F_BOT_DOWN_CCW = fitVerticalToEllipseFillet(OUTER_A, OUTER_B, -1, DOWNWARD_LANE_X, 1, true, 0.25, 1.55, R_LEFT.min, R_LEFT.max);
+
+  function vertY(fit, which) {
+    if (!fit) return which === 'top' ? centerY - ELLIPSE_B0 + 70 : centerY + ELLIPSE_B0 - 70;
+    return fit.P0.x === undefined ? fit.P1.y : (which === 'fromVert' ? fit.P0.y : fit.P1.y);
+  }
+
+  const topJoinYs = [
+    F_TOP_CW_DOWN && F_TOP_CW_DOWN.P1.y,
+    F_TOP_CCW_DOWN && F_TOP_CCW_DOWN.P1.y,
+    F_TOP_UP_CW && F_TOP_UP_CW.P0.y,
+    F_TOP_UP_CCW && F_TOP_UP_CCW.P0.y
+  ].filter(Number.isFinite);
+  const botJoinYs = [
+    F_BOT_CW_UP && F_BOT_CW_UP.P1.y,
+    F_BOT_CCW_UP && F_BOT_CCW_UP.P1.y,
+    F_BOT_DOWN_CW && F_BOT_DOWN_CW.P0.y,
+    F_BOT_DOWN_CCW && F_BOT_DOWN_CCW.P0.y
+  ].filter(Number.isFinite);
+  const VERT_TOP_Y = topJoinYs.length ? Math.min(...topJoinYs) : centerY - ELLIPSE_B0 + 70;
+  const VERT_BOT_Y = botJoinYs.length ? Math.max(...botJoinYs) : centerY + ELLIPSE_B0 - 70;
+
+  registerRail('vert-down', sampleVerticalRail(DOWNWARD_LANE_X, VERT_TOP_Y, VERT_BOT_Y), {
+    kind: 'vertical', vdir: 'down'
+  });
+  registerRail('vert-up', sampleVerticalRail(UPWARD_LANE_X, VERT_BOT_Y, VERT_TOP_Y), {
+    kind: 'vertical', vdir: 'up'
+  });
+
+  function addFitConnector(id, fit, fallback, extra) {
+    registerRail(id, polyFromFit(fit, fallback), Object.assign({ kind: 'connector' }, extra));
+  }
+
+  addFitConnector('top-cw-to-down', F_TOP_CW_DOWN, {
+    p0: ellipsePoint(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, DOWNWARD_LANE_X, 'top')),
+    t0: ellipseTangent(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, DOWNWARD_LANE_X, 'top'), 1),
+    p1: { x: DOWNWARD_LANE_X, y: VERT_TOP_Y }, t1: { x: 0, y: 1 }
+  }, { from: 'ellipse', vdir: 'down', next: 'vert-down', blinker: 'right' });
+  addFitConnector('top-ccw-to-down', F_TOP_CCW_DOWN, {
+    p0: ellipsePoint(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, UPWARD_LANE_X, 'top')),
+    t0: ellipseTangent(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, UPWARD_LANE_X, 'top'), -1),
+    p1: { x: DOWNWARD_LANE_X, y: VERT_TOP_Y }, t1: { x: 0, y: 1 }
+  }, { from: 'ellipse', vdir: 'down', next: 'vert-down', blinker: 'left' });
+  addFitConnector('bot-cw-to-up', F_BOT_CW_UP, {
+    p0: ellipsePoint(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, UPWARD_LANE_X, 'bottom')),
+    t0: ellipseTangent(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, UPWARD_LANE_X, 'bottom'), 1),
+    p1: { x: UPWARD_LANE_X, y: VERT_BOT_Y }, t1: { x: 0, y: -1 }
+  }, { from: 'ellipse', vdir: 'up', next: 'vert-up', blinker: 'right' });
+  addFitConnector('bot-ccw-to-up', F_BOT_CCW_UP, {
+    p0: ellipsePoint(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, DOWNWARD_LANE_X, 'bottom')),
+    t0: ellipseTangent(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, DOWNWARD_LANE_X, 'bottom'), -1),
+    p1: { x: UPWARD_LANE_X, y: VERT_BOT_Y }, t1: { x: 0, y: -1 }
+  }, { from: 'ellipse', vdir: 'up', next: 'vert-up', blinker: 'left' });
+  addFitConnector('top-up-to-cw', F_TOP_UP_CW, {
+    p0: { x: UPWARD_LANE_X, y: VERT_TOP_Y }, t0: { x: 0, y: -1 },
+    p1: ellipsePoint(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, UPWARD_LANE_X, 'top')),
+    t1: ellipseTangent(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, UPWARD_LANE_X, 'top'), 1)
+  }, { from: 'vertical', toDir: 1, a: INNER_A, b: INNER_B, next: 'ellipse-cw', blinker: 'right' });
+  addFitConnector('top-up-to-ccw', F_TOP_UP_CCW, {
+    p0: { x: UPWARD_LANE_X, y: VERT_TOP_Y }, t0: { x: 0, y: -1 },
+    p1: ellipsePoint(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, DOWNWARD_LANE_X, 'top')),
+    t1: ellipseTangent(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, DOWNWARD_LANE_X, 'top'), -1)
+  }, { from: 'vertical', toDir: -1, a: OUTER_A, b: OUTER_B, next: 'ellipse-ccw', blinker: 'left' });
+  addFitConnector('bot-down-to-cw', F_BOT_DOWN_CW, {
+    p0: { x: DOWNWARD_LANE_X, y: VERT_BOT_Y }, t0: { x: 0, y: 1 },
+    p1: ellipsePoint(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, DOWNWARD_LANE_X, 'bottom')),
+    t1: ellipseTangent(INNER_A, INNER_B, ellipseThetaAtX(INNER_A, DOWNWARD_LANE_X, 'bottom'), 1)
+  }, { from: 'vertical', toDir: 1, a: INNER_A, b: INNER_B, next: 'ellipse-cw', blinker: 'right' });
+  addFitConnector('bot-down-to-ccw', F_BOT_DOWN_CCW, {
+    p0: { x: DOWNWARD_LANE_X, y: VERT_BOT_Y }, t0: { x: 0, y: 1 },
+    p1: ellipsePoint(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, UPWARD_LANE_X, 'bottom')),
+    t1: ellipseTangent(OUTER_A, OUTER_B, ellipseThetaAtX(OUTER_A, UPWARD_LANE_X, 'bottom'), -1)
+  }, { from: 'vertical', toDir: -1, a: OUTER_A, b: OUTER_B, next: 'ellipse-ccw', blinker: 'left' });
+
+  rails['vert-down'].next = (plan) => {
+    if (plan && plan.turnDirection === 'right') return 'bot-down-to-cw';
+    if (plan && plan.turnDirection === 'left') return 'bot-down-to-ccw';
+    return null;
+  };
+  rails['vert-up'].next = (plan) => {
+    if (plan && plan.turnDirection === 'right') return 'top-up-to-cw';
+    if (plan && plan.turnDirection === 'left') return 'top-up-to-ccw';
+    return null;
+  };
+
+  function addEllipseBranch(ellipseId, connectorId, junction) {
+    const conn = rails[connectorId];
+    const p0 = conn.points[0];
+    const s = projectToPolyline(rails[ellipseId], p0.x, p0.y);
+    rails[ellipseId].branches.push({ s, railId: connectorId, junction });
+  }
+  addEllipseBranch('ellipse-cw', 'top-cw-to-down', 'top');
+  addEllipseBranch('ellipse-cw', 'bot-cw-to-up', 'bottom');
+  addEllipseBranch('ellipse-ccw', 'top-ccw-to-down', 'top');
+  addEllipseBranch('ellipse-ccw', 'bot-ccw-to-up', 'bottom');
+
+  function wantsEllipseTurn(plan, junction) {
+    if (!plan) return false;
+    if (!plan.isMakingTurn) return false;
+    if (plan.turnDirection !== 'left' && plan.turnDirection !== 'right') return false;
+    if (plan.turnJunction && plan.turnJunction !== junction) return false;
+    return true;
+  }
+
+  function branchDistance(rail, s, branch) {
+    const L = rail.length;
+    let d = branch.s - s;
+    if (d < 0) d += L;
+    if (d > L - 4) d = 0;
+    return d;
+  }
+
+  function nextBranchAhead(rail, s, plan) {
+    if (!rail.branches || !rail.branches.length) return null;
+    let best = null;
+    let bestDist = Infinity;
+    for (const br of rail.branches) {
+      if (br.junction && !wantsEllipseTurn(plan, br.junction)) continue;
+      if (br.turnDirection && (!plan || plan.turnDirection !== br.turnDirection)) continue;
+      const d = rail.loop ? branchDistance(rail, s, br) : (br.s - s);
+      if (!rail.loop && d < -4) continue;
+      const dist = !rail.loop && d < 0 ? 0 : d;
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = br;
+      }
+    }
+    return best;
+  }
+
+  function railPlanFromCar(car) {
+    return {
+      isMakingTurn: !!car.isMakingTurn,
+      turnDirection: car.turnDirection,
+      turnJunction: car.turnJunction,
+      turnState: car.turnState,
+      path: car.path,
+      direction: car.direction,
+      verticalDirection: car.verticalDirection,
+      isYielding: !!car.isYielding,
+      isCommittedToTurn: !!car.isCommittedToTurn
+    };
+  }
+
+  function enterRail(car, railId) {
+    const meta = rails[railId];
+    if (!meta) return;
+    if (meta.kind === 'vertical') {
+      car.path = 'vertical';
+      car.verticalDirection = meta.vdir;
+      car.turnState = null;
+      car.isMakingTurn = false;
+      car.turnDirection = null;
+      car.isCommittedToTurn = false;
+      car.canDecide = true;
+      car.turnJunction = null;
+      car.rejoinBuffer = 0;
+    } else if (meta.kind === 'ellipse') {
+      car.path = 'ellipse';
+      car.direction = meta.dir;
+      car.a = meta.a;
+      car.b = meta.b;
+      if (car.turnState === 'rejoining' || car.verticalDirection) {
+        car.turnState = 'rejoining';
+        car.isCommittedToTurn = true;
+        car.rejoinBuffer = 0;
+      }
+    } else if (meta.kind === 'connector') {
+      car.isCommittedToTurn = true;
+      if (meta.blinker === 'left' || meta.blinker === 'right') {
+        car.turnDirection = meta.blinker;
+      }
+      if (meta.from === 'ellipse') {
+        car.path = 'vertical';
+        car.verticalDirection = meta.vdir;
+        car.turnState = 'turning';
+        car.isMakingTurn = true;
+      } else {
+        car.path = 'ellipse';
+        car.direction = meta.toDir;
+        car.a = meta.a;
+        car.b = meta.b;
+        car.turnState = 'rejoining';
+        car.verticalDirection = car.verticalDirection || (meta.next && rails[meta.next] && rails[meta.next].kind === 'ellipse' ? car.verticalDirection : car.verticalDirection);
+      }
+    }
+    car.railId = railId;
+  }
+
+  function joinRailAt(fromRail, fromS, toId) {
+    const dest = rails[toId];
+    if (!dest) return 0;
+    const pt = samplePolyline(fromRail, fromS);
+    let s = projectToPolyline(dest, pt.x, pt.y);
+    // Entering a connector from a through-lane: never snap to the far end.
+    if (dest.kind === 'connector' && fromRail.kind !== 'connector' && s > dest.length * 0.45) {
+      s = 0;
+    }
+    const p = samplePolyline(dest, s);
+    const along = (pt.tx || 0) * (p.x - pt.x) + (pt.ty || 0) * (p.y - pt.y);
+    if (along < -1.5) {
+      s = Math.min(dest.length, s + Math.min(12, Math.max(2, -along)));
+    }
+    if (!dest.loop) s = clamp(s, 0, dest.length);
+    return s;
+  }
+
+  function walkRails(railId, s0, distance, plan, onEnter) {
+    let id = railId;
+    let s = Math.max(0, s0);
+    let left = distance;
+    if (!rails[id]) return { railId: id, s };
+    const holdForYield = !!(plan && plan.isYielding && !plan.isCommittedToTurn);
+    for (let guard = 0; guard < 12 && left > 1e-4; guard++) {
+      const rail = rails[id];
+      if (rail.loop) {
+        const branch = nextBranchAhead(rail, s, plan);
+        const L = rail.length;
+        if (branch) {
+          const d = branchDistance(rail, s, branch);
+          if (holdForYield) {
+            s += Math.min(left, Math.max(0, d - 2));
+            left = 0;
+            break;
+          }
+          if (d <= left) {
+            left -= d;
+            const joinS = joinRailAt(rail, branch.s, branch.railId);
+            if (onEnter) onEnter(branch.railId);
+            id = branch.railId;
+            s = joinS;
+            continue;
+          }
+        }
+        s = (s + left) % L;
+        left = 0;
+      } else {
+        const remain = Math.max(0, rail.length - s);
+        const next = typeof rail.next === 'function' ? rail.next(plan) : rail.next;
+        if (holdForYield && (rail.kind === 'vertical' || rail.kind === 'connector')) {
+          s = Math.min(Math.max(0, rail.length - 2), s + left);
+          left = 0;
+          break;
+        }
+        if (left < remain) {
+          s += left;
+          left = 0;
+        } else {
+          left -= remain;
+          if (!next || !rails[next]) {
+            s = rail.length;
+            left = 0;
+            break;
+          }
+          const joinS = joinRailAt(rail, rail.length, next);
+          if (onEnter) onEnter(next);
+          id = next;
+          s = joinS;
+        }
+      }
+    }
+    return { railId: id, s };
+  }
+
+  function sampleNetworkAt(railId, s, plan) {
+    if (!rails[railId]) return { x: centerX, y: centerY, tx: 1, ty: 0 };
+    return samplePolyline(rails[railId], s);
+  }
+
+  function sampleNetworkForward(railId, s, ahead, plan) {
+    const dest = walkRails(railId, s, ahead, plan, null);
+    if (!rails[dest.railId]) return sampleNetworkAt(railId, s, plan);
+    return samplePolyline(rails[dest.railId], dest.s);
+  }
+
+  function pathCurvature(railId, s, plan) {
+    const ds = 10;
+    const a = sampleNetworkAt(railId, s, plan);
+    const b = sampleNetworkForward(railId, s, ds, plan);
+    const h0 = Math.atan2(a.ty, a.tx);
+    const h1 = Math.atan2(b.ty, b.tx);
+    return normalizeAngle(h1 - h0) / ds;
+  }
+
+  function applyBicyclePose(state) {
+    if (!state.railId || !rails[state.railId]) {
+      state.railId = state.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw';
+      state.s = projectToPolyline(rails[state.railId], state.frontX || state.x || centerX, state.frontY || state.y || centerY);
+    }
+    const plan = railPlanFromCar(state);
+    const front = sampleNetworkAt(state.railId, state.s, plan);
+    const pathHeading = Math.atan2(front.ty, front.tx);
+    const kappa = pathCurvature(state.railId, state.s, plan);
+    const hasRear = Number.isFinite(state.rearX) && Number.isFinite(state.rearY);
+    if (hasRear && Number.isFinite(state.frontX) && Number.isFinite(state.heading)) {
+      const along = Math.cos(state.heading) * (front.x - state.frontX) +
+        Math.sin(state.heading) * (front.y - state.frontY);
+      if (along < -0.4) {
+        // Rail join snapped behind the car — skip this pose so it does not hitch backward.
+        return;
+      }
+    }
+    if (hasRear) {
+      // Front follows the rail; rear is towed with no sideslip (bicycle / trailer).
+      const dx = front.x - state.rearX;
+      const dy = front.y - state.rearY;
+      if (dx * dx + dy * dy > 1) {
+        state.heading = Math.atan2(dy, dx);
+      }
+    } else {
+      const steer = Math.atan(WHEELBASE * kappa);
+      state.heading = pathHeading - steer;
+    }
+    state.frontX = front.x;
+    state.frontY = front.y;
+    state.rearX = front.x - Math.cos(state.heading) * WHEELBASE;
+    state.rearY = front.y - Math.sin(state.heading) * WHEELBASE;
+    state.steerAngle = normalizeAngle(pathHeading - state.heading);
+    state.x = (state.frontX + state.rearX) * 0.5;
+    state.y = (state.frontY + state.rearY) * 0.5;
+    if (state.a && state.b) {
+      state.angle = Math.atan2((state.y - centerY) / state.b, (state.x - centerX) / state.a);
+    }
+  }
+
+  function applyRailPose(car) {
+    applyBicyclePose(car);
+  }
+
+  function attachCarToRail(car) {
+    if (car.path === 'vertical') {
+      car.railId = car.verticalDirection === 'up' ? 'vert-up' : 'vert-down';
+    } else {
+      car.railId = car.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw';
+    }
+    if (!rails[car.railId]) car.railId = 'ellipse-cw';
+    car.s = projectToPolyline(
+      rails[car.railId],
+      Number.isFinite(car.frontX) ? car.frontX : car.x,
+      Number.isFinite(car.frontY) ? car.frontY : car.y
+    );
+    car.rearX = NaN;
+    car.rearY = NaN;
+    applyRailPose(car);
+  }
+
+  const BLINKER_LOOKAHEAD_PX = CAR_LENGTH * 3.2;
+
+  function blinkerSide(car) {
+    const rail = rails[car.railId];
+    if (!rail) return null;
+    if (rail.kind === 'connector' && (rail.blinker === 'left' || rail.blinker === 'right')) {
+      return rail.blinker;
+    }
+    const plan = railPlanFromCar(car);
+    if (rail.loop) {
+      const br = nextBranchAhead(rail, car.s, plan);
+      if (br) {
+        const d = branchDistance(rail, car.s, br);
+        const dest = rails[br.railId];
+        if (d < BLINKER_LOOKAHEAD_PX && dest && (dest.blinker === 'left' || dest.blinker === 'right')) {
+          return dest.blinker;
+        }
+      }
+    }
+    if (rail.kind === 'vertical') {
+      const nextId = typeof rail.next === 'function' ? rail.next(plan) : rail.next;
+      const dest = nextId && rails[nextId];
+      if (dest && (dest.blinker === 'left' || dest.blinker === 'right') &&
+          (rail.length - car.s) < BLINKER_LOOKAHEAD_PX) {
+        return dest.blinker;
+      }
+    }
+    return null;
+  }
+
+  function clearMissedEllipseTurn(car) {
+    const rail = rails[car.railId];
+    if (!rail || rail.kind !== 'ellipse' || !car.isMakingTurn || !car.turnJunction) return;
+    const br = rail.branches.find(b => b.junction === car.turnJunction);
+    if (!br) return;
+    const past = (car.s - br.s + rail.length) % rail.length;
+    if (past > 25 && past < rail.length * 0.45) {
+      car.isMakingTurn = false;
+      car.turnDirection = null;
+      car.turnState = null;
+      car.turnJunction = null;
+      car.isCommittedToTurn = false;
+    }
+  }
 
   /**
    * Distance along the vertical road to the crossroad junction the car is heading toward.
@@ -1899,7 +2590,10 @@
     stoppedSince: 0,
     cmdSpeedFactor: null,
     smoothedCollisionSlowdown: null,
-    forceUnstickFrames: 0
+    forceUnstickFrames: 0,
+    railId: 'ellipse-cw',
+    s: 0,
+    turnJunction: null
   };
 
   // Helper to create a car object with default and specific properties
@@ -1988,6 +2682,8 @@ function resetSimulation() {
         car.cmdSpeedFactor = null;
         car.smoothedCollisionSlowdown = null;
         car.forceUnstickFrames = 0;
+        car.turnJunction = null;
+        attachCarToRail(car);
     });
     trainingBuffer = [];
     criticalTrainingBuffer = [];
@@ -2410,12 +3106,13 @@ function resetSimulation() {
   }
 
   function turnTypeFor(car) {
-    if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
-      return car.turnDirection === 'left' ? 'ellipse-to-vertical-left' : car.turnDirection === 'right' ? 'ellipse-to-vertical-right' : 'straight';
+    if ((car.turnState === 'turning' || car.turnState === 'approaching') && car.path === 'ellipse' &&
+        (car.turnDirection === 'left' || car.turnDirection === 'right') && car.isMakingTurn) {
+      return car.turnDirection === 'left' ? 'ellipse-to-vertical-left' : 'ellipse-to-vertical-right';
     }
-    if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical') || hasPlannedVerticalExit(car) || car.path === 'vertical') {
-      const direction = car.turnDirection || (car.direction === -1 ? 'left' : 'right');
-      return direction === 'left' ? 'vertical-to-ellipse-left' : 'vertical-to-ellipse-right';
+    if (car.turnState === 'rejoining' || hasPlannedVerticalExit(car) ||
+        (car.path === 'vertical' && (car.turnDirection === 'left' || car.turnDirection === 'right'))) {
+      return car.turnDirection === 'left' ? 'vertical-to-ellipse-left' : 'vertical-to-ellipse-right';
     }
     return 'straight';
   }
@@ -2473,18 +3170,48 @@ function resetSimulation() {
     });
   }
 
+  function addRailDebugOverlay() {
+    if (!threeScene) return;
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xff1a1a,
+      linewidth: 2,
+      depthTest: true
+    });
+    for (const id of Object.keys(rails)) {
+      const rail = rails[id];
+      if (!rail || !rail.points || rail.points.length < 2) continue;
+      const pts = rail.points.map(p => new THREE.Vector3(worldX(p.x), 0.45, worldZ(p.y)));
+      if (rail.loop && pts.length) pts.push(pts[0].clone());
+      const geom = new THREE.BufferGeometry().setFromPoints(pts);
+      const line = new THREE.Line(geom, mat);
+      line.renderOrder = 20;
+      line.frustumCulled = false;
+      threeScene.add(line);
+    }
+  }
+
   function renderThreeScene() {
     if (!threeRenderer) return;
     const allCars = [car1, car2, car3, car4, car5, car6];
+    if (DEBUG_SHOW_RAILS_ONLY) {
+      for (const car of allCars) {
+        const visual = threeCars.get(car);
+        if (visual) visual.visible = false;
+        const meshes = trajectoryMeshes.get(car);
+        if (meshes) meshes.forEach(mesh => { mesh.visible = false; });
+      }
+      threeRenderer.render(threeScene, threeCamera);
+      return;
+    }
     const blinkOn = performance.now() % BLINKER_CYCLE_MS < BLINKER_ON_MS;
     for (const car of allCars) {
       const visual = threeCars.get(car) || buildCarVisual(car);
       if (!visual) continue;
       visual.position.set(worldX(car.x), 0.12, worldZ(car.y));
-      visual.rotation.y = modelForwardYaw - car.heading + Math.PI / 2;;
-      const isTurning = (car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining') && car.turnDirection;
-      setLampState(visual.userData.lights.left, !!isTurning && car.turnDirection === 'left' && blinkOn, 0xffa000, 'left');
-      setLampState(visual.userData.lights.right, !!isTurning && car.turnDirection === 'right' && blinkOn, 0xffa000, 'right');
+      visual.rotation.y = modelForwardYaw - car.heading + Math.PI / 2;
+      const blinker = blinkerSide(car);
+      setLampState(visual.userData.lights.left, blinker === 'left' && blinkOn, 0xffa000, 'left');
+      setLampState(visual.userData.lights.right, blinker === 'right' && blinkOn, 0xffa000, 'right');
       const braking = car.currentSpeedFactor < visual.userData.lastSpeedFactor || car.isYielding;
       setLampState(visual.userData.lights.brake, braking, 0xff0808, 'brake');
       setLampState(visual.userData.lights.head, sceneSetup.night, 0xe8f2ff, 'head');
@@ -2613,6 +3340,7 @@ function resetSimulation() {
     sunLight.shadow.camera.bottom = -600;
     threeScene.add(sunLight);
     applyDayNight();
+    addRailDebugOverlay();
 
     resizeThreeRenderer();
     window.addEventListener('resize', resizeThreeRenderer);
@@ -2714,24 +3442,30 @@ function checkTrajectoryVsStaticBox(trajectory, staticCarBox) {
     return false; // No collision found
 }
 
+function occupancyAheadOfCar(car, box) {
+    let cx = 0;
+    let cy = 0;
+    for (const p of box) {
+      cx += p.x;
+      cy += p.y;
+    }
+    cx /= box.length;
+    cy /= box.length;
+    const ahead = Math.cos(car.heading) * (cx - car.x) + Math.sin(car.heading) * (cy - car.y);
+    return ahead > CAR_LENGTH * 0.15;
+}
+
 function checkTrajectoryIntersection(car, otherCar) {
-    // Predict both paths
     const myTrajectory = predictTrajectory(car);
     const otherTrajectory = predictTrajectory(otherCar);
-
-    // Get current bounding boxes
-    const myBox = getCarBoundingBox(car);
     const otherBox = getCarBoundingBox(otherCar);
 
-    // Compare the swept occupancy of both trajectories, not just matching time
-    // samples.  Rule 2 is about two cars claiming the same future road space;
-    // cars with different speeds can arrive at that space in different samples.
-    // The old lock-step-only test missed that case, allowing a turning car to
-    // commit and discover the conflict only after it was already in the junction.
-    if (myTrajectory.length > 0 && otherTrajectory.length > 0) {
-        // Eight well-spaced sprite boxes cover the 4-car-length look-ahead
-        // without turning the six-car simulation into a 40 x 40 SAT check for
-        // every ordered pair every frame.  Include the final state as well.
+    // A car behind us will always “hit” our current body along its future path.
+    // That is following, not a crossroad conflict — ignore it here.
+    const otherAhead =
+      Math.cos(car.heading) * (otherCar.x - car.x) + Math.sin(car.heading) * (otherCar.y - car.y);
+
+    if (myTrajectory.length > 0 && otherTrajectory.length > 0 && otherAhead > -CAR_LENGTH * 0.35) {
         const sampleTrajectory = trajectory => {
             const stride = Math.max(1, Math.ceil(trajectory.length / TRAJECTORY_OCCUPANCY_SAMPLES));
             const samples = [];
@@ -2740,28 +3474,25 @@ function checkTrajectoryIntersection(car, otherCar) {
             if (samples[samples.length - 1] !== finalState) samples.push(finalState);
             return samples;
         };
-        const otherFutureBoxes = sampleTrajectory(otherTrajectory).map(state =>
-            getCarBoundingBox({ x: state.x, y: state.y, heading: state.heading })
-        );
+        const otherFutureBoxes = sampleTrajectory(otherTrajectory)
+            .map(state => getCarBoundingBox({ x: state.x, y: state.y, heading: state.heading }))
+            .filter(box => occupancyAheadOfCar(car, box));
         for (const myFutureState of sampleTrajectory(myTrajectory)) {
             const myFutureBox = getCarBoundingBox({
                 x: myFutureState.x,
                 y: myFutureState.y,
                 heading: myFutureState.heading
             });
+            if (!occupancyAheadOfCar(car, myFutureBox)) continue;
             for (const otherFutureBox of otherFutureBoxes) {
                 if (checkPolygonIntersection(myFutureBox, otherFutureBox)) {
-                    return true; // Both planned occupancies claim the same road space.
+                    return true;
                 }
             }
         }
     }
 
-    // Original check (future-vs-static) as a fallback
-    const iWillHitThem = checkTrajectoryVsStaticBox(myTrajectory, otherBox);
-    const theyWillHitMe = checkTrajectoryVsStaticBox(otherTrajectory, myBox);
-
-    return iWillHitThem || theyWillHitMe;
+    return checkTrajectoryVsStaticBox(myTrajectory, otherBox);
 }
 
 /**
@@ -3174,177 +3905,24 @@ function getEllipseLookaheadPoint(car) {
   }
 
   /**
-   * Shared path-state machine + lookahead target used by both live cars and trajectory
-   * prediction. Mutates path / turnState / commitment fields exactly as updateCar does.
-   * Returns the steering target the car would aim for this step.
+   * Lookahead on the same rails the car drives. Read-only (no path mutations).
    */
   function applyPathGuidance(car) {
-    let targetX, targetY;
-    const isOnVerticalSegment = car.path === 'vertical';
-    const isRejoining = car.path === 'ellipse' && car.verticalDirection !== null;
-
-    if (car.isMakingTurn && car.path === 'ellipse' && car.turnState !== 'rejoining') {
-      const atTop = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y < centerY;
-      const atBottom = Math.abs(car.x - centerX) < ROAD_WIDTH * 0.9 && car.y > centerY;
-      if (atTop) {
-        // Yield decisions are made before path guidance.  Do not let guidance
-        // cross the stop line and silently commit a car that has been told to
-        // wait for Rule 2 traffic; it must remain on its ellipse approach until
-        // the conflicting trajectory has cleared.
-        if (!car.isCommittedToTurn && car.isYielding) {
-          const look = getEllipseLookaheadPoint(car);
-          return { targetX: look.targetX, targetY: look.targetY };
-        }
-        car.path = 'vertical';
-        car.verticalDirection = 'down';
-        car.turnState = 'turning';
-        if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
-        targetX = DOWNWARD_LANE_X;
-        targetY = car.y + LOOK_AHEAD_DISTANCE;
-      } else if (atBottom) {
-        if (!car.isCommittedToTurn && car.isYielding) {
-          const look = getEllipseLookaheadPoint(car);
-          return { targetX: look.targetX, targetY: look.targetY };
-        }
-        car.path = 'vertical';
-        car.verticalDirection = 'up';
-        car.turnState = 'turning';
-        if (!car.isCommittedToTurn) car.isCommittedToTurn = true;
-        targetX = UPWARD_LANE_X;
-        targetY = car.y - LOOK_AHEAD_DISTANCE;
-      } else {
-        const look = getEllipseLookaheadPoint(car);
-        targetX = look.targetX;
-        targetY = look.targetY;
-      }
-    } else if (isOnVerticalSegment) {
-      const verticalTarget = getVerticalLookaheadPoint(car);
-      targetX = verticalTarget.targetX;
-      targetY = verticalTarget.targetY;
-
-      const laneCenter = car.verticalDirection === 'up' ? UPWARD_LANE_X : DOWNWARD_LANE_X;
-      const headingErr = Math.abs(car.heading - (car.verticalDirection === 'up' ? -Math.PI / 2 : Math.PI / 2));
-      if (headingErr < Math.PI / 10 && Math.abs(car.x - laneCenter) < ROAD_WIDTH / 4 && car.turnState === 'turning') {
-        car.turnState = null;
-        car.isMakingTurn = false;
-        car.canDecide = true;
-        car.turnDirection = null;
-        car.isCommittedToTurn = false;
-      }
-
-      // Start rejoin steering in the junction using fixed road geometry (not car.b),
-      // so outer/inner lane choices share the same entry window and have room to arc
-      // onto the ellipse without cutting across grass.
-      const rejoinWindow = ROAD_WIDTH;
-      const nearBottomRejoin = car.verticalDirection === 'down' &&
-        car.y > centerY + ELLIPSE_B0 - rejoinWindow;
-      const nearTopRejoin = car.verticalDirection === 'up' &&
-        car.y < centerY - ELLIPSE_B0 + rejoinWindow;
-      if ((nearBottomRejoin || nearTopRejoin) && car.isCommittedToTurn) {
-        if (!car.turnDirection || car.turnDirection === 'straight') {
-          car.turnDirection = car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left');
-        }
-        if (car.turnDirection === 'left') {
-          car.direction = -1;
-          car.a = ELLIPSE_A0 + ROAD_WIDTH / 4;
-          car.b = ELLIPSE_B0 + ROAD_WIDTH / 4;
-        } else if (car.turnDirection === 'right') {
-          car.direction = 1;
-          car.a = ELLIPSE_A0 - ROAD_WIDTH / 4;
-          car.b = ELLIPSE_B0 - ROAD_WIDTH / 4;
-        }
-        // Always mark rejoining in the junction. If turnState were left as
-        // 'approaching' after path flips to ellipse, the ellipse→vertical branch
-        // above would fire and reverse the car 180° back down the vertical road.
-        car.turnState = 'rejoining';
-        car.path = 'ellipse';
-        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-        const look = getEllipseLookaheadPoint(car);
-        targetX = look.targetX;
-        targetY = look.targetY;
-      }
-    } else {
-      car.path = 'ellipse';
-      if (!isRejoining) {
-        car.angle = Math.atan2((car.y - centerY) / car.b, (car.x - centerX) / car.a);
-      }
-      const look = getEllipseLookaheadPoint(car);
-      targetX = look.targetX;
-      targetY = look.targetY;
-
-      const radial = Math.hypot(car.x - centerX, (car.y - centerY) * car.a / car.b);
-      const onEllipse = Math.abs(radial - car.a) < ROAD_WIDTH / 2;
-      if (isRejoining && onEllipse && car.rejoinBuffer > REJOIN_BUFFER_DISTANCE) {
-        car.verticalDirection = null;
-        car.rejoinBuffer = 0;
-        car.turnState = null;
-        car.isMakingTurn = false;
-        car.turnDirection = null;
-        car.isCommittedToTurn = false;
-      }
-      if (car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
-        car.canDecide = true;
-      }
-    }
-
-    return { targetX, targetY };
+    const lookAheadDistance = LOOK_AHEAD_DISTANCE;
+    const plan = railPlanFromCar(car);
+    const railId = car.railId || (car.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw');
+    const s = Number.isFinite(car.s) ? car.s : 0;
+    const p = sampleNetworkForward(railId, s, lookAheadDistance, plan);
+    return { targetX: p.x, targetY: p.y };
   }
 
   /** Pure lookahead for sensors / NN features (does not mutate car). */
   function getLookaheadPointForPrediction(car, lookAheadDistance = LOOK_AHEAD_DISTANCE) {
-    const ghost = {
-      x: car.x,
-      y: car.y,
-      angle: car.angle,
-      a: car.a,
-      b: car.b,
-      speed: car.speed,
-      direction: car.direction,
-      path: car.path,
-      verticalDirection: car.verticalDirection,
-      isMakingTurn: car.isMakingTurn,
-      turnState: car.turnState,
-      turnDirection: car.turnDirection,
-      isCommittedToTurn: car.isCommittedToTurn,
-      isYielding: car.isYielding,
-      canDecide: car.canDecide,
-      rejoinBuffer: car.rejoinBuffer,
-      heading: car.heading
-    };
-
-    const isOnVerticalSegment = ghost.path === 'vertical';
-    const isRejoining = ghost.path === 'ellipse' && ghost.verticalDirection !== null;
-
-    if (ghost.isMakingTurn && ghost.path === 'ellipse' && ghost.turnState !== 'rejoining') {
-      const atTop = Math.abs(ghost.x - centerX) < ROAD_WIDTH * 0.9 && ghost.y < centerY;
-      const atBottom = Math.abs(ghost.x - centerX) < ROAD_WIDTH * 0.9 && ghost.y > centerY;
-      if (atTop) {
-        return { targetX: DOWNWARD_LANE_X, targetY: ghost.y + lookAheadDistance };
-      }
-      if (atBottom) {
-        return { targetX: UPWARD_LANE_X, targetY: ghost.y - lookAheadDistance };
-      }
-      return getEllipseLookaheadPoint(ghost);
-    }
-
-    if (isOnVerticalSegment) {
-      const rejoinWindow = ROAD_WIDTH;
-      const nearBottomRejoin = ghost.verticalDirection === 'down' &&
-        ghost.y > centerY + ELLIPSE_B0 - rejoinWindow;
-      const nearTopRejoin = ghost.verticalDirection === 'up' &&
-        ghost.y < centerY - ELLIPSE_B0 + rejoinWindow;
-      const plannedExit = ghost.turnDirection === 'left' || ghost.turnDirection === 'right';
-      if ((nearBottomRejoin || nearTopRejoin) && (ghost.isCommittedToTurn || plannedExit)) {
-        ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
-        return getEllipseLookaheadPoint(ghost);
-      }
-      return getVerticalLookaheadPoint(ghost, lookAheadDistance);
-    }
-
-    if (!isRejoining) {
-      ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
-    }
-    return getEllipseLookaheadPoint(ghost);
+    const plan = railPlanFromCar(car);
+    const railId = car.railId || (car.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw');
+    const s = Number.isFinite(car.s) ? car.s : 0;
+    const p = sampleNetworkForward(railId, s, lookAheadDistance, plan);
+    return { targetX: p.x, targetY: p.y };
   }
 
   function computeTargetSteerAngle(car, targetX, targetY) {
@@ -3365,51 +3943,17 @@ function getEllipseLookaheadPoint(car) {
     );
   }
 
-  /**
-   * Integrate one bicycle-model step over a fixed path distance (used by prediction).
-   * Mirrors updateCarPhysics kinematic integration without speed-limit side effects.
-   */
-  function integrateBicycleStep(car, stepLength) {
-    car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR;
-    const MAX_STEER_CLAMP = Math.PI / 3;
-    car.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, car.steerAngle));
-
-    if (Math.abs(car.steerAngle) > 0.001) {
-      const deltaHeading = Math.tan(car.steerAngle) * stepLength / WHEELBASE;
-      car.heading += deltaHeading;
-      while (car.heading > Math.PI) car.heading -= 2 * Math.PI;
-      while (car.heading < -Math.PI) car.heading += 2 * Math.PI;
-    }
-
-    car.rearX += Math.cos(car.heading) * stepLength;
-    car.rearY += Math.sin(car.heading) * stepLength;
-    car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
-    car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
-    car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
-    car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
-
-    if (car.path === 'ellipse' && car.verticalDirection !== null) {
-      car.rejoinBuffer += stepLength;
-    }
+  function poseFromRails(state) {
+    applyBicyclePose(state);
   }
 
-  // Predict future occupancy along the same planned path the car actually drives.
+  // Predict future occupancy by walking the same rails the car will drive.
   function predictTrajectory(car) {
     const trajectory = [];
     const totalDistance = getTrajectoryDistancePx();
-    // Match live sim: one steer-smoothing update per nominal frame travel distance,
-    // so steering response vs distance matches updateCarPhysics.
-    const nominalFrameDist = Math.max(0.5, car.maximumSpeed * 50);
-    const stepLength = Math.min(nominalFrameDist, totalDistance / 40);
+    const stepLength = Math.max(4, totalDistance / 40);
     const steps = Math.max(1, Math.ceil(totalDistance / stepLength));
 
-    // Once left/right is chosen for a vertical→ellipse exit, trajectory must follow that
-    // planned path through the junction even if the live car has not yet crossed the
-    // yield line (isCommittedToTurn). Commitment only gates live yield behavior.
-    const plannedVerticalExit = hasPlannedVerticalExit(car);
-    const isVerticalCar = car.path === 'vertical';
-
-    // Clone only kinematic + path state (avoid cloning arrays / policy history).
     const ghost = {
       x: car.x,
       y: car.y,
@@ -3418,73 +3962,76 @@ function getEllipseLookaheadPoint(car) {
       frontX: car.frontX,
       frontY: car.frontY,
       heading: car.heading,
-      steerAngle: car.steerAngle,
-      targetSteerAngle: car.targetSteerAngle,
       path: car.path,
       verticalDirection: car.verticalDirection,
       direction: car.direction,
       a: car.a,
       b: car.b,
       angle: car.angle,
-      speed: car.speed,
-      isMakingTurn: car.isMakingTurn || plannedVerticalExit || isVerticalCar,
-      turnDirection: car.turnDirection || (isVerticalCar ? (car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left')) : null),
-      turnState: car.turnState || (plannedVerticalExit || isVerticalCar ? 'approaching' : null),
-      isCommittedToTurn: car.isCommittedToTurn || plannedVerticalExit || isVerticalCar,
-      canDecide: false,
+      isMakingTurn: !!car.isMakingTurn,
+      turnDirection: car.turnDirection,
+      turnState: car.turnState,
+      isCommittedToTurn: !!car.isCommittedToTurn,
+      turnJunction: car.turnJunction,
+      railId: car.railId,
+      s: car.s,
       rejoinBuffer: car.rejoinBuffer,
-      // Prediction follows planned path geometry; do not freeze for yield stops.
-      isYielding: false
+      isYielding: false,
+      steerAngle: car.steerAngle
     };
+    if (!ghost.railId) {
+      ghost.railId = ghost.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw';
+      ghost.s = 0;
+    }
 
     for (let i = 0; i < steps; i++) {
-      if (ghost.path === 'ellipse') {
-        ghost.angle = Math.atan2((ghost.y - centerY) / ghost.b, (ghost.x - centerX) / ghost.a);
+      const dest = walkRails(ghost.railId, ghost.s, stepLength, railPlanFromCar(ghost), (nextId) => {
+        enterRail(ghost, nextId);
+      });
+      ghost.railId = dest.railId;
+      ghost.s = dest.s;
+      if (ghost.turnState === 'rejoining') ghost.rejoinBuffer += stepLength;
+      if (ghost.turnState === 'rejoining' && ghost.rejoinBuffer > REJOIN_BUFFER_DISTANCE) {
+        ghost.verticalDirection = null;
+        ghost.rejoinBuffer = 0;
+        ghost.turnState = null;
+        ghost.isMakingTurn = false;
+        ghost.turnDirection = null;
+        ghost.isCommittedToTurn = false;
+        ghost.turnJunction = null;
       }
-
-      const { targetX, targetY } = applyPathGuidance(ghost);
-      ghost.targetSteerAngle = computeTargetSteerAngle(ghost, targetX, targetY);
-      integrateBicycleStep(ghost, stepLength);
-
+      poseFromRails(ghost);
       trajectory.push({ x: ghost.x, y: ghost.y, heading: ghost.heading });
     }
     return trajectory;
   }
 
   function updateCarPhysics(car, speed) {
-    car.steerAngle += (car.targetSteerAngle - car.steerAngle) * STEERING_SMOOTHING_FACTOR;
-    const MAX_STEER_CLAMP = Math.PI / 3;
-    car.steerAngle = Math.max(-MAX_STEER_CLAMP, Math.min(MAX_STEER_CLAMP, car.steerAngle));
-
-    if (Math.abs(car.steerAngle) > 0.001) {
-      const turnRadius = WHEELBASE / Math.tan(Math.abs(car.steerAngle));
-      const currentVelocity = car.maximumSpeed * 50 * car.currentSpeedFactor;
-      const centrifugalForce = (currentVelocity ** 2) / turnRadius;
-      if (centrifugalForce > MAX_CENTRIFUGAL_FORCE) {
-        const targetVelocity = Math.sqrt(MAX_CENTRIFUGAL_FORCE * turnRadius);
-        car.currentSpeedFactor = Math.min(car.currentSpeedFactor, targetVelocity / (car.maximumSpeed * 50));
-      }
+    if (!car.railId || !rails[car.railId]) attachCarToRail(car);
+    const dist = Math.max(0, speed);
+    const dest = walkRails(car.railId, car.s, dist, railPlanFromCar(car), (nextId) => {
+      enterRail(car, nextId);
+    });
+    car.railId = dest.railId;
+    car.s = dest.s;
+    if (car.turnState === 'rejoining' || (car.path === 'ellipse' && car.verticalDirection !== null)) {
+      car.rejoinBuffer += dist;
     }
-
-    if (Math.abs(car.steerAngle) > 0.001) {
-      const deltaHeading = Math.tan(car.steerAngle) * speed / WHEELBASE;
-      car.heading += deltaHeading;
-      while (car.heading > Math.PI) car.heading -= 2 * Math.PI;
-      while (car.heading < -Math.PI) car.heading += 2 * Math.PI;
+    if (car.turnState === 'rejoining' && car.rejoinBuffer > REJOIN_BUFFER_DISTANCE) {
+      car.verticalDirection = null;
+      car.rejoinBuffer = 0;
+      car.turnState = null;
+      car.isMakingTurn = false;
+      car.turnDirection = null;
+      car.isCommittedToTurn = false;
+      car.turnJunction = null;
+      car.canDecide = true;
     }
-
-    car.rearX += Math.cos(car.heading) * speed;
-    car.rearY += Math.sin(car.heading) * speed;
-
-    car.frontX = car.rearX + Math.cos(car.heading) * WHEELBASE;
-    car.frontY = car.rearY + Math.sin(car.heading) * WHEELBASE;
-
-    car.x = car.rearX + Math.cos(car.heading) * WHEELBASE * 0.5;
-    car.y = car.rearY + Math.sin(car.heading) * WHEELBASE * 0.5;
-
-    if (car.path === "ellipse" && car.verticalDirection !== null) {
-      car.rejoinBuffer += speed;
+    if (car.path === 'ellipse' && car.y > centerY - car.b + 2 * ROAD_WIDTH && car.y < centerY + car.b - 2 * ROAD_WIDTH) {
+      car.canDecide = true;
     }
+    poseFromRails(car);
+    clearMissedEllipseTurn(car);
 
     const carNames = [null, "Car1", "Car2", "Car3", "Car4", "Car5", "Car6"];
     const carNumber = [car1, car2, car3, car4, car5, car6].indexOf(car) + 1;
@@ -3495,8 +4042,7 @@ function getEllipseLookaheadPoint(car) {
     const distTraveled = Math.hypot(car.x - car.lastLoggedX, car.y - car.lastLoggedY);
     if (DEBUG_LOG && LOG_CONFIG.verboseKinematics &&
         (Math.abs(headingDeg - lastHeadingDeg) > LOG_HEADING_THRESHOLD_DEG || distTraveled > LOG_DISTANCE_THRESHOLD_PX)) {
-      const turnRadius = Math.abs(car.steerAngle) > 0.001 ? WHEELBASE / Math.tan(Math.abs(car.steerAngle)) : Number.MAX_VALUE;
-      logEvent('behavior', `${carName} speed=${car.currentSpeedFactor.toFixed(3)} steerDeg=${(car.steerAngle * 180 / Math.PI).toFixed(1)} radius=${turnRadius.toFixed(1)} path=${car.path} turnState=${car.turnState || 'none'}`);
+      logEvent('behavior', `${carName} speed=${car.currentSpeedFactor.toFixed(3)} rail=${car.railId} s=${car.s.toFixed(1)} path=${car.path} turnState=${car.turnState || 'none'}`);
       car.lastLoggedHeading = car.heading;
       car.lastLoggedX = car.x;
       car.lastLoggedY = car.y;
@@ -3600,14 +4146,13 @@ function getEllipseLookaheadPoint(car) {
 
 
     let blinkerFrame = null;
-    const isTurningOrRejoining = car.turnState === 'approaching' || car.turnState === 'turning' || car.turnState === 'rejoining';
-
-    if (isTurningOrRejoining && car.turnDirection) {
-      if (car.turnDirection === 'left') {
-        blinkerFrame = { sx: 1 * frameWidth, sy: 1 * frameHeight };
-      } else if (car.turnDirection === 'right') {
-        blinkerFrame = { sx: 2 * frameWidth, sy: 1 * frameHeight };
-      }
+    const blinker = blinkerSide(car);
+    if (blinker === 'left') {
+      blinkerFrame = { sx: 1 * frameWidth, sy: 1 * frameHeight };
+    } else if (blinker === 'right') {
+      blinkerFrame = { sx: 2 * frameWidth, sy: 1 * frameHeight };
+    }
+    if (blinker) {
 
       const currentTime = performance.now();
       const cycleTime = currentTime % BLINKER_CYCLE_MS;
@@ -3648,24 +4193,7 @@ function getEllipseLookaheadPoint(car) {
     }
     car.lastSpeedFactor = car.currentSpeedFactor;
     const predictedTrajectory = predictTrajectory(car);
-    let turnType = 'straight';
-
-    if (car.turnState === 'turning' || (car.turnState === 'approaching' && car.path === 'ellipse')) {
-        if (car.turnDirection === 'left') {
-            turnType = 'ellipse-to-vertical-left';
-        } else if (car.turnDirection === 'right') {
-            turnType = 'ellipse-to-vertical-right';
-        }
-    }
-    else if (car.turnState === 'rejoining' || (car.turnState === 'approaching' && car.path === 'vertical') ||
-             hasPlannedVerticalExit(car) || car.path === 'vertical') {
-        const effectiveTurnDir = car.turnDirection || (car.direction === -1 ? 'left' : (car.direction === 1 ? 'right' : 'left'));
-        if (effectiveTurnDir === 'left') {
-            turnType = 'vertical-to-ellipse-left';
-        } else if (effectiveTurnDir === 'right') {
-            turnType = 'vertical-to-ellipse-right';
-        }
-    }
+    const turnType = turnTypeFor(car);
 
     /*ctx.font = 'bold 80px sans-serif'; // Smaller font for additional info
     ctx.fillStyle = 'white'; // White for better visibility
@@ -3723,8 +4251,10 @@ function updateCar(car) {
       if (car.isMakingTurn) {
         car.turnDirection = car.direction === -1 ? 'left' : 'right';
         car.turnState     = 'approaching';
+        car.turnJunction  = 'top';
       } else {
         car.turnDirection = 'straight';
+        car.turnJunction = null;
       }
       car.canDecide = false;
     } else if (isNearBottomCrossroad) {
@@ -3732,13 +4262,16 @@ function updateCar(car) {
       if (car.isMakingTurn) {
         car.turnDirection = car.direction === -1 ? 'left' : 'right';
         car.turnState     = 'approaching';
+        car.turnJunction  = 'bottom';
       } else {
         car.turnDirection = 'straight';
+        car.turnJunction = null;
       }
       car.canDecide = false;
     } else if (isApproachingVerticalCrossroad) {
         car.isMakingTurn = true;
         car.turnState    = 'approaching';
+        car.turnJunction = car.verticalDirection === 'down' ? 'bottom' : 'top';
         car.turnDirection = Math.random() < 0.5 ? 'left' : 'right';
 
         if (car.turnDirection === 'left') {
@@ -3843,8 +4376,12 @@ function updateCar(car) {
     /* Rule 2 – intersection conflicts
        Also evaluate while mid ellipse→vertical turn even after commitment: committing
        only means "past the stop line", not "ignore cross traffic finishing their turn". */
+    const otherLongitudinal =
+      Math.cos(car.heading) * (otherCar.x - car.x) + Math.sin(car.heading) * (otherCar.y - car.y);
+    const otherIsBehind = otherLongitudinal < -CAR_LENGTH * 0.2;
     const carEllipseToVertical = isEllipseToVerticalManeuver(car);
-    if (!car.isCommittedToTurn || car.turnState === 'rejoining' || carEllipseToVertical) {
+    if (!otherIsBehind &&
+        (!car.isCommittedToTurn || car.turnState === 'rejoining' || carEllipseToVertical)) {
       const overlap = checkTrajectoryIntersection(car, otherCar);
       if (overlap) {
         
@@ -4026,11 +4563,13 @@ function updateCar(car) {
         if (carEllipseToVertical && !car.isCommittedToTurn && !mustYield) {
           const otherIsRejoining = otherCar.turnState === 'rejoining' ||
             (otherCar.path === 'ellipse' && otherCar.verticalDirection !== null);
+          const otherAheadDot = Math.cos(car.heading) * (otherCar.x - car.x) + Math.sin(car.heading) * (otherCar.y - car.y);
           const otherFreeSameDir =
             otherCar.path === 'ellipse' &&
             !otherIsRejoining &&
             otherCar.direction === car.direction &&
-            !isEllipseToVerticalManeuver(otherCar);
+            !isEllipseToVerticalManeuver(otherCar) &&
+            otherAheadDot > CAR_LENGTH * 0.2;
           if (otherFreeSameDir) {
             mustYield = true;
             reason = 'ellipse-to-vertical-same-dir-through';
@@ -4512,32 +5051,10 @@ function updateCar(car) {
     }
   }
 
-  const currentVel = car.maximumSpeed * 50 * car.currentSpeedFactor;
-  const maxCurveVel = Math.sqrt(turnRadius * MAX_CENTRIFUGAL_FORCE);
-  let turnDecelDist = currentVel > maxCurveVel ? (currentVel ** 2 - maxCurveVel ** 2) / (2 * MAX_ACCELERATION) : 0;
-
-  let distToTurn = 0;
-  let hasTurnDecel = false;
-  if (isNearTopCrossroad && car.isMakingTurn) {
-    distToTurn = distToTop;
-    hasTurnDecel = true;
-  } else if (isNearBottomCrossroad && car.isMakingTurn) {
-    distToTurn = distToBottom;
-    hasTurnDecel = true;
-  } else if (isOnVerticalSegment && hasPlannedVerticalExit(car) && distToVerticalJunction <= Math.max(turnDecelDist, approachDistance)) {
-    distToTurn = Math.max(0, distToVerticalJunction);
-    hasTurnDecel = true;
-  }
-
-  if (hasTurnDecel && distToTurn <= turnDecelDist) {
-    const targetCurveFactor = Math.sqrt(maxCurveVel ** 2 + 2 * MAX_ACCELERATION * distToTurn) / (car.maximumSpeed * 50);
-    targetFactor = Math.min(targetFactor, targetCurveFactor);
-  } else if (hasTurnDecel) {
-    targetFactor = Math.min(targetFactor, 1);
-  }
-
-  // Precautionary slowing to be able to stop at yield line
-  if (car.turnState === 'approaching' || car.turnState === 'rejoining') {
+  // Rails already constrain turn geometry — do not crawl through junctions.
+  // Only slow for a yield line when this car actually has to stop.
+  if ((car.turnState === 'approaching' || car.turnState === 'rejoining') &&
+      (shouldStop || hadPriorityConflict)) {
     let distToStop = 0;
     if (car.path === 'ellipse') {
       const yieldX = car.x > centerX ? VERTICAL_ROAD_RIGHT : VERTICAL_ROAD_LEFT;
@@ -5041,6 +5558,7 @@ function updateCar(car) {
   }
 
   function update() {
+    if (DEBUG_SHOW_RAILS_ONLY) return;
     simFrame++;
     logAccumulator.frames++;
     frameCrashPairs = 0;
