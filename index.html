@@ -549,13 +549,14 @@
   // The simulation continues to use its original pixel coordinate system.  The
   // renderer maps that plane directly into an orthographic Three.js scene.
   let ctx = null;
-  const ROAD_WIDTH = 90 * 1.5;
+  const ROAD_WIDTH = 90 * 1.5 * 1.15;
   // Lane-center offset from the road midline. /4 put cars too far to the
   // driver's right of Road_Asphalt; a bit under 1/4 recenters them.
   const LANE_CENTER_OFFSET = ROAD_WIDTH * 0.175;
   const CAR_SCALE = 0.1 * 1.5;
   const CAR_LENGTH = 518 * CAR_SCALE;
   const WHEELBASE = (409 - 94) * CAR_SCALE;
+  const CAR_COLLISION_WIDTH = 230 * CAR_SCALE * 0.82;
   const centerX = 650;
   const centerY = 450;
   const STEERING_GAIN = 0.5;
@@ -566,18 +567,33 @@
   const UPWARD_LANE_X = centerX + LANE_CENTER_OFFSET;
   const DOWNWARD_LANE_X = centerX - LANE_CENTER_OFFSET;
   const MAX_CENTRIFUGAL_FORCE = 0.02;
-  const MAX_ACCELERATION = 0.08;
-  const SPEED_SMOOTHING_FACTOR = 0.12;
+  const MAX_ACCELERATION = 0.18;
+  const SPEED_SMOOTHING_FACTOR = 0.08;
   // Comfort braking at crossroads: limit how hard/jerkily speed commands change.
-  const COMFORT_DECEL_FACTOR = 1.2;       // × MAX_ACCELERATION for normal yield/curve braking
+  const COMFORT_DECEL_FACTOR = 0.82;      // × MAX_ACCELERATION for normal yield/curve braking
   const EMERGENCY_DECEL_FACTOR = 2.2;     // × MAX_ACCELERATION only when impact is imminent
-  const TARGET_COMMAND_SMOOTH_UP = 0.18;  // blend rate when raising speed target
-  const TARGET_COMMAND_SMOOTH_DOWN = 0.32;// blend rate when lowering speed target (still rate-capped)
-  const STEERING_SMOOTHING_FACTOR = 0.1;
+  const TARGET_COMMAND_SMOOTH_UP = 0.10;  // blend rate when raising speed target
+  const TARGET_COMMAND_SMOOTH_DOWN = 0.20;// blend rate when lowering speed target (still rate-capped)
+  // Comfort motion shaping: planned maneuvers use a long S-curve rather than the
+  // emergency kinematic envelope, so braking into turns and rolling out of them
+  // reads as a single elegant speed pulse instead of a step.
+  const APPROACH_COMFORT_DECEL = MAX_ACCELERATION * 0.22; // planned decel toward a stop line
+  const COMFORT_ACCEL_FACTOR = 0.30;      // × MAX_ACCELERATION when regaining speed
+  const CURVATURE_LOOKAHEAD_PX = 280;     // how far ahead path curvature is sampled
+  const CURVATURE_SAMPLE_STEP_PX = 12;
+  const TURN_COMFORT_LAT_ACCEL = 0.044;   // lateral px/step² used for curve speed caps
+  const TURN_CRUISE_FACTOR = 0.58;        // comfort speed fraction at a junction apex
+  const TURN_ENTRY_LEAD_PX = 280;         // start easing down this far before the fillet apex
+  const TURN_EXIT_TAIL_PX = 230;          // ease back to cruise over this after the apex
+  const TURN_APEX_FRACTION = 0.42;        // apex sits slightly before the fillet midpoint
+  const TURN_CAP_SMOOTH_DOWN = 0.18;      // frame blend when the turn cap falls
+  const TURN_CAP_SMOOTH_UP = 0.055;       // frame blend when the turn cap rises (lazy exit)
+  const SPEED_JERK_COMFORT = 0.0017;      // max |Δaccel| per step (speed-factor units)
+  const SPEED_JERK_EMERGENCY = 0.014;
+  const STEERING_SMOOTHING_FACTOR = 0.09;
+  const STEERING_SMOOTHING_TURN = 0.18;
   const REJOIN_BUFFER_DISTANCE = ROAD_WIDTH;
-  const DEBUG_SHOW_RAILS_ONLY = false;
-  const DEBUG_SHOW_RAILS = true; // Keep lane-center (front-axle) rails visible
-  const DEBUG_LOG = true; // Enabled for debugging
+  const DEBUG_LOG = false // Enabled for debugging
   const LOG_CONFIG = {
     training: true,
     rl: true,
@@ -607,7 +623,7 @@
   const AGGRESSIVE_DECELERATION_FACTOR = 1.55; // Mild boost when conflict is near (emergency path uses EMERGENCY_DECEL_FACTOR)
 
   // New tunable parameter for trajectory prediction
-  const BASE_TRAJECTORY_LENGTH = 4.0;
+  const BASE_TRAJECTORY_LENGTH = 3.0;
   const RECOVERY_TRAJECTORY_LENGTH = 5.5;
   const INPUT_DIM = 48;
   const HIDDEN_DIM = 32;
@@ -712,6 +728,7 @@
   let lastPretrainState = false;
   let lastRLState = false;
   let lastControllerMode = 'heuristics';
+  let lastStatusPanelRefreshMs = 0;
   let logWindowStartMs = 0;
   let lastPretrainLogMs = 0;
   let lastRLLogMs = 0;
@@ -1681,6 +1698,97 @@
     return normalizeAngle(h1 - h0) / ds;
   }
 
+  // Comfort speed cap from the curvature of the planned path ahead. Each sample point
+  // at distance d allows sqrt(vCurve² + 2·aBrake·d) at the car's current position, so
+  // the cap engages with anticipatory braking before a curve and relaxes progressively
+  // while exiting it (classic bell-shaped speed profile through turns).
+  function smootherstep01(t) {
+    t = clamp(t, 0, 1);
+    return t * t * t * (t * (t * 6 - 15) + 10);
+  }
+
+  function cosineDip(signedDist, halfWidth) {
+    const u = clamp(Math.abs(signedDist) / Math.max(1, halfWidth), 0, 1);
+    return 0.5 * (1 + Math.cos(Math.PI * u));
+  }
+
+  function blendToward(current, target, downRate, upRate) {
+    if (!Number.isFinite(current)) return target;
+    const rate = target < current ? downRate : upRate;
+    return current + (target - current) * rate;
+  }
+
+  function curvatureSpeedFactorAhead(car, maxSpeedPx) {
+    if (!car.railId || !rails[car.railId]) return 1;
+    const startS = Number.isFinite(car.s) ? car.s : 0;
+    const plan = railPlanFromCar(car);
+    let cap = 1;
+    for (let d = 0; d <= CURVATURE_LOOKAHEAD_PX; d += CURVATURE_SAMPLE_STEP_PX) {
+      const dest = d === 0
+        ? { railId: car.railId, s: startS }
+        : walkRails(car.railId, startS, d, plan, null);
+      if (!rails[dest.railId]) continue;
+      const kappa = Math.abs(pathCurvature(dest.railId, dest.s, plan));
+      if (!Number.isFinite(kappa) || kappa < 8e-5) continue;
+      const vCurveSq = TURN_COMFORT_LAT_ACCEL / Math.max(kappa, 1e-5);
+      const vAllow = Math.sqrt(Math.max(0, vCurveSq + 2 * APPROACH_COMFORT_DECEL * d));
+      cap = Math.min(cap, clamp(vAllow / Math.max(0.001, maxSpeedPx), 0, 1));
+    }
+    return cap;
+  }
+
+  function turnExitTailFactor(car) {
+    if (!Number.isFinite(car.turnExitRemainPx) || car.turnExitRemainPx <= 0) return 1;
+    const u = 1 - clamp(car.turnExitRemainPx / TURN_EXIT_TAIL_PX, 0, 1);
+    return TURN_CRUISE_FACTOR + (1 - TURN_CRUISE_FACTOR) * smootherstep01(u);
+  }
+
+  // Comfort cap for the junction maneuver itself: a raised-cosine bell centered
+  // on the fillet apex. Cars ease off the throttle well before the corner, hold
+  // a stable apex speed, then roll back to cruise on the way out. Straight
+  // through-traffic is unaffected.
+  function turnApproachCapFactor(car, maxSpeedPx) {
+    const rail = rails[car.railId];
+    if (!rail || !Number.isFinite(car.s)) return turnExitTailFactor(car);
+    const plan = railPlanFromCar(car);
+    let signedFromApex = null;
+    let halfWidth = TURN_ENTRY_LEAD_PX;
+
+    if (rail.kind === 'connector') {
+      const apexS = rail.length * TURN_APEX_FRACTION;
+      signedFromApex = car.s - apexS;
+      halfWidth = Math.max(rail.length * 0.62, 110);
+      car.turnExitRemainPx = TURN_EXIT_TAIL_PX;
+    } else if (rail.loop) {
+      const br = nextBranchAhead(rail, car.s, plan);
+      if (br) {
+        const dToFillet = branchDistance(rail, car.s, br);
+        const conn = rails[br.railId];
+        const connLen = conn && Number.isFinite(conn.length) ? conn.length : 90;
+        signedFromApex = -(dToFillet + connLen * TURN_APEX_FRACTION);
+        halfWidth = TURN_ENTRY_LEAD_PX + connLen * TURN_APEX_FRACTION;
+      }
+    } else if (rail.kind === 'vertical') {
+      const nextId = (typeof rail.next === 'function') ? rail.next(plan) : null;
+      if (nextId && rails[nextId]) {
+        const dToFillet = Math.max(0, rail.length - car.s);
+        const connLen = rails[nextId].length || 90;
+        signedFromApex = -(dToFillet + connLen * TURN_APEX_FRACTION);
+        halfWidth = TURN_ENTRY_LEAD_PX + connLen * TURN_APEX_FRACTION;
+      }
+    }
+
+    if (signedFromApex === null) return turnExitTailFactor(car);
+
+    const hw = signedFromApex < 0
+      ? Math.max(halfWidth, TURN_ENTRY_LEAD_PX)
+      : Math.max(halfWidth * 0.9, TURN_EXIT_TAIL_PX * 0.6);
+    if (Math.abs(signedFromApex) > hw) return turnExitTailFactor(car);
+
+    const dip = cosineDip(signedFromApex, hw);
+    return clamp(1 - (1 - TURN_CRUISE_FACTOR) * dip, TURN_CRUISE_FACTOR, 1);
+  }
+
   function applyBicyclePose(state) {
     if (!state.railId || !rails[state.railId]) {
       state.railId = state.direction === -1 ? 'ellipse-ccw' : 'ellipse-cw';
@@ -2555,7 +2663,7 @@
 
   // Default properties for a car
   const CAR_DEFAULTS = {
-    maximumSpeed: 0.15,
+    maximumSpeed: 0.06,
     speed: 0.05,
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
@@ -2593,6 +2701,11 @@
     stoppedSince: 0,
     cmdSpeedFactor: null,
     smoothedCollisionSlowdown: null,
+    speedAccel: 0,
+    smoothedCurveCap: 1,
+    smoothedTurnCap: 1,
+    turnExitRemainPx: 0,
+    smoothedSteer: 0,
     forceUnstickFrames: 0,
     railId: 'ellipse-cw',
     s: 0,
@@ -2771,9 +2884,87 @@ function resetSimulation() {
   function worldX(x) { return x - centerX; }
   function worldZ(y) { return y - centerY; }
 
+  function getRenderPose(car) {
+    const hasPrev = Number.isFinite(car.prevPoseX) && Number.isFinite(car.prevPoseY) &&
+                    Number.isFinite(car.prevPoseHeading);
+    if (!hasPrev || !Number.isFinite(car.x) || !Number.isFinite(car.y)) {
+      return { x: car.x, y: car.y, heading: car.heading };
+    }
+    const dh = normalizeAngle(car.heading - car.prevPoseHeading);
+    return {
+      x: car.prevPoseX + (car.x - car.prevPoseX) * renderAlpha,
+      y: car.prevPoseY + (car.y - car.prevPoseY) * renderAlpha,
+      heading: car.prevPoseHeading + dh * renderAlpha
+    };
+  }
+
+  const TRACK_WIDEN_FACTOR = 1.15;
+  const TRACK_RING_A = 46;
+  const TRACK_RING_B = 28;
+  const TRACK_ISLAND_SCALE = (1 - 0.125 * TRACK_WIDEN_FACTOR) / 0.875;
+  const TRACK_WIDEN_MESH_KINDS = {
+    362: 'asphalt',
+    8: 'stripMarking',
+    64: 'stripMarking',
+    112: 'ringMarking',
+    168: 'ringMarking',
+    640: 'ringMarking',
+    2048: 'ringMarking',
+    1968: 'ringMarking',
+    1214: 'island',
+    1728: 'curb'
+  };
+
+  function widenTrackPoint(kind, x, z) {
+    if (kind === 'stripMarking') return [x * TRACK_WIDEN_FACTOR, z];
+    if (kind === 'island') return [x * TRACK_ISLAND_SCALE, z * TRACK_ISLAND_SCALE];
+    const d = Math.hypot(x / TRACK_RING_A, z / TRACK_RING_B);
+    if (kind === 'curb') {
+      const f = 1 + Math.max(d - 1, 0) * (TRACK_WIDEN_FACTOR - 1);
+      return [x * f, z * f];
+    }
+    if (d >= 0.8 && d <= 1.2) {
+      const f = (1 + (d - 1) * TRACK_WIDEN_FACTOR) / d;
+      return [x * f, z * f];
+    }
+    if (kind === 'asphalt' && Math.abs(x) <= 5.5) return [x * TRACK_WIDEN_FACTOR, z];
+    return [x, z];
+  }
+
+  function widenTrackGeometry(track) {
+    const processed = new Set();
+    track.traverse(node => {
+      if (!node.isMesh || !node.geometry || !node.geometry.attributes.position) return;
+      const kind = TRACK_WIDEN_MESH_KINDS[node.geometry.attributes.position.count];
+      if (!kind) return;
+      let attr = node.geometry.attributes.position;
+      if (attr.isInterleavedBufferAttribute) {
+        const flat = new Float32Array(attr.count * 3);
+        for (let i = 0; i < attr.count; i++) {
+          flat[i * 3] = attr.getX(i);
+          flat[i * 3 + 1] = attr.getY(i);
+          flat[i * 3 + 2] = attr.getZ(i);
+        }
+        attr = new THREE.BufferAttribute(flat, 3);
+        node.geometry.setAttribute('position', attr);
+      }
+      if (processed.has(attr)) return;
+      processed.add(attr);
+      for (let i = 0; i < attr.count; i++) {
+        const widened = widenTrackPoint(kind, attr.getX(i), attr.getZ(i));
+        attr.setX(i, widened[0]);
+        attr.setZ(i, widened[1]);
+      }
+      attr.needsUpdate = true;
+      node.geometry.computeBoundingBox();
+      node.geometry.computeBoundingSphere();
+    });
+  }
+
   function loadTrackModel() {
     new THREE.GLTFLoader().load('GeminiTrack.glb', gltf => {
       const track = gltf.scene;
+      widenTrackGeometry(track);
       const scaleX = 560 / 46;
       const scaleZ = 360 / 28;
       const scaleY = (scaleX + scaleZ) / 2;
@@ -3173,45 +3364,17 @@ function resetSimulation() {
     });
   }
 
-  function addRailDebugOverlay() {
-    if (!threeScene) return;
-    const mat = new THREE.LineBasicMaterial({
-      color: 0xff1a1a,
-      linewidth: 2,
-      depthTest: true
-    });
-    for (const id of Object.keys(rails)) {
-      const rail = rails[id];
-      if (!rail || !rail.points || rail.points.length < 2) continue;
-      const pts = rail.points.map(p => new THREE.Vector3(worldX(p.x), 0.45, worldZ(p.y)));
-      if (rail.loop && pts.length) pts.push(pts[0].clone());
-      const geom = new THREE.BufferGeometry().setFromPoints(pts);
-      const line = new THREE.Line(geom, mat);
-      line.renderOrder = 20;
-      line.frustumCulled = false;
-      threeScene.add(line);
-    }
-  }
-
   function renderThreeScene() {
     if (!threeRenderer) return;
     const allCars = [car1, car2, car3, car4, car5, car6];
-    if (DEBUG_SHOW_RAILS_ONLY) {
-      for (const car of allCars) {
-        const visual = threeCars.get(car);
-        if (visual) visual.visible = false;
-        const meshes = trajectoryMeshes.get(car);
-        if (meshes) meshes.forEach(mesh => { mesh.visible = false; });
-      }
-      threeRenderer.render(threeScene, threeCamera);
-      return;
-    }
     const blinkOn = performance.now() % BLINKER_CYCLE_MS < BLINKER_ON_MS;
     for (const car of allCars) {
       const visual = threeCars.get(car) || buildCarVisual(car);
       if (!visual) continue;
-      visual.position.set(worldX(car.x), 0.12, worldZ(car.y));
-      visual.rotation.y = modelForwardYaw - car.heading + Math.PI / 2;
+      const pose = getRenderPose(car);
+      visual.position.set(worldX(pose.x), 0.12, worldZ(pose.y));
+      visual.rotation.y = modelForwardYaw - pose.heading + Math.PI / 2;
+      visual.userData.renderHeading = pose.heading;
       const blinker = blinkerSide(car);
       setLampState(visual.userData.lights.left, blinker === 'left' && blinkOn, 0xffa000, 'left');
       setLampState(visual.userData.lights.right, blinker === 'right' && blinkOn, 0xffa000, 'right');
@@ -3232,8 +3395,11 @@ function resetSimulation() {
     if (!beamSpots || !Number.isFinite(car.frontX) || !Number.isFinite(car.frontY)) return;
     const on = brightness > 0;
     visual.updateMatrixWorld(true);
-    const dirX = Math.cos(car.heading);
-    const dirZ = Math.sin(car.heading);
+    const beamHeading = Number.isFinite(visual.userData.renderHeading)
+      ? visual.userData.renderHeading
+      : car.heading;
+    const dirX = Math.cos(beamHeading);
+    const dirZ = Math.sin(beamHeading);
     const latX = dirZ;
     const latZ = -dirX;
     let sideSign = 1;
@@ -3343,7 +3509,6 @@ function resetSimulation() {
     sunLight.shadow.camera.bottom = -600;
     threeScene.add(sunLight);
     applyDayNight();
-    addRailDebugOverlay();
 
     resizeThreeRenderer();
     window.addEventListener('resize', resizeThreeRenderer);
@@ -3363,7 +3528,7 @@ function resetSimulation() {
 // Helper function to get the four corners of a car's bounding box
 function getCarBoundingBox(car) {
     const w = CAR_LENGTH / 2;
-    const h = (230 * CAR_SCALE) / 2; // Half-width for corners
+    const h = CAR_COLLISION_WIDTH / 2;
     const cosH = Math.cos(car.heading);
     const sinH = Math.sin(car.heading);
 
@@ -4068,7 +4233,7 @@ function getEllipseLookaheadPoint(car) {
     ctx.fillStyle = color;
 
     const w = CAR_LENGTH / 2;
-    const h = (230 * CAR_SCALE) / 2; // half-width
+    const h = CAR_COLLISION_WIDTH / 2;
 
     for (const state of trajectoryStates) {
         const cosH = Math.cos(state.heading);
@@ -4239,10 +4404,6 @@ function updateCar(car) {
   // Decide left/right before the future trajectory reaches the junction: when distance
   // to the crossroad first falls within the trajectory length (stable geometry).
   const distToVerticalJunction = getDistToVerticalJunction(car);
-  const isApproachingVerticalCrossroad =
-    car.path === 'vertical' &&
-    Number.isFinite(distToVerticalJunction) &&
-    distToVerticalJunction <= approachDistance;
 
   const distToTop    = Math.abs(car.y - (centerY - ELLIPSE_B0));
   const distToBottom = Math.abs(car.y - (centerY + ELLIPSE_B0));
@@ -4271,7 +4432,11 @@ function updateCar(car) {
         car.turnJunction = null;
       }
       car.canDecide = false;
-    } else if (isApproachingVerticalCrossroad) {
+    } else if (isOnVerticalSegment && Number.isFinite(distToVerticalJunction)) {
+        // Vertical cars always turn at their junction, so commit to a direction as
+        // soon as they enter the vertical road. This keeps the predicted trajectory
+        // at constant length through the crossroad instead of collapsing at the
+        // rail end and jumping when the old proximity-based decide fired.
         car.isMakingTurn = true;
         car.turnState    = 'approaching';
         car.turnJunction = car.verticalDirection === 'down' ? 'bottom' : 'top';
@@ -4691,14 +4856,20 @@ function updateCar(car) {
     }
   }
 
-  // Smooth only brake-release (rising cap). Falling caps apply immediately for safety;
-  // actual speed is rate-limited later so the stop still feels progressive.
+  // Smooth the speed cap in both directions: rises blend gently (comfort release),
+  // moderate falls ease over a few frames so distance-cap jitter cannot pump the
+  // throttle; only severe/imminent drops engage instantly for safety. Actual speed
+  // remains rate-limited afterwards regardless.
   {
     const rawCs = collisionSlowdown;
     if (!Number.isFinite(car.smoothedCollisionSlowdown)) {
       car.smoothedCollisionSlowdown = rawCs;
     } else if (rawCs < car.smoothedCollisionSlowdown) {
-      car.smoothedCollisionSlowdown = rawCs;
+      if (rawCs <= 0.001 || rawCs < car.smoothedCollisionSlowdown * 0.5) {
+        car.smoothedCollisionSlowdown = rawCs;
+      } else {
+        car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * TARGET_COMMAND_SMOOTH_DOWN;
+      }
     } else {
       car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * TARGET_COMMAND_SMOOTH_UP;
     }
@@ -5041,38 +5212,50 @@ function updateCar(car) {
   const priorityStatus = onMainRoad ? 1 : -1;
 
   /* ----------  Speed & steering  ---------- */
+  const maxSpeedPx = Math.max(0.001, car.maximumSpeed * 50);
   let targetFactor = 1;
-  let turnRadius   = car.b;
 
-  if (car.isMakingTurn && car.path === 'ellipse' && (isNearTopCrossroad || isNearBottomCrossroad)) {
-    turnRadius = ROAD_WIDTH / 2;
-  } else if (isOnVerticalSegment) {
-    if (isApproachingVerticalCrossroad || (car.turnState === 'approaching' || car.turnState === 'rejoining')) {
-      turnRadius = car.b;
-    } else {
-      turnRadius = Number.MAX_VALUE;
-    }
+  // Stable planned-stop latch: once a Rule-2 conflict requires stopping at this yield
+  // line, keep riding the parabolic approach profile even when the overlap flickers
+  // frame-to-frame — instead of surging between cruise and brake caps.
+  if (car.turnState === 'approaching' && !car.isCommittedToTurn) {
+    if ((shouldStop && hadPriorityConflict) || defensiveBrake) car.approachStopLatch = true;
+  } else {
+    car.approachStopLatch = false;
   }
-
-  // Rails already constrain turn geometry — do not crawl through junctions.
-  // Only slow for a yield line when this car actually has to stop.
-  if ((car.turnState === 'approaching' || car.turnState === 'rejoining') &&
-      (shouldStop || hadPriorityConflict)) {
-    let distToStop = 0;
+  if (car.approachStopLatch) {
+    let distToStop = Infinity;
     if (car.path === 'ellipse') {
       const yieldX = car.x > centerX ? VERTICAL_ROAD_RIGHT : VERTICAL_ROAD_LEFT;
       distToStop = Math.abs(frontBumperX - yieldX);
     } else if (car.path === 'vertical') {
-      const yieldY = car.verticalDirection === 'up' ? (centerY - (360 - ROAD_WIDTH / 2)) : (centerY + (360 - ROAD_WIDTH / 2));
+      const yieldY = car.verticalDirection === 'up' ? yieldLineTop : yieldLineBottom;
       distToStop = Math.abs(frontBumperY - yieldY);
     }
-    if (distToStop > 0) {
-      const maxStopVel = Math.sqrt(2 * MAX_ACCELERATION * distToStop);
-      targetFactor = Math.min(targetFactor, maxStopVel / (car.maximumSpeed * 50));
+    if (Number.isFinite(distToStop) && distToStop > 0) {
+      const maxStopVel = Math.sqrt(2 * APPROACH_COMFORT_DECEL * distToStop);
+      targetFactor = Math.min(targetFactor, maxStopVel / maxSpeedPx);
     }
   }
 
   targetFactor = Math.min(targetFactor, collisionSlowdown);
+
+  // Rules.txt: Max Speed = sqrt(2 * MAX_ACCELERATION * TRAJECTORY_LENGTH * CarLength).
+  // Cruise may never exceed the speed that is still stoppable within the trajectory,
+  // otherwise every reaction gate keyed to trajectoryDistance runs out of braking room.
+  const trajSpeedCeiling = Math.sqrt(2 * MAX_ACCELERATION * trajectoryDistance) /
+    maxSpeedPx;
+  targetFactor = Math.min(targetFactor, trajSpeedCeiling);
+
+  // Comfort curve speed: a long raised-cosine bell into/out of the junction
+  // plus a curvature-based safety cap, both frame-smoothed so the command
+  // never steps. Rise is much slower than fall — cars roll out of a turn.
+  const curveRaw = curvatureSpeedFactorAhead(car, maxSpeedPx);
+  const turnRaw = turnApproachCapFactor(car, maxSpeedPx);
+  car.smoothedCurveCap = blendToward(car.smoothedCurveCap, curveRaw, TURN_CAP_SMOOTH_DOWN, TURN_CAP_SMOOTH_UP);
+  car.smoothedTurnCap = blendToward(car.smoothedTurnCap, turnRaw, TURN_CAP_SMOOTH_DOWN, TURN_CAP_SMOOTH_UP);
+  const curvatureCapFactor = Math.min(car.smoothedCurveCap, car.smoothedTurnCap);
+  targetFactor = Math.min(targetFactor, curvatureCapFactor);
   const laneErrBeforeMove = laneCenterError(car);
   const onGrassBeforeMove = !isPointOnRoad(car.x, car.y);
   const roadEdgeSensorsBeforeMove = getRoadEdgeDistanceSensors(car);
@@ -5177,14 +5360,16 @@ function updateCar(car) {
     targetFactor = heuristicTargetFactor;
     car.lastHeuristicLead = true;
   }
+  targetFactor = Math.min(targetFactor, trajSpeedCeiling);
+  targetFactor = Math.min(targetFactor, curvatureCapFactor);
 
-  // Rate-limited speed command: comfort braking at crossroads, emergency only when imminent.
-  const maxSpeedPx = Math.max(0.001, car.maximumSpeed * 50);
+  // Jerk-limited speed command: S-curve accel/decel for comfort, emergency only
+  // when impact is imminent. Acceleration itself ramps, so throttle/brake never
+  // slam from zero to max in a single frame.
   const imminentStop =
     (Number.isFinite(defensiveHitDist) && defensiveHitDist <= CAR_LENGTH * 0.75) ||
     (hasFollowingConflict && Number.isFinite(leadGapPx) && leadGapPx < CAR_LENGTH * 0.3) ||
     (collisionSlowdown <= 0.001 && car.currentSpeedFactor > 0.55);
-  // Scale deceleration smoothly with conflict severity instead of jumping to max.
   const conflictSeverity = clamp(
     Math.max(
       needsAggressive,
@@ -5198,13 +5383,10 @@ function updateCar(car) {
   const decelFactor = imminentStop
     ? EMERGENCY_DECEL_FACTOR
     : (COMFORT_DECEL_FACTOR + conflictSeverity * (AGGRESSIVE_DECELERATION_FACTOR - COMFORT_DECEL_FACTOR));
-  const accelStep = MAX_ACCELERATION / maxSpeedPx;
+  const accelStep = (MAX_ACCELERATION * COMFORT_ACCEL_FACTOR) / maxSpeedPx;
   const decelStep = (MAX_ACCELERATION * decelFactor) / maxSpeedPx;
 
   let desiredFactor = targetFactor;
-  // Hard-hold stop: at/past the yield line while yielding, or already commanded full stop.
-  // Also hold when a priority yield is active and the front bumper is within stop-line
-  // tolerance — prevents a single overshoot frame from committing through a Rule 2 conflict.
   const nearStopLineForHold =
     shouldStop &&
     hadPriorityConflict &&
@@ -5216,34 +5398,63 @@ function updateCar(car) {
   }
   desiredFactor = clamp(desiredFactor, 0, 1);
 
-  if (!Number.isFinite(car.cmdSpeedFactor)) {
-    car.cmdSpeedFactor = car.currentSpeedFactor;
+  if (!Number.isFinite(car.cmdSpeedFactor)) car.cmdSpeedFactor = car.currentSpeedFactor;
+  if (!Number.isFinite(car.speedAccel)) car.speedAccel = 0;
+
+  if (Number.isFinite(car.turnExitRemainPx) && car.turnExitRemainPx > 0) {
+    const railNow = rails[car.railId];
+    if (!railNow || railNow.kind !== 'connector') {
+      const ds = Math.max(0.8, car.currentSpeedFactor * maxSpeedPx);
+      car.turnExitRemainPx = Math.max(0, car.turnExitRemainPx - ds);
+    }
   }
 
   if (controllerMode !== 'nn' || shouldStop || hadPriorityConflict) {
-    // Primary smoothness: at most one comfort/emergency physical step per frame.
-    if (desiredFactor < car.cmdSpeedFactor) {
-      car.cmdSpeedFactor = Math.max(desiredFactor, car.cmdSpeedFactor - decelStep);
+    const error = desiredFactor - car.currentSpeedFactor;
+    let desiredAccel;
+    if (error < 0) {
+      desiredAccel = clamp(error * 0.15, -decelStep, 0);
     } else {
-      car.cmdSpeedFactor = Math.min(desiredFactor, car.cmdSpeedFactor + accelStep);
+      // Slightly softer proportional gain on the way up so the exit of a turn
+      // keeps rolling on rather than snapping to the cruise ceiling.
+      desiredAccel = clamp(error * 0.085, 0, accelStep);
     }
-    // Gentle secondary blend (small) so command changes aren't staircase-harsh.
-    const blend = imminentStop ? 0.65 : 0.4;
-    car.currentSpeedFactor += (car.cmdSpeedFactor - car.currentSpeedFactor) * blend;
-    // Enforce the rate limit on the displayed/applied speed as well.
-    if (car.currentSpeedFactor > car.cmdSpeedFactor + 1e-6) {
-      car.currentSpeedFactor = Math.max(car.cmdSpeedFactor, car.currentSpeedFactor - decelStep);
-    } else if (car.currentSpeedFactor < car.cmdSpeedFactor - 1e-6) {
-      car.currentSpeedFactor = Math.min(car.cmdSpeedFactor, car.currentSpeedFactor + accelStep);
+    if (imminentStop) {
+      car.speedAccel = -decelStep;
+    } else {
+      const jerk = SPEED_JERK_COMFORT;
+      car.speedAccel += clamp(desiredAccel - car.speedAccel, -jerk, jerk);
+      car.speedAccel = clamp(car.speedAccel, -decelStep, accelStep);
     }
-    // Settle to a true hold-stop once nearly stopped for a yield/conflict.
-    if (desiredFactor <= 0.001 && car.currentSpeedFactor < 0.035) {
+
+    let next = car.currentSpeedFactor + car.speedAccel;
+    if (car.speedAccel < 0) next = Math.max(desiredFactor, next);
+    else next = Math.min(desiredFactor, next);
+    next = clamp(next, 0, 1);
+
+    const hardHold = desiredFactor <= 0.001 && (
+      imminentStop ||
+      ((isAtYieldLine && shouldStop) || nearStopLineForHold || collisionSlowdown <= 0.001) &&
+      car.currentSpeedFactor < 0.12
+    );
+    if (hardHold && car.currentSpeedFactor < 0.12) {
+      next = 0;
+      car.speedAccel = 0;
+    } else if (Math.abs(desiredFactor - next) < 0.003 && Math.abs(car.speedAccel) < 0.0008) {
+      next = desiredFactor;
+      car.speedAccel = 0;
+    }
+
+    car.cmdSpeedFactor = next;
+    car.currentSpeedFactor = next;
+    if (desiredFactor <= 0.001 && car.currentSpeedFactor < 0.03) {
       car.currentSpeedFactor = 0;
       car.cmdSpeedFactor = 0;
+      car.speedAccel = 0;
     }
   } else {
     // NN path: keep previous simple tracking toward targetFactor.
-    let accel = MAX_ACCELERATION;
+    let accel = MAX_ACCELERATION * COMFORT_ACCEL_FACTOR;
     if (needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
     const speedStep = accel / maxSpeedPx;
     if (car.currentSpeedFactor < targetFactor) {
@@ -5252,6 +5463,7 @@ function updateCar(car) {
       car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
     }
     car.cmdSpeedFactor = car.currentSpeedFactor;
+    car.speedAccel = 0;
   }
   if (!Number.isFinite(car.currentSpeedFactor)) {
     logModelIssue(`${carName} speed factor invalid; clamping to heuristic`);
@@ -5262,7 +5474,11 @@ function updateCar(car) {
   /* ----------  Path guidance (shared with trajectory prediction)  ---------- */
   ({ targetX, targetY } = applyPathGuidance(car));
   const heuristicTargetSteer = computeTargetSteerAngle(car, targetX, targetY);
-  car.targetSteerAngle = heuristicTargetSteer;
+  const onTurnConnector = !!(rails[car.railId] && rails[car.railId].kind === 'connector');
+  const steerBlend = onTurnConnector ? STEERING_SMOOTHING_TURN : STEERING_SMOOTHING_FACTOR;
+  if (!Number.isFinite(car.smoothedSteer)) car.smoothedSteer = heuristicTargetSteer;
+  car.smoothedSteer += (heuristicTargetSteer - car.smoothedSteer) * steerBlend;
+  car.targetSteerAngle = car.smoothedSteer;
   if (controllerMode === 'nn' && policyMeanSteer !== null) {
     const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
     const minEdge = Math.min(...roadEdgeSensorsBeforeMove);
@@ -5547,10 +5763,43 @@ function updateCar(car) {
 
   // Function to draw crossroad areas for debugging
   
-  function gameLoop() {
-    if (!isSimulationRunning) return;
+  // Simulation advances in fixed 1/60s steps decoupled from rendering, so car
+  // motion stays smooth and speed-correct on any refresh rate or under frame
+  // hitches (physics constants remain tuned in px per step).
+  const SIM_STEP_MS = 1000 / 60;
+  const MAX_SIM_STEPS_PER_FRAME = 4;
+  let lastSimFrameTimeMs = null;
+  let simStepCarryMs = 0;
+  let renderAlpha = 0;
 
-    update();
+  function gameLoop(timestamp) {
+    if (!isSimulationRunning) {
+      lastSimFrameTimeMs = null;
+      return;
+    }
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
+      timestamp = performance.now();
+    }
+    if (lastSimFrameTimeMs === null) {
+      lastSimFrameTimeMs = timestamp;
+    }
+    let elapsedMs = timestamp - lastSimFrameTimeMs;
+    lastSimFrameTimeMs = timestamp;
+    if (!Number.isFinite(elapsedMs) || elapsedMs < 0) elapsedMs = 0;
+    if (elapsedMs > 250) elapsedMs = 250;
+    simStepCarryMs += elapsedMs;
+
+    let steps = 0;
+    while (simStepCarryMs >= SIM_STEP_MS && steps < MAX_SIM_STEPS_PER_FRAME) {
+      simStepCarryMs -= SIM_STEP_MS;
+      steps++;
+      update();
+    }
+    if (steps === MAX_SIM_STEPS_PER_FRAME) {
+      simStepCarryMs = Math.min(simStepCarryMs, SIM_STEP_MS);
+    }
+
+    renderAlpha = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
     draw();
 
     animationFrameId = requestAnimationFrame(gameLoop);
@@ -5561,7 +5810,6 @@ function updateCar(car) {
   }
 
   function update() {
-    if (DEBUG_SHOW_RAILS_ONLY) return;
     simFrame++;
     logAccumulator.frames++;
     frameCrashPairs = 0;
@@ -5575,6 +5823,12 @@ function updateCar(car) {
 
     // Break multi-car freezes before control (avgSpeed→0 gridlocks).
     resolveGridlock(allCars);
+
+    for (const car of allCars) {
+      car.prevPoseX = car.x;
+      car.prevPoseY = car.y;
+      car.prevPoseHeading = car.heading;
+    }
 
     updateCar(car1);
     updateCar(car2);
@@ -5689,7 +5943,8 @@ function updateCar(car) {
       }
     }
 
-    if ((pretrainSteps + rlStepCount) % 3 === 0) {
+    if (performance.now() - lastStatusPanelRefreshMs >= 250) {
+      lastStatusPanelRefreshMs = performance.now();
       refreshStatusPanel();
     }
 
