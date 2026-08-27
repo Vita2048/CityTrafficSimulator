@@ -539,6 +539,13 @@
         <span class="switch-slider"></span>
         <span>Stop on crash</span>
       </label>
+
+      <div class="controls-divider"></div>
+      <label class="switch-container" title="How fast simulation time advances vs wall clock">
+        <span style="white-space:nowrap">Sim speed</span>
+        <input type="range" id="simSpeedSlider" min="25" max="300" step="25" value="150" style="width:110px;accent-color:var(--primary)">
+        <span id="simSpeedLabel">1.5×</span>
+      </label>
     </div>
   </div>
 
@@ -566,8 +573,8 @@
   const LOG_DISTANCE_THRESHOLD_PX = 25;
   const UPWARD_LANE_X = centerX + LANE_CENTER_OFFSET;
   const DOWNWARD_LANE_X = centerX - LANE_CENTER_OFFSET;
-  const MAX_CENTRIFUGAL_FORCE = 0.02;
-  const MAX_ACCELERATION = 0.18;
+  const MAX_CENTRIFUGAL_FORCE = 0.10;
+  const MAX_ACCELERATION = 0.40;
   const SPEED_SMOOTHING_FACTOR = 0.08;
   // Comfort braking at crossroads: limit how hard/jerkily speed commands change.
   const COMFORT_DECEL_FACTOR = 0.82;      // × MAX_ACCELERATION for normal yield/curve braking
@@ -578,17 +585,17 @@
   // emergency kinematic envelope, so braking into turns and rolling out of them
   // reads as a single elegant speed pulse instead of a step.
   const APPROACH_COMFORT_DECEL = MAX_ACCELERATION * 0.22; // planned decel toward a stop line
-  const COMFORT_ACCEL_FACTOR = 0.30;      // × MAX_ACCELERATION when regaining speed
+  const COMFORT_ACCEL_FACTOR = 0.38;      // × MAX_ACCELERATION when regaining speed
   const CURVATURE_LOOKAHEAD_PX = 280;     // how far ahead path curvature is sampled
   const CURVATURE_SAMPLE_STEP_PX = 12;
-  const TURN_COMFORT_LAT_ACCEL = 0.044;   // lateral px/step² used for curve speed caps
+  const TURN_COMFORT_LAT_ACCEL = 0.22;    // lateral px/step² used for curve speed caps
   const TURN_CRUISE_FACTOR = 0.58;        // comfort speed fraction at a junction apex
   const TURN_ENTRY_LEAD_PX = 280;         // start easing down this far before the fillet apex
   const TURN_EXIT_TAIL_PX = 230;          // ease back to cruise over this after the apex
   const TURN_APEX_FRACTION = 0.42;        // apex sits slightly before the fillet midpoint
   const TURN_CAP_SMOOTH_DOWN = 0.18;      // frame blend when the turn cap falls
   const TURN_CAP_SMOOTH_UP = 0.055;       // frame blend when the turn cap rises (lazy exit)
-  const SPEED_JERK_COMFORT = 0.0017;      // max |Δaccel| per step (speed-factor units)
+  const SPEED_JERK_COMFORT = 0.0038;      // max |Δaccel| per step (speed-factor units)
   const SPEED_JERK_EMERGENCY = 0.014;
   const STEERING_SMOOTHING_FACTOR = 0.09;
   const STEERING_SMOOTHING_TURN = 0.18;
@@ -1802,8 +1809,10 @@
     if (hasRear && Number.isFinite(state.frontX) && Number.isFinite(state.heading)) {
       const along = Math.cos(state.heading) * (front.x - state.frontX) +
         Math.sin(state.heading) * (front.y - state.frontY);
-      if (along < -0.4) {
-        // Rail join snapped behind the car — skip this pose so it does not hitch backward.
+      if (along < -2.5) {
+        // Rail join snapped well behind the car — keep last pose this step
+        // instead of hitching backward. Small mismatches are applied so the
+        // front can settle onto the new rail without a one-frame freeze.
         return;
       }
     }
@@ -2663,7 +2672,7 @@
 
   // Default properties for a car
   const CAR_DEFAULTS = {
-    maximumSpeed: 0.06,
+    maximumSpeed: 0.135,
     speed: 0.05,
     currentSpeedFactor: 1.0,
     x: 0, y: 0,
@@ -3352,7 +3361,7 @@ function resetSimulation() {
       });
       trajectoryMeshes.set(car, meshes);
     }
-    const states = predictTrajectory(car);
+    const states = car.cachedTrajectory || predictTrajectory(car);
     const color = trajectoryColor(turnTypeFor(car));
     meshes.forEach((mesh, index) => {
       const state = states[index];
@@ -3835,6 +3844,34 @@ function isCarInCrossroadArea(c) {
     return inTop || inBottom;
 }
 
+/** 'top' / 'bottom' for the junction this car is approaching or occupying. */
+function junctionOfCar(c) {
+    if (!c) return null;
+    if (c.turnJunction === 'top' || c.turnJunction === 'bottom') return c.turnJunction;
+    if (Number.isFinite(c.y)) return c.y < centerY ? 'top' : 'bottom';
+    return null;
+}
+
+function crossroadAreaForJunction(junction) {
+    if (junction === 'top') return topCrossroadArea;
+    if (junction === 'bottom') return bottomCrossroadArea;
+    return null;
+}
+
+function isPointInArea(x, y, area) {
+    return !!area && x > area.x && x < area.x + area.width && y > area.y && y < area.y + area.height;
+}
+
+/** True if `other` is actually at `car`'s junction (not the opposite crossroad). */
+function isOtherAtCarsJunction(car, other) {
+    if (!car || !other) return false;
+    const junction = junctionOfCar(car);
+    const area = crossroadAreaForJunction(junction);
+    if (isPointInArea(other.x, other.y, area)) return true;
+    const jy = junction === 'top' ? centerY - ELLIPSE_B0 : centerY + ELLIPSE_B0;
+    return Math.abs(other.y - jy) < ROAD_WIDTH * 1.15 && Math.abs(other.x - centerX) < ROAD_WIDTH * 1.6;
+}
+
 /**
  * Other car is still working through a vertical↔ellipse exchange (rejoin / exit turn).
  * Kept intentionally narrow — "any car in the purple box" caused permanent over-yielding.
@@ -4199,6 +4236,7 @@ function getEllipseLookaheadPoint(car) {
       car.canDecide = true;
     }
     poseFromRails(car);
+    car.cachedTrajectory = predictTrajectory(car);
     clearMissedEllipseTurn(car);
 
     const carNames = [null, "Car1", "Car2", "Car3", "Car4", "Car5", "Car6"];
@@ -4686,24 +4724,27 @@ function updateCar(car) {
            (and left turns: yield to anyone still exchanging vertical↔ellipse with overlap). */
         const isEllipseToVerticalRight = car.turnDirection === 'right' && carEllipseToVertical;
         if (carEllipseToVertical && !car.isCommittedToTurn) {
+          const otherAtThisJunction = isOtherAtCarsJunction(car, otherCar);
           const otherExchanging = isNavigatingVerticalEllipseExchange(otherCar);
           // Peer uncommitted ellipse→vertical is NOT "navigating the vertical crossroad" yet.
           const otherPeerUncommittedExit =
             isEllipseToVerticalManeuver(otherCar) && !otherCar.isCommittedToTurn;
           const hitEx = getStaticOccupancyHitDistance(car, otherCar);
           const exchangeNear = Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 2.5;
-          // Right turn (2.2.2): yield to cars on the vertical that are actually in the
-          // crossroad box or actively exchanging — not every distant vertical car,
-          // and not a peer still waiting on the ellipse (Car6 must not wait for Car1).
-          const rightConflict = isEllipseToVerticalRight && otherCar.path === 'vertical' &&
+          // Right turn (2.2.2): only yield to a car that is actually in THIS junction's
+          // vertical crossroad. Distant vertical traffic (other end of the road) and an
+          // empty junction must not impose the 2–3s yield timeout.
+          const rightConflict = isEllipseToVerticalRight && otherAtThisJunction &&
+            otherCar.path === 'vertical' &&
             !otherPeerUncommittedExit &&
             !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
-            (isCarInCrossroadArea(otherCar) || otherExchanging) &&
+            (isPointInArea(otherCar.x, otherCar.y, crossroadAreaForJunction(junctionOfCar(car))) ||
+              otherExchanging) &&
             (otherCar.currentSpeedFactor > 0.03 || exchangeNear ||
               (Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 1.5));
-          // Left / either: wait for active vertical↔ellipse exchange with real motion or near body.
-          // Do not treat peer uncommitted ellipse exits as exchange traffic.
+          // Left / either: wait for active vertical↔ellipse exchange at this junction.
           const exchangeConflict = otherExchanging &&
+            otherAtThisJunction &&
             !otherPeerUncommittedExit &&
             !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
             (otherCar.currentSpeedFactor > 0.04 || exchangeNear);
@@ -4903,6 +4944,12 @@ function updateCar(car) {
       continue;
     }
     if (shouldSkipYieldForDivergingManeuver(car, otherCar)) continue;
+    // Uncommitted ellipse→vertical right must not defensive-brake for a car at the
+    // opposite junction (future path may graze the vertical lane far away).
+    if (isEllipseToVerticalManeuver(car) && car.turnDirection === 'right' &&
+        !car.isCommittedToTurn && !isOtherAtCarsJunction(car, otherCar)) {
+      continue;
+    }
     const hitDist = getStaticOccupancyHitDistance(car, otherCar);
     if (hitDist < defensiveHitDist) {
       defensiveHitDist = hitDist;
@@ -5766,11 +5813,24 @@ function updateCar(car) {
   // Simulation advances in fixed 1/60s steps decoupled from rendering, so car
   // motion stays smooth and speed-correct on any refresh rate or under frame
   // hitches (physics constants remain tuned in px per step).
+  //
+  // At 1× take one physics step per paint (smooth, no catch-up bursts).
+  // The sim-speed slider is allowed to run extra steps so 2×/3× actually
+  // advances simulation time, while poses are still interpolated from the
+  // pre-step snapshot.
   const SIM_STEP_MS = 1000 / 60;
-  const MAX_SIM_STEPS_PER_FRAME = 4;
+  let simSpeed = 1;
   let lastSimFrameTimeMs = null;
   let simStepCarryMs = 0;
   let renderAlpha = 0;
+  function snapshotRenderPoses() {
+    const allCars = [car1, car2, car3, car4, car5, car6];
+    for (const car of allCars) {
+      car.prevPoseX = car.x;
+      car.prevPoseY = car.y;
+      car.prevPoseHeading = car.heading;
+    }
+  }
 
   function gameLoop(timestamp) {
     if (!isSimulationRunning) {
@@ -5786,20 +5846,29 @@ function updateCar(car) {
     let elapsedMs = timestamp - lastSimFrameTimeMs;
     lastSimFrameTimeMs = timestamp;
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) elapsedMs = 0;
-    if (elapsedMs > 250) elapsedMs = 250;
-    simStepCarryMs += elapsedMs;
+    if (elapsedMs > 100) elapsedMs = 100;
+    simStepCarryMs += elapsedMs * simSpeed;
+
+    const maxStepsThisFrame = Math.max(1, Math.min(4, Math.ceil(simSpeed)));
+    const willStep = simStepCarryMs >= SIM_STEP_MS;
+    if (willStep) snapshotRenderPoses();
 
     let steps = 0;
-    while (simStepCarryMs >= SIM_STEP_MS && steps < MAX_SIM_STEPS_PER_FRAME) {
+    while (simStepCarryMs >= SIM_STEP_MS && steps < maxStepsThisFrame) {
       simStepCarryMs -= SIM_STEP_MS;
       steps++;
       update();
     }
-    if (steps === MAX_SIM_STEPS_PER_FRAME) {
-      simStepCarryMs = Math.min(simStepCarryMs, SIM_STEP_MS);
+    // Keep at most one extra step of credit; never bank a hitch into a later burst.
+    if (simStepCarryMs > SIM_STEP_MS) {
+      simStepCarryMs = SIM_STEP_MS * 0.999;
     }
-
-    renderAlpha = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
+    if (steps > 0) {
+      const fraction = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
+      renderAlpha = clamp((steps - 1 + fraction) / steps, 0, 1);
+    } else {
+      renderAlpha = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
+    }
     draw();
 
     animationFrameId = requestAnimationFrame(gameLoop);
@@ -5823,12 +5892,6 @@ function updateCar(car) {
 
     // Break multi-car freezes before control (avgSpeed→0 gridlocks).
     resolveGridlock(allCars);
-
-    for (const car of allCars) {
-      car.prevPoseX = car.x;
-      car.prevPoseY = car.y;
-      car.prevPoseHeading = car.heading;
-    }
 
     updateCar(car1);
     updateCar(car2);
@@ -5990,6 +6053,16 @@ function updateCar(car) {
   document.getElementById('trajectoriesSwitch').addEventListener('change', e => {
     sceneSetup.showTrajectories = e.target.checked;
   });
+  {
+    const speedSlider = document.getElementById('simSpeedSlider');
+    const speedLabel = document.getElementById('simSpeedLabel');
+    const applySimSpeed = () => {
+      simSpeed = Number(speedSlider.value) / 100;
+      speedLabel.textContent = `${simSpeed.toFixed(2)}×`;
+    };
+    speedSlider.addEventListener('input', applySimSpeed);
+    applySimSpeed();
+  }
   [
     ['lamppostsBrightness', 'lampposts'],
     ['headlightsBrightness', 'headlights'],
