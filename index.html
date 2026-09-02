@@ -579,16 +579,16 @@
   // emergency kinematic envelope, so braking into turns and rolling out of them
   // reads as a single elegant speed pulse instead of a step.
   const APPROACH_COMFORT_DECEL = MAX_ACCELERATION * 0.22; // planned decel toward a stop line
-  const COMFORT_ACCEL_FACTOR = 0.38;      // × MAX_ACCELERATION when regaining speed
+  const COMFORT_ACCEL_FACTOR = 0.52;      // × MAX_ACCELERATION when regaining speed
   const CURVATURE_LOOKAHEAD_PX = 280;     // how far ahead path curvature is sampled
   const CURVATURE_SAMPLE_STEP_PX = 12;
-  const TURN_COMFORT_LAT_ACCEL = 0.22;    // lateral px/step² used for curve speed caps
-  const TURN_CRUISE_FACTOR = 0.58;        // comfort speed fraction at a junction apex
-  const TURN_ENTRY_LEAD_PX = 280;         // start easing down this far before the fillet apex
-  const TURN_EXIT_TAIL_PX = 230;          // ease back to cruise over this after the apex
+  const TURN_COMFORT_LAT_ACCEL = 0.28;    // lateral px/step² used for curve speed caps
+  const TURN_CRUISE_FACTOR = 0.78;        // comfort speed fraction at a junction apex
+  const TURN_ENTRY_LEAD_PX = 180;         // start easing down this far before the fillet apex
+  const TURN_EXIT_TAIL_PX = 160;          // ease back to cruise over this after the apex
   const TURN_APEX_FRACTION = 0.42;        // apex sits slightly before the fillet midpoint
-  const TURN_CAP_SMOOTH_DOWN = 0.18;      // frame blend when the turn cap falls
-  const TURN_CAP_SMOOTH_UP = 0.055;       // frame blend when the turn cap rises (lazy exit)
+  const TURN_CAP_SMOOTH_DOWN = 0.22;      // frame blend when the turn cap falls
+  const TURN_CAP_SMOOTH_UP = 0.12;        // frame blend when the turn cap rises
   const SPEED_JERK_COMFORT = 0.0038;      // max |Δaccel| per step (speed-factor units)
   const SPEED_JERK_EMERGENCY = 0.014;
   const STEERING_SMOOTHING_FACTOR = 0.09;
@@ -3744,20 +3744,19 @@ function hasMainRoadPriorityOver(car, other) {
  */
 function isHigherPriorityEllipseCrossTraffic(car, other) {
     if (!other) return false;
-    // Free through traffic on the ellipse always outranks an uncommitted exit.
+    // Rule 2.2.1: left exit yields only to OPPOSITE-direction elliptical traffic.
+    // Same-direction through cars are Rule 1 (following), not a crossroad yield.
     const otherIsRejoining = other.turnState === 'rejoining' ||
       (other.path === 'ellipse' && other.verticalDirection !== null);
+    const opposite =
+      (car.direction === 1 && other.direction === -1) ||
+      (car.direction === -1 && other.direction === 1);
+    if (!opposite) return false;
     const otherFreeThrough =
       other.path === 'ellipse' &&
       !otherIsRejoining &&
       !isEllipseToVerticalManeuver(other);
     if (otherFreeThrough) return true;
-    // Rule 2.2.1: left exit yields to opposite direction on the elliptical road
-    // (free through, right-turn waiters, and cars already mid-turn / rejoining).
-    const opposite =
-      (car.direction === 1 && other.direction === -1) ||
-      (car.direction === -1 && other.direction === 1);
-    if (!opposite) return false;
     if (other.path === 'ellipse') return true;
     if (other.path === 'vertical' && other.turnState === 'turning') return true;
     if (otherIsRejoining) return true;
@@ -3877,6 +3876,85 @@ function isOtherAtCarsJunction(car, other) {
     if (isPointInArea(other.x, other.y, area)) return true;
     const jy = junction === 'top' ? centerY - ELLIPSE_B0 : centerY + ELLIPSE_B0;
     return Math.abs(other.y - jy) < ROAD_WIDTH * 1.15 && Math.abs(other.x - centerX) < ROAD_WIDTH * 1.6;
+}
+
+/** Rule 2.2.2: other must be inside this junction's vertical crossroad, not merely nearby. */
+function isOtherInCarsCrossroad(car, other) {
+    if (!car || !other) return false;
+    return isPointInArea(other.x, other.y, crossroadAreaForJunction(junctionOfCar(car)));
+}
+
+/**
+ * Ellipse car is still on the approach behind the slot a vertical→ellipse merge
+ * would enter. Those cars become our followers if we go — they are not 2.1 yield targets.
+ */
+function isEllipseBehindSideRoadMerge(car, other) {
+    if (!car || !other || !Number.isFinite(other.x) || !Number.isFinite(car.x)) return false;
+    const junction = junctionOfCar(car);
+    const slotX = Number.isFinite(centerX) ? centerX : car.x;
+    const margin = CAR_LENGTH * 0.2;
+    if (junction === 'top') {
+      if (other.direction === 1) return other.x < Math.min(car.x, slotX) - margin;
+      if (other.direction === -1) return other.x > Math.max(car.x, slotX) + margin;
+    } else if (junction === 'bottom') {
+      if (other.direction === 1) return other.x > Math.max(car.x, slotX) + margin;
+      if (other.direction === -1) return other.x < Math.min(car.x, slotX) - margin;
+    }
+    return false;
+}
+
+/** Ellipse car has already left this junction along its ring — Rule 1 following, not Rule 2. */
+function isEllipsePastSideRoadMerge(car, other) {
+    if (!car || !other || !Number.isFinite(other.x)) return false;
+    const junction = junctionOfCar(car);
+    const clear = ROAD_WIDTH * 0.4;
+    if (junction === 'top') {
+      if (other.direction === 1) return other.x > centerX + clear;
+      if (other.direction === -1) return other.x < centerX - clear;
+    } else if (junction === 'bottom') {
+      if (other.direction === 1) return other.x < centerX - clear;
+      if (other.direction === -1) return other.x > centerX + clear;
+    }
+    return false;
+}
+
+/** Lane an ellipse→vertical exit will enter (bottom connectors go up, top go down). */
+function ellipseExitTargetVdir(car) {
+    if (!car) return null;
+    if (car.verticalDirection === 'up' || car.verticalDirection === 'down') return car.verticalDirection;
+    const j = junctionOfCar(car);
+    if (j === 'bottom') return 'up';
+    if (j === 'top') return 'down';
+    return null;
+}
+
+/**
+ * Rule 2.2.2: a right-turning ellipse car waits only for traffic that is actually
+ * occupying the vertical lane it is about to enter. A car leaving on the opposite
+ * lane or already peeling onto the ellipse is not a reason to wait.
+ */
+function verticalBlocksEllipseRightEntry(car, other) {
+    if (!car || !other) return false;
+    if (shouldSkipYieldForDivergingManeuver(car, other)) return false;
+    if (isEllipseToVerticalManeuver(other) && !other.isCommittedToTurn) return false;
+    if (!isOtherInCarsCrossroad(car, other)) return false;
+    if (isVerticalExitingToEllipse(other) || other.turnState === 'rejoining') return false;
+    const want = ellipseExitTargetVdir(car);
+    const otherV = other.verticalDirection || (rails[other.railId] && rails[other.railId].vdir) || null;
+    if (want && otherV && otherV !== want) return false;
+    return other.path === 'vertical' || (other.path === 'ellipse' && other.turnState === 'rejoining');
+}
+
+/** True when a side-road / rejoin car must actually wait for this ellipse actor (Rules 2.1.x). */
+function ellipseBlocksSideRoadEntry(car, other) {
+    if (!other) return false;
+    if (isEllipseBehindSideRoadMerge(car, other)) return false;
+    if (isEllipsePastSideRoadMerge(car, other)) return false;
+    if (isOtherInCarsCrossroad(car, other)) return true;
+    const junction = junctionOfCar(car);
+    const jy = junction === 'top' ? centerY - ELLIPSE_B0 : centerY + ELLIPSE_B0;
+    if (!Number.isFinite(other.y) || Math.abs(other.y - jy) > ROAD_WIDTH * 0.9) return false;
+    return Math.abs(other.x - centerX) <= ROAD_WIDTH * 0.55 + CAR_LENGTH * 0.25;
 }
 
 /**
@@ -4602,17 +4680,18 @@ function updateCar(car) {
            Re-joining → ellipse (vertical → ellipse)
            ---------------------------------------------------------- */
         if (car.turnState === 'rejoining' && car.verticalDirection !== null) {
-          // Yield to main-road ellipse traffic when trajectories overlap.
-          // Skip complementary diverging exits (vertical-right vs ellipse-left, etc.).
+          // Yield to ellipse traffic that actually occupies the merge. Queueing
+          // cars behind the slot and cars already past the junction are Rule 1.
           if (otherCar.path === 'ellipse' && otherCar.turnState !== 'rejoining') {
-             if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+             if (!shouldSkipYieldForDivergingManeuver(car, otherCar) &&
+                 ellipseBlocksSideRoadEntry(car, otherCar)) {
                mustYield = true;
                reason = 'rejoin-yield-to-main-road';
                yieldRule_rejoin = true;
                yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
                if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} rejoin yielding to Car${allCars.indexOf(otherCar)+1}`);
              } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
-               logEvent('behavior', `${carName} skip rejoin yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+               logEvent('behavior', `${carName} skip rejoin yield to Car${allCars.indexOf(otherCar)+1} (behind/past/diverging)`);
              }
           }
         }
@@ -4631,14 +4710,15 @@ function updateCar(car) {
             (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
             isEllipseToVerticalManeuver(otherCar);
           if (otherIsEllipseTraffic && otherCar.direction === 1) {
-            if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+            if (!shouldSkipYieldForDivergingManeuver(car, otherCar) &&
+                ellipseBlocksSideRoadEntry(car, otherCar)) {
               mustYield = true;
               reason    = 'intersection-vertical-right';
               yieldRule_2_1_1 = true;
               yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
               if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse right`);
             } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
-              logEvent('behavior', `${carName} skip vertical-right yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+              logEvent('behavior', `${carName} skip vertical-right yield to Car${allCars.indexOf(otherCar)+1} (behind/past/diverging)`);
             }
           }
         }
@@ -4655,15 +4735,15 @@ function updateCar(car) {
             (otherCar.path === 'vertical' && otherCar.turnState === 'turning') ||
             isEllipseToVerticalManeuver(otherCar);
           if (otherIsEllipseOrExchange) {
-            // Yield to through / exchange traffic either way; skip only complementary exits.
-            if (!shouldSkipYieldForDivergingManeuver(car, otherCar)) {
+            if (!shouldSkipYieldForDivergingManeuver(car, otherCar) &&
+                ellipseBlocksSideRoadEntry(car, otherCar)) {
               mustYield = true;
               reason    = 'intersection-vertical-left';
               yieldRule_2_1_2 = true;
               yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
               if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} at vertical->ellipse left`);
             } else if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
-              logEvent('behavior', `${carName} skip vertical-left yield to Car${allCars.indexOf(otherCar)+1} (diverging ellipse exit)`);
+              logEvent('behavior', `${carName} skip vertical-left yield to Car${allCars.indexOf(otherCar)+1} (behind/past/diverging)`);
             }
           } else if (otherCar.path === 'vertical' || (otherCar.turnState === 'rejoining' && otherCar.verticalDirection !== null)) {
             const carIsectY = car.verticalDirection === 'up' ? centerY - car.b : centerY + car.b;
@@ -4727,48 +4807,18 @@ function updateCar(car) {
             }
         }
 
-        /* 2.2.2 ellipse → vertical right yields to cars navigating vertical crossroad
-           (and left turns: yield to anyone still exchanging vertical↔ellipse with overlap). */
+        /* 2.2.2 ellipse → vertical right: yield only to a car currently inside THIS
+           junction's vertical crossroad. Mid-vertical traffic, opposite-lane cars still
+           approaching, and complementary vertical-left exits are not a reason to wait. */
         const isEllipseToVerticalRight = car.turnDirection === 'right' && carEllipseToVertical;
-        if (carEllipseToVertical && !car.isCommittedToTurn) {
-          const otherAtThisJunction = isOtherAtCarsJunction(car, otherCar);
-          const otherExchanging = isNavigatingVerticalEllipseExchange(otherCar);
-          // Peer uncommitted ellipse→vertical is NOT "navigating the vertical crossroad" yet.
-          const otherPeerUncommittedExit =
-            isEllipseToVerticalManeuver(otherCar) && !otherCar.isCommittedToTurn;
-          const hitEx = getStaticOccupancyHitDistance(car, otherCar);
-          const exchangeNear = Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 2.5;
-          // Right turn (2.2.2): only yield to a car that is actually in THIS junction's
-          // vertical crossroad. Distant vertical traffic (other end of the road) and an
-          // empty junction must not impose the 2–3s yield timeout.
-          const rightConflict = isEllipseToVerticalRight && otherAtThisJunction &&
-            otherCar.path === 'vertical' &&
-            !otherPeerUncommittedExit &&
-            !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
-            (isPointInArea(otherCar.x, otherCar.y, crossroadAreaForJunction(junctionOfCar(car))) ||
-              otherExchanging) &&
-            (otherCar.currentSpeedFactor > 0.03 || exchangeNear ||
-              (Number.isFinite(hitEx) && hitEx < CAR_LENGTH * 1.5));
-          // Left / either: wait for active vertical↔ellipse exchange at this junction.
-          const exchangeConflict = otherExchanging &&
-            otherAtThisJunction &&
-            !otherPeerUncommittedExit &&
-            !shouldSkipYieldForDivergingManeuver(car, otherCar) &&
-            (otherCar.currentSpeedFactor > 0.04 || exchangeNear);
-
-          if (rightConflict || exchangeConflict) {
+        if (isEllipseToVerticalRight && !car.isCommittedToTurn) {
+          if (verticalBlocksEllipseRightEntry(car, otherCar)) {
             mustYield = true;
-            reason = isEllipseToVerticalRight
-              ? 'ellipse-right-yield-to-vertical'
-              : 'ellipse-to-vertical-yield-to-exchange';
-            if (isEllipseToVerticalRight) {
-              yieldRule_2_2_2 = true;
-            } else {
-              yieldRule_2_2_1 = true;
-            }
+            reason = 'ellipse-right-yield-to-vertical';
+            yieldRule_2_2_2 = true;
             yieldConflictMinDist = Math.min(yieldConflictMinDist, distance);
             if (DEBUG_LOG && LOG_CONFIG.verboseYieldEvents) {
-              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical vs crossroad/exchange (${reason})`);
+              logEvent('behavior', `${carName} yielding to Car${allCars.indexOf(otherCar)+1} ellipse->vertical right vs vertical crossroad`);
             }
           }
         }
@@ -4954,10 +5004,17 @@ function updateCar(car) {
       continue;
     }
     if (shouldSkipYieldForDivergingManeuver(car, otherCar)) continue;
-    // Uncommitted ellipse→vertical right must not defensive-brake for a car at the
-    // opposite junction (future path may graze the vertical lane far away).
+    // Uncommitted ellipse→vertical right has ROW except vs traffic actually in this
+    // junction's vertical box (Rule 2.2.2). Do not freeze for mid-vertical cars,
+    // opposite ellipse through-traffic, or a yielder still outside the crossroad.
     if (isEllipseToVerticalManeuver(car) && car.turnDirection === 'right' &&
-        !car.isCommittedToTurn && !isOtherAtCarsJunction(car, otherCar)) {
+        !car.isCommittedToTurn && !verticalBlocksEllipseRightEntry(car, otherCar)) {
+      continue;
+    }
+    const sideRoadEntry = (car.turnState === 'rejoining' && car.verticalDirection !== null) ||
+      hasPlannedVerticalExit(car);
+    if (sideRoadEntry && otherCar.path === 'ellipse' &&
+        (isEllipseBehindSideRoadMerge(car, otherCar) || isEllipsePastSideRoadMerge(car, otherCar))) {
       continue;
     }
     const hitDist = getStaticOccupancyHitDistance(car, otherCar);
