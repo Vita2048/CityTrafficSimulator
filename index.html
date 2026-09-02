@@ -540,12 +540,6 @@
         <span>Stop on crash</span>
       </label>
 
-      <div class="controls-divider"></div>
-      <label class="switch-container" title="How fast simulation time advances vs wall clock">
-        <span style="white-space:nowrap">Sim speed</span>
-        <input type="range" id="simSpeedSlider" min="25" max="300" step="25" value="150" style="width:110px;accent-color:var(--primary)">
-        <span id="simSpeedLabel">1.5×</span>
-      </label>
     </div>
   </div>
 
@@ -1719,9 +1713,14 @@
     return 0.5 * (1 + Math.cos(Math.PI * u));
   }
 
+  function dtRate(rate) {
+    const dt = Number.isFinite(simDtScale) ? simDtScale : 1;
+    return 1 - Math.pow(1 - clamp(rate, 0, 0.999), Math.max(0, dt));
+  }
+
   function blendToward(current, target, downRate, upRate) {
     if (!Number.isFinite(current)) return target;
-    const rate = target < current ? downRate : upRate;
+    const rate = dtRate(target < current ? downRate : upRate);
     return current + (target - current) * rate;
   }
 
@@ -1809,11 +1808,13 @@
     if (hasRear && Number.isFinite(state.frontX) && Number.isFinite(state.heading)) {
       const along = Math.cos(state.heading) * (front.x - state.frontX) +
         Math.sin(state.heading) * (front.y - state.frontY);
-      if (along < -2.5) {
-        // Rail join snapped well behind the car — keep last pose this step
-        // instead of hitching backward. Small mismatches are applied so the
-        // front can settle onto the new rail without a one-frame freeze.
-        return;
+      if (along < 0) {
+        // Rail join can snap behind the car. Project a small forward advance
+        // so motion stays monotonic instead of freezing or hitching backward.
+        const dt = Number.isFinite(simDtScale) ? simDtScale : 1;
+        const minAdvance = Math.max(0.2, (state.currentSpeedFactor || 0.5) * 2.0) * dt;
+        front.x = state.frontX + Math.cos(state.heading) * minAdvance;
+        front.y = state.frontY + Math.sin(state.heading) * minAdvance;
       }
     }
     if (hasRear) {
@@ -2809,6 +2810,9 @@ function resetSimulation() {
         car.forceUnstickFrames = 0;
         car.turnJunction = null;
         attachCarToRail(car);
+        car.prevPoseX = car.x;
+        car.prevPoseY = car.y;
+        car.prevPoseHeading = car.heading;
     });
     trainingBuffer = [];
     criticalTrainingBuffer = [];
@@ -3363,12 +3367,15 @@ function resetSimulation() {
     }
     const states = car.cachedTrajectory || predictTrajectory(car);
     const color = trajectoryColor(turnTypeFor(car));
+    const pose = getRenderPose(car);
+    const dx = (Number.isFinite(pose.x) && Number.isFinite(car.x)) ? pose.x - car.x : 0;
+    const dy = (Number.isFinite(pose.y) && Number.isFinite(car.y)) ? pose.y - car.y : 0;
     meshes.forEach((mesh, index) => {
       const state = states[index];
       mesh.visible = !!state;
       if (!state) return;
       mesh.userData.material.color.setHex(color);
-      mesh.position.set(worldX(state.x), 0.18, worldZ(state.y));
+      mesh.position.set(worldX(state.x + dx), 0.18, worldZ(state.y + dy));
       mesh.rotation.y = -state.heading;
     });
   }
@@ -4906,13 +4913,14 @@ function updateCar(car) {
     if (!Number.isFinite(car.smoothedCollisionSlowdown)) {
       car.smoothedCollisionSlowdown = rawCs;
     } else if (rawCs < car.smoothedCollisionSlowdown) {
-      if (rawCs <= 0.001 || rawCs < car.smoothedCollisionSlowdown * 0.5) {
+      const imminentBody = Number.isFinite(leadGapPx) && leadGapPx < CAR_LENGTH * 0.5;
+      if (imminentBody && (rawCs <= 0.001 || rawCs < car.smoothedCollisionSlowdown * 0.5)) {
         car.smoothedCollisionSlowdown = rawCs;
       } else {
-        car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * TARGET_COMMAND_SMOOTH_DOWN;
+        car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * dtRate(TARGET_COMMAND_SMOOTH_DOWN);
       }
     } else {
-      car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * TARGET_COMMAND_SMOOTH_UP;
+      car.smoothedCollisionSlowdown += (rawCs - car.smoothedCollisionSlowdown) * dtRate(TARGET_COMMAND_SMOOTH_UP);
     }
     collisionSlowdown = clamp(car.smoothedCollisionSlowdown, 0, 1);
   }
@@ -4923,7 +4931,9 @@ function updateCar(car) {
   if (hasLeadVehicle && (followRisk > 0.25 || closingRate > 0.08)) {
     const safetySlowdown = clamp(1 - (followRisk * 0.85 + closingRate * 0.9), 0, 1);
     collisionSlowdown = Math.min(collisionSlowdown, safetySlowdown);
-    if (followRisk > 0.55 || closingRate > 0.14) {
+    // Only hard-stop when a rear-end is imminent; mid-range follow uses the
+    // continuous speed cap so throttle does not chatter across the old 0.55/0.14 edges.
+    if (leadGapPx < CAR_LENGTH * 0.5 && (followRisk > 0.85 || closingRate > 0.35)) {
       shouldStop = true;
     }
     needsAggressive = Math.max(needsAggressive, clamp(followRisk + closingRate, 0, 1));
@@ -5430,8 +5440,9 @@ function updateCar(car) {
   const decelFactor = imminentStop
     ? EMERGENCY_DECEL_FACTOR
     : (COMFORT_DECEL_FACTOR + conflictSeverity * (AGGRESSIVE_DECELERATION_FACTOR - COMFORT_DECEL_FACTOR));
-  const accelStep = (MAX_ACCELERATION * COMFORT_ACCEL_FACTOR) / maxSpeedPx;
-  const decelStep = (MAX_ACCELERATION * decelFactor) / maxSpeedPx;
+  const dt = Number.isFinite(simDtScale) ? simDtScale : 1;
+  const accelStep = (MAX_ACCELERATION * COMFORT_ACCEL_FACTOR) / maxSpeedPx * dt;
+  const decelStep = (MAX_ACCELERATION * decelFactor) / maxSpeedPx * dt;
 
   let desiredFactor = targetFactor;
   const nearStopLineForHold =
@@ -5469,7 +5480,7 @@ function updateCar(car) {
     if (imminentStop) {
       car.speedAccel = -decelStep;
     } else {
-      const jerk = SPEED_JERK_COMFORT;
+      const jerk = SPEED_JERK_COMFORT * dt;
       car.speedAccel += clamp(desiredAccel - car.speedAccel, -jerk, jerk);
       car.speedAccel = clamp(car.speedAccel, -decelStep, accelStep);
     }
@@ -5503,11 +5514,11 @@ function updateCar(car) {
     // NN path: keep previous simple tracking toward targetFactor.
     let accel = MAX_ACCELERATION * COMFORT_ACCEL_FACTOR;
     if (needsAggressive) accel *= AGGRESSIVE_DECELERATION_FACTOR;
-    const speedStep = accel / maxSpeedPx;
+    const speedStep = accel / maxSpeedPx * dt;
     if (car.currentSpeedFactor < targetFactor) {
       car.currentSpeedFactor = Math.min(targetFactor, car.currentSpeedFactor + speedStep);
     } else {
-      car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * SPEED_SMOOTHING_FACTOR;
+      car.currentSpeedFactor += (targetFactor - car.currentSpeedFactor) * dtRate(SPEED_SMOOTHING_FACTOR);
     }
     car.cmdSpeedFactor = car.currentSpeedFactor;
     car.speedAccel = 0;
@@ -5524,7 +5535,7 @@ function updateCar(car) {
   const onTurnConnector = !!(rails[car.railId] && rails[car.railId].kind === 'connector');
   const steerBlend = onTurnConnector ? STEERING_SMOOTHING_TURN : STEERING_SMOOTHING_FACTOR;
   if (!Number.isFinite(car.smoothedSteer)) car.smoothedSteer = heuristicTargetSteer;
-  car.smoothedSteer += (heuristicTargetSteer - car.smoothedSteer) * steerBlend;
+  car.smoothedSteer += (heuristicTargetSteer - car.smoothedSteer) * dtRate(steerBlend);
   car.targetSteerAngle = car.smoothedSteer;
   if (controllerMode === 'nn' && policyMeanSteer !== null) {
     const nnSteerAngle = policySampleSteer * SYMMETRIC_MAX_TURN_STEER_ANGLE;
@@ -5569,7 +5580,7 @@ function updateCar(car) {
   }
   pushImitationSample(imitationSample);
 
-  updateCarPhysics(car, car.maximumSpeed * 50 * car.currentSpeedFactor);
+  updateCarPhysics(car, car.maximumSpeed * 50 * car.currentSpeedFactor * dt);
   const clampedX = Math.max(0, Math.min(canvas.width, car.x));
   const clampedY = Math.max(0, Math.min(canvas.height, car.y));
   if (clampedX !== car.x || clampedY !== car.y || !Number.isFinite(clampedX) || !Number.isFinite(clampedY)) {
@@ -5810,19 +5821,13 @@ function updateCar(car) {
 
   // Function to draw crossroad areas for debugging
   
-  // Simulation advances in fixed 1/60s steps decoupled from rendering, so car
-  // motion stays smooth and speed-correct on any refresh rate or under frame
-  // hitches (physics constants remain tuned in px per step).
-  //
-  // At 1× take one physics step per paint (smooth, no catch-up bursts).
-  // The sim-speed slider is allowed to run extra steps so 2×/3× actually
-  // advances simulation time, while poses are still interpolated from the
-  // pre-step snapshot.
+  // One physics update per display frame, scaled to wall-clock so 60Hz and
+  // 144Hz look the same speed. Never run extra catch-up steps — that is what
+  // made the whole scene slow down then surge. A hitch drops time instead.
   const SIM_STEP_MS = 1000 / 60;
-  let simSpeed = 1;
+  let simDtScale = 1;
   let lastSimFrameTimeMs = null;
-  let simStepCarryMs = 0;
-  let renderAlpha = 0;
+  let renderAlpha = 1;
   function snapshotRenderPoses() {
     const allCars = [car1, car2, car3, car4, car5, car6];
     for (const car of allCars) {
@@ -5842,33 +5847,25 @@ function updateCar(car) {
     }
     if (lastSimFrameTimeMs === null) {
       lastSimFrameTimeMs = timestamp;
+      snapshotRenderPoses();
+      simDtScale = 1;
+      update();
+      renderAlpha = 1;
+      draw();
+      animationFrameId = requestAnimationFrame(gameLoop);
+      return;
     }
     let elapsedMs = timestamp - lastSimFrameTimeMs;
     lastSimFrameTimeMs = timestamp;
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) elapsedMs = 0;
-    if (elapsedMs > 100) elapsedMs = 100;
-    simStepCarryMs += elapsedMs * simSpeed;
+    // Cap at ~30Hz worth of time so a GC pause does not teleport, and never
+    // banks leftover time into a later burst.
+    elapsedMs = Math.min(elapsedMs, SIM_STEP_MS * 2);
 
-    const maxStepsThisFrame = Math.max(1, Math.min(4, Math.ceil(simSpeed)));
-    const willStep = simStepCarryMs >= SIM_STEP_MS;
-    if (willStep) snapshotRenderPoses();
-
-    let steps = 0;
-    while (simStepCarryMs >= SIM_STEP_MS && steps < maxStepsThisFrame) {
-      simStepCarryMs -= SIM_STEP_MS;
-      steps++;
-      update();
-    }
-    // Keep at most one extra step of credit; never bank a hitch into a later burst.
-    if (simStepCarryMs > SIM_STEP_MS) {
-      simStepCarryMs = SIM_STEP_MS * 0.999;
-    }
-    if (steps > 0) {
-      const fraction = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
-      renderAlpha = clamp((steps - 1 + fraction) / steps, 0, 1);
-    } else {
-      renderAlpha = clamp(simStepCarryMs / SIM_STEP_MS, 0, 1);
-    }
+    simDtScale = elapsedMs / SIM_STEP_MS;
+    snapshotRenderPoses();
+    update();
+    renderAlpha = 1;
     draw();
 
     animationFrameId = requestAnimationFrame(gameLoop);
@@ -6053,16 +6050,6 @@ function updateCar(car) {
   document.getElementById('trajectoriesSwitch').addEventListener('change', e => {
     sceneSetup.showTrajectories = e.target.checked;
   });
-  {
-    const speedSlider = document.getElementById('simSpeedSlider');
-    const speedLabel = document.getElementById('simSpeedLabel');
-    const applySimSpeed = () => {
-      simSpeed = Number(speedSlider.value) / 100;
-      speedLabel.textContent = `${simSpeed.toFixed(2)}×`;
-    };
-    speedSlider.addEventListener('input', applySimSpeed);
-    applySimSpeed();
-  }
   [
     ['lamppostsBrightness', 'lampposts'],
     ['headlightsBrightness', 'headlights'],
